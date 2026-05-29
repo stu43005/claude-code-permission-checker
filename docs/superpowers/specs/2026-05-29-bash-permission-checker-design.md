@@ -113,11 +113,13 @@ interface CommandInvocation {
    工作目錄的變動來源由 `cwd.ts` 在此階段統一識別：
    - 頂層 `cd <靜態路徑>` → 更新 cwd；`cd <動態>` 或無參數 `cd`（= `$HOME`）→
      自此 cwd 變 `unknown`。
-   - `git -C <path>`：此參數**只覆寫本次 git 指令的有效 cwd**、不外洩到後續語句。
-     `-C` 的識別與解析同樣在 `cwd.ts` 循序追蹤階段完成（與頂層 `cd` 同層級），
-     **不在 git rule 內處理**；若 `<path>` 為動態或解析後落在專案外，該指令的
-     `cwd` 即為 `unknown` / out-of-project。git rule 看到的 `ctx.cwd` 已是套用
-     `-C` 後的結果。
+   - git 指令級路徑選項（`-C <path>`、`--git-dir=<path>`、`--work-tree=<path>`、
+     `-c core.worktree=<path>` / `-c core.bare`）：**只覆寫本次 git 指令的有效
+     cwd / 基準**、不外洩到後續語句。這些選項可互相組合，須**解析完全部選項後**
+     再算最終路徑（例如 `git -C c --git-dir=a.git --work-tree=b` 的基準相對於
+     `c`）。識別與解析皆在 `cwd.ts` 循序追蹤階段完成（與頂層 `cd` 同層級），
+     **不在 git rule 內處理**；任一路徑為動態或解析後落在專案外，該指令的 `cwd`
+     即為 `unknown` / out-of-project。git rule 看到的 `ctx.cwd` 已套用這些選項。
    - subshell `( … )` / pipeline 段：內部 `cd` 不外洩（用 cwd 副本），但內部
      指令**仍逐一分類與範圍檢查**。
    - command substitution `$(…)` / backtick：內層指令在**當前 cwd 的副本**下執行
@@ -213,18 +215,63 @@ interface CommandRule {
 
 ## 預設 allowlist 內容（rules/commands/）
 
-**讀取型 coreutils（allow，路徑做範圍檢查）**：
-`cat` `head` `tail` `wc` `ls` `tree` `stat` `file` `pwd` `echo`
-`which` `date` `whoami` `basename` `dirname` `realpath` `readlink` `cut` `sort`
-`uniq` `tr` `column` `cmp` `diff` `comm` `md5sum` `sha256sum` `xxd` `hexdump`
-`jq` `yq` `less` `nl` `fold`。
+**純讀取 coreutils（無寫入 flag、無位置輸出檔，allow，路徑做範圍檢查）**：
+`cat` `head` `tail` `wc` `ls` `stat` `pwd` `echo` `which` `whoami` `basename`
+`dirname` `realpath` `readlink` `cut` `tr` `column` `cmp` `diff` `comm` `md5sum`
+`sha256sum` `hexdump` `jq` `nl` `fold`。
 
-**有 flag 條件的指令**：
+> 經 man page 查證的釐清（避免誤擋）：`ls -o`（long format 不列 group）、
+> `ls -C`（多欄排列）、`column -o`（輸出分隔符）、`column -C`（欄位屬性）、
+> `cut --output-delimiter`、`comm --output-delimiter`、`diff --from-file` /
+> `--to-file`（指定比較對象）、`md5sum` / `sha256sum -c`（讀 checksum 檔核驗）
+> 皆**不寫檔**，輸出僅到 stdout，維持 `allow`。`tail -f` / `-F` 不寫檔（僅長時間
+> 阻塞），維持 `allow`。
 
-- `sed`：含 `-i` / `--in-place` → `ask`；否則 `allow`（涵蓋 `sed -n '30,45p' file`）。
-- `find`：含 `-delete` / `-exec` / `-execdir` / `-ok` / `-fprint` 等 → `ask`；
-  純搜尋列出 → `allow`。
-- `grep` / `rg` / `egrep` / `fgrep`：讀取 → `allow`（寫重導向由中央規則擋）。
+**有 flag / 參數條件的指令**（命中下列任一寫入或副作用條件 → `ask`，否則 `allow`）：
+
+- `sed`：**腳本掃描白名單**。sed 程式碼即使無 `-i` 也能寫檔 / 執行 shell
+  （`w file`、`W file`、`s///w file`、`e` 指令、`s///e` 旗標），這些藏在腳本參數
+  內，無法靠 flag 掃描攔截。故僅在能**靜態確認為純唯讀**時 allow，規則如下：
+  - 出現 `-i` / `--in-place`（含任何後綴形式如 `-i.bak`）→ `ask`。
+  - 出現 `-f` / `--file <scriptfile>`（外部腳本，內容不可見）→ `ask`。
+  - 解析 sed 程式（隱含的第一個非 flag 引數，以及所有 `-e` / `--expression`），
+    程式內出現 `w` / `W` 指令、`r` / `R` 指令、`e` 指令、或 `s///` 帶 `w` 或 `e`
+    旗標 → `ask`；任何無法靜態確認分類的構造 → `ask`。
+  - **唯讀白名單**（全部 token 僅由下列構成才 allow，涵蓋常見用例）：位址
+    （行號、`$`、`/regexp/`、`N,M` 區間、`first~step`）後接 `p`（print）/ `d`
+    （delete-to-stdout）；`s/regexp/replacement/` 與 `g` / `p` / `I` / 數字等
+    **非 w/e** 旗標的替換；`q` / `Q`（quit）。例：`sed -n '30,45p' file`、
+    `sed '/foo/d' file`、`sed 's/a/b/g' file` → `allow`。
+- `awk`：**程式掃描白名單**（與 sed 同理）。awk 程式可透過 `print > file` /
+  `printf > file` / `print >> file` 寫檔、`print | "cmd"`（pipe 到指令）、
+  `system("cmd")`、`"cmd" | getline`（執行指令）、`getline < file`（讀任意檔）、
+  `close()` / `fflush(file)` 等造成副作用，藏在程式參數內。規則如下：
+  - 出現 `-i` / `--in-place`（gawk inplace 擴充）或 `-f` / `--file <progfile>`
+    （外部程式不可見）→ `ask`。
+  - 解析 awk 程式（隱含的第一個非 flag 引數，以及所有 `-e`），程式內出現重導向
+    `>` / `>>`、pipe `|`、`system(`、`getline`、`close(`、`fflush(` 等 token →
+    `ask`；任何無法靜態確認分類的構造 → `ask`。
+  - **唯讀白名單**（涵蓋常見用例）：純 pattern 過濾（無 action，預設印出整行，
+    如 `awk 'NR>=8940 && NR<=9281' file`）；action 僅由 `print` / `printf`
+    （**無重導向、無 pipe**）與欄位 / 變數 / 算術 / 比較 / 內建唯讀函式
+    （`length`、`substr`、`split` 到變數等）構成。例：
+    `awk 'NR>=8940 && NR<=9281' file`、`awk '{print $1}' file`、
+    `awk -F, '$3>100' file` → `allow`。
+- `find`：含 `-delete` / `-exec` / `-execdir` / `-ok` / `-okdir` / `-fprint` /
+  `-fprint0` / `-fprintf` / `-fls` 等寫檔或執行外部指令的 action → `ask`；
+  純搜尋列出（`-name` / `-type` / `-print` / `-printf` 等）→ `allow`。
+- `sort`：含 `-o` / `--output=<file>`（寫檔，含 `sort -o F F` 原地排序）或
+  `-T` / `--temporary-directory=<dir>`（指定暫存目錄）→ `ask`；否則 `allow`。
+- `yq`：含 `-i` / `--inplace` / `--in-place`（mikefarah Go 版與 kislyuk Python
+  版皆有就地修改）→ `ask`；否則 `allow`。
+- `tree`：含 `-o <file>`（輸出寫入具名檔）→ `ask`；否則 `allow`。
+- `file`：含 `-C` / `--compile`（寫出 `magic.mgc`）→ `ask`；否則 `allow`。
+- `date`：含 `-s` / `--set`（修改系統時間，OS 級副作用）→ `ask`；否則 `allow`。
+- `xxd` / `uniq`：採 GNU `cmd [INPUT [OUTPUT]]` 語法，**第 2 個非 `-` 開頭的位置
+  參數為輸出檔**（不需重導向即寫檔，會繞過 flag 掃描）。規則：非 flag 位置參數
+  數量 ≥ 2 → 視為有寫入目標 → `ask`；僅 1 個（或 0 個）輸入來源 → `allow`。
+- `grep` / `rg` / `egrep` / `fgrep`：讀取 → `allow`（`rg -r` / `-o` 僅影響 stdout
+  呈現、ripgrep 官方明示永不改檔；寫重導向由中央規則擋）。
 - `git`：依**子指令**判定——
   - `allow`：`status` `log` `diff` `show` `blame` `rev-parse` `describe`
     `branch`（僅列出，無 `-d` / `-D` / `-m`）`tag`（僅列出）`remote -v`
@@ -233,16 +280,19 @@ interface CommandRule {
   - `ask`：`commit` `add` `push` `pull` `fetch` `checkout` `switch` `restore`
     `reset` `merge` `rebase` `clean` `rm` `mv` `stash`（push / pop）`apply`
     `init` `clone` `worktree` `config`（set / unset）。
-  - `git -C <path>`：覆寫該次指令的有效 cwd，於 `cwd.ts` 階段識別與範圍檢查
-    （見評估流程 step 2），git rule 收到的 `ctx.cwd` 已套用 `-C`；`-c key=val`
-    視為無害。
+  - **指令級路徑選項**（皆於 `cwd.ts` 階段識別與範圍檢查，見評估流程 step 2，
+    git rule 收到的 `ctx.cwd` 已套用之；可互相組合，路徑檢查必須在解析完全部選項
+    後進行）：`-C <path>`（覆寫該次 git 的 cwd，多個累積）、`--git-dir=<path>`、
+    `--work-tree=<path>`（改變倉庫 / 工作樹基準）、`-c core.worktree=<path>`
+    / `-c core.bare`（透過 config 改變路徑基準）。其餘 `-c key=val` 視為無害。
 
 **預設排除（→ `ask`，需手動信任才加入）**：
 `rm` `mv` `cp` `mkdir` `touch` `chmod` `chown` `ln` `dd` `tee` `truncate`
 `kill`；`curl` `wget` `ssh`（網路）；`docker` `make` 及各種 build / test runner
 （執行任意碼）；`npm` / `pnpm` / `yarn`（`test` / `run` 執行任意碼，整包排除，
-僅使用者信任時自行加 `ls` / `view`）；`awk`（script 內可 `print > file` /
-`system()`，靜態難分析）；`xargs` `find -exec` `eval` `source` / `.` `bash -c` /
+僅使用者信任時自行加 `ls` / `view`）；`less`（互動模式 `s file` 存檔、`-o` / `-O` log 檔、
+`!` / `#` shell 逃逸均可寫檔 / 執行指令，無法靜態保證安全）；`xargs`
+`find -exec` `eval` `source` / `.` `bash -c` /
 `sh -c`（執行我們看不到的其他指令）。
 
 ## 失敗模式與輸出契約
@@ -265,14 +315,25 @@ interface CommandRule {
 
 - 引擎為純函式（`command + projectRoot + cwd → Verdict`），用 `deno test`
   表格驅動，免 FS、免真 hook。
-- 案例涵蓋：唯讀 allow（`grep` / `sed -n` / `git diff` / `cat` 於專案內）、
-  null 裝置重導向 allow（`grep foo file 2>/dev/null`、`cmd > /dev/null 2>&1`）、
-  範圍逸出（`cat /etc/passwd`、`cd /tmp && ls`、`../` 逸出）、寫入（`sed -i`、
-  `git commit`、`> redirect`、`mkdir`）、動態（`$VAR` 路徑、`$(...)`、glob）、
-  cwd 未知後的相對路徑（`cd $X && cat f` → `dynamic` → ask）、`git -C` 逸出與
-  在專案內、組合（pipe 中一段寫入、`&&` 串接、subshell、command substitution
+- 案例涵蓋：唯讀 allow（`grep` / `sed -n '30,45p' file` /
+  `awk 'NR>=8940 && NR<=9281' file` / `git diff` / `cat` 於專案內）、
+  null 裝置重導向 allow（`grep foo file 2>/dev/null`、
+  `cmd > /dev/null 2>&1`）、範圍逸出（`cat /etc/passwd`、`cd /tmp && ls`、`../`
+  逸出）、寫入（`sed -i`、`git commit`、`> redirect`、`mkdir`）、動態（`$VAR`
+  路徑、`$(...)`、glob）、cwd 未知後的相對路徑（`cd $X && cat f` → `dynamic` →
+  ask）、組合（pipe 中一段寫入、`&&` 串接、subshell、command substitution
   內層寫入）、空指令 / 純註解 → allow、解析錯誤、未知指令、信任擴充（加一條
   fake 規則 → allow）。
+- **flag / 參數寫入破綻案例（全部應 ask）**：`sed 's/a/b/w out'`、`sed '5e cmd'`、
+  `sed -f script.sed file`、`sort -o out.txt file`、`sort -T /tmp file`、
+  `yq -i '.a=1' f.yml`、`xxd in out.bin`、`uniq in out.txt`、`tree -o t.txt`、
+  `file -C -m mymagic`、`date -s '2020-01-01'`、`find . -delete`、
+  `find . -fprintf out '%p'`、`awk '{print > "out"}' file`、
+  `awk '{system("rm x")}' file`、`awk '{"cmd"|getline}' file`、
+  `awk -f prog.awk file`、`less file`（已排除 → ask）。
+- **git 指令級路徑案例**：`git --git-dir=/外部/.git status`、
+  `git --work-tree=/外部 status`、`git -c core.worktree=/外部 status` → ask；
+  `git -C subdir status`（subdir 在專案內）→ allow、`git -C /tmp status` → ask。
 - 薄整合測試：JSON 餵 stdin 給 `main.ts`，斷言 stdout JSON。
 - 強制驗證：`deno check`（型別）+ `deno lint` + `deno test` 全綠才算完成。
 
