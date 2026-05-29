@@ -69,7 +69,7 @@
     "@std/assert": "jsr:@std/assert@^1.0.0"
   },
   "tasks": {
-    "test": "deno test --allow-env",
+    "test": "deno test --allow-run --allow-env --allow-read",
     "check": "deno check src/**/*.ts",
     "lint": "deno lint",
     "build": "deno compile --allow-env=CLAUDE_PROJECT_DIR --output dist/permission-checker src/main.ts"
@@ -251,9 +251,16 @@ Deno.test("double-quoted word with expansion is dynamic", () => {
   assertEquals(isStatic(w), false);
 });
 
-Deno.test("glob word is dynamic", () => {
-  const w = firstArg("cat *.txt");
-  assertEquals(isStatic(w), false);
+Deno.test("unquoted glob word is dynamic", () => {
+  assertEquals(isStatic(firstArg("cat *.txt")), false);
+  assertEquals(isStatic(firstArg("cat ?.txt")), false);
+  assertEquals(isStatic(firstArg("cat [ab].txt")), false);
+});
+
+Deno.test("quoted glob is static (glob chars protected by quotes)", () => {
+  const w = firstArg("cat '*.txt'");
+  assertEquals(isStatic(w), true);
+  assertEquals(staticValue(w), "*.txt");
 });
 ```
 
@@ -278,19 +285,36 @@ const DYNAMIC_PART_TYPES = new Set<string>([
   "ExtendedGlob",
 ]);
 
-function partIsDynamic(part: WordPart): boolean {
-  if (DYNAMIC_PART_TYPES.has(part.type)) return true;
-  // DoubleQuoted / LocaleString 內部仍可能含展開
-  if (part.type === "DoubleQuoted" || part.type === "LocaleString") {
-    return part.parts.some(partIsDynamic);
-  }
-  return false; // Literal / SingleQuoted / AnsiCQuoted
+/**
+ * 未加引號的 glob 元字元。unbash 不結構化表示 glob（`*.txt` 與字面值 `a.txt` 的
+ * Word 結構相同、皆無 parts），故須詞法偵測：未加引號的 `*` / `?` / `[` 會被 shell
+ * 展開、無法靜態確定指向哪些路徑 → 視為動態。
+ */
+const GLOB_CHARS = /[*?[]/;
+
+/** 雙引號內的 part：glob 字元被引號保護不展開，僅展開類 part 才算動態。 */
+function nestedPartIsDynamic(part: WordPart): boolean {
+  return DYNAMIC_PART_TYPES.has(part.type);
 }
 
-/** Word 是否為純靜態字面值（不含任何展開）。 */
+/** 頂層 part：展開類 → 動態；未加引號的 Literal 含 glob 字元 → 動態。 */
+function topPartIsDynamic(part: WordPart): boolean {
+  if (DYNAMIC_PART_TYPES.has(part.type)) return true;
+  if (part.type === "Literal") return GLOB_CHARS.test(part.value); // 未加引號字面值
+  // 雙引號 / locale 字串：內部 glob 不展開，只看展開類 part
+  if (part.type === "DoubleQuoted" || part.type === "LocaleString") {
+    return part.parts.some(nestedPartIsDynamic);
+  }
+  return false; // SingleQuoted / AnsiCQuoted → 引號保護的字面值
+}
+
+/** Word 是否為純靜態字面值（不含展開、且無未加引號的 glob）。 */
 export function isStatic(word: Word): boolean {
-  if (!word.parts) return true; // 純字面值，parts 可能為 undefined
-  return !word.parts.some(partIsDynamic);
+  if (!word.parts) {
+    // 無 parts = 未加引號的字面值；含 glob 元字元即視為動態
+    return !GLOB_CHARS.test(word.value);
+  }
+  return !word.parts.some(topPartIsDynamic);
 }
 
 /** 靜態時回傳字面值，動態回傳 null。 */
@@ -699,6 +723,14 @@ Deno.test("pure fd-dup 2>&1 is not a write", () => {
   assertEquals(hasWriteRedirect(redirectsOf("cmd 2>&1")), false);
 });
 
+Deno.test(">&filename is a write", () => {
+  assertEquals(hasWriteRedirect(redirectsOf("ls >&out.txt")), true);
+});
+
+Deno.test(">&fd-number is not a write (dup)", () => {
+  assertEquals(hasWriteRedirect(redirectsOf("ls >&2")), false);
+});
+
 Deno.test("input redirect < is not a write", () => {
   assertEquals(hasWriteRedirect(redirectsOf("cmd < in.txt")), false);
 });
@@ -719,7 +751,7 @@ Expected: FAIL
 import type { Redirect } from "../deps.ts";
 import { staticValue } from "./word.ts";
 
-/** 寫入型重導向運算子（會建立 / 覆寫 / 附加檔案）。 */
+/** 一律寫檔的運算子（建立 / 覆寫 / 附加檔案）。 */
 const WRITE_OPERATORS = new Set<string>([">", ">>", ">|", "&>", "&>>", "<>"]);
 
 /** 目標是否為 null 裝置（無副作用）。 */
@@ -728,21 +760,36 @@ function isNullDevice(value: string): boolean {
   return v === "/dev/null" || v === "nul";
 }
 
+/** target 是否為 fd 數字或關閉符 `-`（代表 fd 複製 / 關閉，非寫檔）。 */
+function isFdOrClose(value: string): boolean {
+  return /^\d+$/.test(value) || value === "-";
+}
+
 /**
- * 是否存在「會造成檔案寫入」的重導向。
- * - 純 fd 複製（無 target Word，如 2>&1）→ 不算寫入。
- * - 目標為 null 裝置 → 不算寫入。
- * - 目標為動態（無法靜態確認）→ 保守視為寫入（ask）。
+ * 單一重導向是否會造成檔案寫入。
+ * - `>&`：接檔名 → 寫檔（如 `ls >&out.txt`）；接 fd 數字 / `-` → fd 複製 / 關閉
+ *   （如 `2>&1`、`>&2`、`>&-`），非寫檔。`<&` 為輸入複製，永不寫檔。
+ * - WRITE_OPERATORS：一律寫檔，但目標為 null 裝置 → 視為無副作用。
+ * - 目標為動態（無法靜態確認）→ 保守視為寫檔（ask）。
  */
-export function hasWriteRedirect(redirects: Redirect[]): boolean {
-  for (const r of redirects) {
-    if (!WRITE_OPERATORS.has(r.operator)) continue;
-    if (!r.target) continue; // fd-dup，無檔案目標
-    const val = staticValue(r.target);
-    if (val !== null && isNullDevice(val)) continue;
-    return true;
+function isWriteRedirect(r: Redirect): boolean {
+  if (r.operator === ">&") {
+    if (!r.target) return false;
+    const v = staticValue(r.target);
+    if (v !== null && isFdOrClose(v)) return false; // fd 複製 / 關閉
+    if (v !== null && isNullDevice(v)) return false;
+    return true; // 檔名或動態目標 → 寫檔
   }
-  return false;
+  if (!WRITE_OPERATORS.has(r.operator)) return false; // 含 `<&`、純輸入運算子
+  if (!r.target) return false; // 無檔案目標
+  const val = staticValue(r.target);
+  if (val !== null && isNullDevice(val)) return false;
+  return true;
+}
+
+/** 是否存在任一會造成檔案寫入的重導向。 */
+export function hasWriteRedirect(redirects: Redirect[]): boolean {
+  return redirects.some(isWriteRedirect);
 }
 ```
 
@@ -937,6 +984,13 @@ Deno.test("gitEffectiveCwd: -c core.worktree changes base", () => {
   assertEquals(c, { kind: "known", path: "/outside" });
 });
 
+Deno.test("gitEffectiveCwd: --git-dir out-of-project sets cwd outside", () => {
+  assertEquals(
+    gitEffectiveCwd(cmdOf("git --git-dir=/outside/.git status"), { kind: "known", path: "/proj" }),
+    { kind: "known", path: "/outside/.git" },
+  );
+});
+
 Deno.test("gitEffectiveCwd: dynamic path option -> unknown", () => {
   assertEquals(
     gitEffectiveCwd(cmdOf("git -C $D status"), { kind: "known", path: "/proj" }),
@@ -1005,6 +1059,7 @@ function optionValue(argv: Word[], i: number, token: string): { value: string | 
 export function gitEffectiveCwd(cmd: Command, cwd: CwdState): CwdState {
   let base = cwd; // 隨 -C 累積
   let workTree: string | null = null; // 相對於套用 -C 後的 base
+  let gitDir: string | null = null; // --git-dir 路徑（納入範圍檢查）
   const argv = cmd.suffix;
 
   for (let i = 0; i < argv.length; i++) {
@@ -1022,9 +1077,10 @@ export function gitEffectiveCwd(cmd: Command, cwd: CwdState): CwdState {
       workTree = v.value;
       if (v.consumedNext) i++;
     } else if (tok === "--git-dir" || tok.startsWith("--git-dir=")) {
-      // --git-dir 改變倉庫基準；若為動態則 unknown，否則不改 cwd 本身
+      // --git-dir 指向倉庫目錄；靜態值須納入範圍檢查（落在專案外 → 該指令 cwd 視為該處）
       const v = optionValue(argv, i, tok);
       if (v.value === null) return UNKNOWN;
+      gitDir = v.value;
       if (v.consumedNext) i++;
     } else if (tok === "-c") {
       const v = optionValue(argv, i, tok);
@@ -1044,11 +1100,12 @@ export function gitEffectiveCwd(cmd: Command, cwd: CwdState): CwdState {
   }
 
   if (workTree !== null) return applyPath(base, workTree);
+  // --git-dir 在專案外 → effective cwd 指向該處，使中央 cwd 前置規則 ask；
+  // 在專案內則維持 in-project（讀取子指令仍可 allow）。
+  if (gitDir !== null) return applyPath(base, gitDir);
   return base;
 }
 ```
-
-> 註：`--git-dir` 不直接改變相對路徑基準（那是 `--work-tree` 的職責），但動態值仍 → unknown，保守處理。
 
 - [ ] **Step 4: 執行確認通過**
 
@@ -1440,6 +1497,11 @@ Deno.test("pureUtil always allows (no file operands)", () => {
   assertEquals(pureUtilRule.evaluate(ctxOf("whoami")).kind, "allow");
 });
 
+Deno.test("fileReader scope-checks basename path operand", () => {
+  assertEquals(fileReaderRule.evaluate(ctxOf("basename src/a.ts")).kind, "allow");
+  assertEquals(fileReaderRule.evaluate(ctxOf("realpath /etc/passwd")).kind, "ask");
+});
+
 Deno.test("cd always allows", () => {
   assertEquals(cdRule.evaluate(ctxOf("cd /anywhere")).kind, "allow");
 });
@@ -1505,18 +1567,23 @@ import type { CommandRule } from "../types.ts";
 import { allow } from "../types.ts";
 import { flagGatedReader } from "../factory.ts";
 
-/** 會把非 flag 參數當作要讀取的檔案路徑，需做範圍檢查。 */
+/**
+ * 會把非 flag 參數當作要讀取 / 解析的路徑，需做範圍檢查（spec line 218 要求整份
+ * 清單皆「路徑做範圍檢查」）。basename/dirname/realpath/readlink 接受路徑操作元，
+ * 故一併納入受範圍檢查的群組。
+ */
 export const fileReaderRule: CommandRule = flagGatedReader({
   names: [
     "cat", "head", "tail", "wc", "ls", "stat", "cut", "tr", "column",
     "cmp", "diff", "comm", "md5sum", "sha256sum", "hexdump", "jq", "nl", "fold",
+    "basename", "dirname", "realpath", "readlink",
   ],
   // 這些指令無「會寫檔」的 flag（已於 spec 查證）；故 askFlags 留空。
 });
 
 /** 不接受檔案路徑操作元、且無寫入能力的純工具：一律 allow。 */
 export const pureUtilRule: CommandRule = {
-  names: ["echo", "pwd", "whoami", "which", "basename", "dirname", "realpath", "readlink"],
+  names: ["echo", "pwd", "whoami", "which"],
   evaluate: () => allow(),
 };
 
@@ -1801,10 +1868,13 @@ import { staticValue } from "../../engine/word.ts";
 const ASK_FLAGS = [exact("-i", "--in-place", "-f", "--file"), prefix("--in-place=", "--file=")];
 const VALUE_FLAGS = [exact("-F", "-v", "-f", "--file", "--field-separator", "--assign")];
 
-/** awk 程式中代表副作用的構造：重導向 >、>>、pipe |、system(、getline、close(、fflush(。 */
+/** awk 程式中代表副作用的構造：輸出重導向、pipe、system(、getline、close(、fflush(。 */
 function programHasSideEffect(program: string): boolean {
-  if (/[>]/.test(program)) return true; // print > / >> file
-  if (/\|/.test(program)) return true; // print | "cmd" 或 "cmd" | getline
+  // 輸出重導向：僅在 print / printf 之後出現 > 或 >> 才算寫檔，避開比較運算子
+  // （bare pattern 過濾如 $3>100、NR>=8940 必須維持 allow）。
+  if (/\b(?:print|printf)\b[^;{}\n]*>/.test(program)) return true;
+  // pipe：偵測單一 |（print | "cmd" / "cmd" | getline），排除邏輯 ||。
+  if (/(?:^|[^|])\|(?:[^|]|$)/.test(program)) return true;
   if (/\bsystem\s*\(/.test(program)) return true;
   if (/\bgetline\b/.test(program)) return true;
   if (/\bclose\s*\(/.test(program)) return true;
@@ -3217,8 +3287,8 @@ deno task lint
 
 - [ ] **Step 2: 全套單元 + 整合測試**
 
-Run: `deno test --allow-run --allow-env --allow-read`
-Expected: 全部 PASS
+Run: `deno task test`
+Expected: 全部 PASS（task 已含 `--allow-run --allow-env --allow-read`）
 
 - [ ] **Step 3: 型別檢查與 lint**
 
