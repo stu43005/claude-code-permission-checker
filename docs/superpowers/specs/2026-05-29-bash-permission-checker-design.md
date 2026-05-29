@@ -109,22 +109,37 @@ interface CommandInvocation {
 ## 評估流程（engine/evaluate.ts）
 
 1. `unbash.parse(command)` → 若 `errors.length > 0` → `ask`（「指令語法無法可靠解析」）。
-2. `walk(script)` 列舉所有葉節點指令，並把 `CwdState` 穿過頂層循序語句：
+2. `walk(script)` 列舉所有葉節點指令，並把 `CwdState` 穿過頂層循序語句。
+   工作目錄的變動來源由 `cwd.ts` 在此階段統一識別：
    - 頂層 `cd <靜態路徑>` → 更新 cwd；`cd <動態>` 或無參數 `cd`（= `$HOME`）→
      自此 cwd 變 `unknown`。
+   - `git -C <path>`：此參數**只覆寫本次 git 指令的有效 cwd**、不外洩到後續語句。
+     `-C` 的識別與解析同樣在 `cwd.ts` 循序追蹤階段完成（與頂層 `cd` 同層級），
+     **不在 git rule 內處理**；若 `<path>` 為動態或解析後落在專案外，該指令的
+     `cwd` 即為 `unknown` / out-of-project。git rule 看到的 `ctx.cwd` 已是套用
+     `-C` 後的結果。
    - subshell `( … )` / pipeline 段：內部 `cd` 不外洩（用 cwd 副本），但內部
      指令**仍逐一分類與範圍檢查**。
-   - command substitution `$(…)`：內層指令會執行，**一併列舉求值**；其輸出是
-     動態值，若餵給外層指令當路徑 → 該路徑視為動態 → `ask`。
+   - command substitution `$(…)` / backtick：內層指令在**當前 cwd 的副本**下執行
+     （內部 `cd` 不外洩），內層指令**逐一納入分類與範圍檢查並參與最終 `combine`**
+     （內層若 `ask`，整體即 `ask`）。此外其輸出為動態值，若被外層指令當作路徑
+     參數使用，該路徑參數的 `resolvePath` 會回傳 `dynamic` → `ask`。
    - 控制流（if/for/while/case）：走訪所有分支本體收集指令；因無法靜態確定
      是否執行，迴圈/條件內的 `cd` 對其後語句的 cwd 影響 → 保守標 `unknown`。
-3. 對每個 `CommandInvocation`：
-   - **先範圍檢查**（規則 1 最高優先）：解析所有路徑型參數 + 重導向目標 + cwd
-     本身；任一落在專案外、或 scope 相關但為動態 / cwd 未知 → `ask`。
-   - 範圍 OK 才**分類**：`name` 為 null（動態指令名）→ `ask`；不在 allowlist →
-     `ask`（規則 3）；在 allowlist → 跑該指令規則 → `allow` / `ask`。
+3. 對每個 `CommandInvocation`（單一階段，範圍檢查內嵌於規則求值）：
+   - `name` 為 null（動態指令名）→ `ask`。
+   - 不在 allowlist → `ask`（規則 3）。
+   - cwd 與寫入型重導向目標的範圍檢查由**中央前置邏輯**先做（見「指令規則模型」
+     的中央前置規則）——這兩者不需要 argv 的路徑識別知識：cwd 落在專案外 / 為
+     `unknown` 而後續有相對路徑時 → `ask`；寫入重導向 → 依中央規則處理。
+   - 在 allowlist 且通過前置檢查 → 跑該指令規則。規則在 `evaluate` 內**自行宣告
+     哪些 argv 是路徑**，對每個路徑參數呼叫 `ctx.resolvePath(arg)`；任一回傳
+     `out-of-project` 或 `dynamic` → `ask`（規則 1）；否則 → `allow`。
+     （路徑識別屬各指令的語意知識，故必然發生在 rule 內、而非 rule 之前。）
 4. `combine`：任一指令 `ask` → 整體 `ask`（附首要原因）；全部 `allow` → `allow`。
-5. 邊界：解析後零個可執行指令（純註解 / 空白）→ `allow`（不會發生任何事）。
+5. 邊界：`parse` 成功（無 `errors`）且確認 AST 中**零個 Command 節點**（純註解 /
+   空白 / 空字串）→ `allow`，理由：等同 no-op、不會發生任何事。此 allow 嚴格
+   以「step 1 已通過、確實零指令」為前提；任何解析失敗的情形已在 step 1 擋成 `ask`。
 
 ## 範圍與路徑解析（engine/scope.ts）
 
@@ -136,13 +151,24 @@ interface CommandInvocation {
   I/O）。代價：專案內指向外部的 symlink 無法偵測，列為已知限制（可接受——本工具是
   「自動允許的收緊」、非對抗性安全邊界，且預設就是 `ask`）。
 - 含展開部位（變數 / `$()` / 可逸出 glob）的動態路徑 → 視為動態 → `ask`。
-- **「哪個參數是路徑」由各指令規則宣告**（例如 `grep PATTERN FILE…` 中第一個非
-  flag 是 pattern、其餘是路徑），rules 透過 scope.ts 提供的 helper 解析。
+- **`resolvePath(arg)` 契約**（三態）：`in-project`（靜態解析且落在根之下）、
+  `out-of-project`（靜態解析但落在根外）、`dynamic`。其中 `dynamic` 同時涵蓋兩種
+  情形：(a) arg 含展開部位無法靜態求值；(b) arg 為相對路徑但 `cwd.kind ===
+  "unknown"`、無法靜態定位。`out-of-project` 與 `dynamic` 皆 → `ask`（規則 1）。
+- **「哪個參數是路徑」由各指令規則在 `evaluate` 內宣告**（例如 `grep PATTERN
+  FILE…` 中第一個非 flag 是 pattern、其餘是路徑），rule 對其宣告的路徑參數呼叫
+  `ctx.resolvePath`。路徑識別是各指令的語意知識，故必然發生在 rule 內，而非由一個
+  rule 之外的通用「先範圍檢查」階段完成（後者無從得知 argv 語意）。
 
 ## 指令規則模型（rules/types.ts）
 
+`RuleContext` 由 `CommandInvocation` 投影建構；`name` 為已確認非 null 的靜態指令名
+（null 名稱在進 rule 前已被 step 3 擋為 `ask`），供需依「實際被呼叫的名字」分歧的
+規則（如別名 `egrep` / `fgrep` / `rg`）使用。
+
 ```typescript
 interface RuleContext {
+  name: string;              // 已確認非 null 的靜態指令名（含實際別名）
   argv: Word[];
   redirects: Redirect[];
   assignments: Assignment[];
@@ -163,12 +189,22 @@ interface CommandRule {
 
 **中央前置規則（在跑個別 rule 前統一套用）**：任何寫入型重導向（`>` `>>` `>|`
 `&>` `<>`）一律使該指令 → `ask`（除非該指令規則明確 bless，預設不 bless）。
-這實現「專案內寫入也 ask」。
+這實現「專案內寫入也 ask」。個別指令規則**不需也不應**重複判斷寫入重導向；
+重導向的允許 / 詢問完全由本中央前置規則決定，allowlist 中所有讀取型指令的規則
+只需處理其 argv 與 flag 語意。
+
+**重導向目標特例**：
+
+- 寫入型重導向若目標為 null 裝置（POSIX `/dev/null`；Windows `NUL`，不分大小寫），
+  視為「無副作用」，**不觸發 ask**，且其路徑不納入專案範圍檢查（涵蓋
+  `grep foo file 2>/dev/null`、`cmd > /dev/null 2>&1` 等常見唯讀慣用法）。
+- 純 fd 複製（`2>&1`、`>&` 之類，無檔案目標）不算寫入型重導向，不觸發 ask。
+- 其餘所有寫入型重導向目標一律 `ask`（即使落在專案內，貫徹「專案內寫入也 ask」）。
 
 ## 預設 allowlist 內容（rules/commands/）
 
 **讀取型 coreutils（allow，路徑做範圍檢查）**：
-`cat` `head` `tail` `wc` `ls` `tree` `stat` `file` `pwd` `echo`（無寫重導向時）
+`cat` `head` `tail` `wc` `ls` `tree` `stat` `file` `pwd` `echo`
 `which` `date` `whoami` `basename` `dirname` `realpath` `readlink` `cut` `sort`
 `uniq` `tr` `column` `cmp` `diff` `comm` `md5sum` `sha256sum` `xxd` `hexdump`
 `jq` `yq` `less` `nl` `fold`。
@@ -187,7 +223,8 @@ interface CommandRule {
   - `ask`：`commit` `add` `push` `pull` `fetch` `checkout` `switch` `restore`
     `reset` `merge` `rebase` `clean` `rm` `mv` `stash`（push / pop）`apply`
     `init` `clone` `worktree` `config`（set / unset）。
-  - `git -C <path>`：設定該次指令的 cwd → 對 `<path>` 做範圍檢查；`-c key=val`
+  - `git -C <path>`：覆寫該次指令的有效 cwd，於 `cwd.ts` 階段識別與範圍檢查
+    （見評估流程 step 2），git rule 收到的 `ctx.cwd` 已套用 `-C`；`-c key=val`
     視為無害。
 
 **預設排除（→ `ask`，需手動信任才加入）**：
@@ -219,17 +256,24 @@ interface CommandRule {
 - 引擎為純函式（`command + projectRoot + cwd → Verdict`），用 `deno test`
   表格驅動，免 FS、免真 hook。
 - 案例涵蓋：唯讀 allow（`grep` / `sed -n` / `git diff` / `cat` 於專案內）、
+  null 裝置重導向 allow（`grep foo file 2>/dev/null`、`cmd > /dev/null 2>&1`）、
   範圍逸出（`cat /etc/passwd`、`cd /tmp && ls`、`../` 逸出）、寫入（`sed -i`、
   `git commit`、`> redirect`、`mkdir`）、動態（`$VAR` 路徑、`$(...)`、glob）、
-  組合（pipe 中一段寫入、`&&` 串接、subshell、command substitution 內層寫入）、
-  解析錯誤、未知指令、信任擴充（加一條 fake 規則 → allow）。
+  cwd 未知後的相對路徑（`cd $X && cat f` → `dynamic` → ask）、`git -C` 逸出與
+  在專案內、組合（pipe 中一段寫入、`&&` 串接、subshell、command substitution
+  內層寫入）、空指令 / 純註解 → allow、解析錯誤、未知指令、信任擴充（加一條
+  fake 規則 → allow）。
 - 薄整合測試：JSON 餵 stdin 給 `main.ts`，斷言 stdout JSON。
 - 強制驗證：`deno check`（型別）+ `deno lint` + `deno test` 全綠才算完成。
 
 ## Build 與 hook 接線
 
 - `deno compile --allow-env=CLAUDE_PROJECT_DIR --output dist/permission-checker src/main.ts`
-  → 單一執行檔。**只需 `--allow-env`，不需 `--allow-read`**（詞法路徑檢查、不碰 FS）。
+  → 單一執行檔。`npm:unbash` 於 `deno compile` 時嵌入 binary，執行期不需網路或
+  npm 解析。**「不需 `--allow-read`」僅就路徑檢查邏輯本身而言**（純詞法、不碰
+  FS），與 npm 嵌入機制為兩個獨立宣稱。`--allow-env` 暫限定 `CLAUDE_PROJECT_DIR`；
+  若 compile 後執行期報缺其他環境變數權限（屬實作期 operational verification），
+  依實際錯誤訊息補列所需 env，不在純詞法路徑檢查的權限宣稱範圍內。
 - `deno.json` 提供 task：`deno task build` / `test` / `check` / `lint`。
 - 接線（`~/.claude/settings.json`，Windows 直接指向 `.exe` 絕對路徑）：
 
