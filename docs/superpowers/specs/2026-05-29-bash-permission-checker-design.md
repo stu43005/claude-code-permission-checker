@@ -129,13 +129,17 @@ interface CommandInvocation {
 3. 對每個 `CommandInvocation`（單一階段，範圍檢查內嵌於規則求值）：
    - `name` 為 null（動態指令名）→ `ask`。
    - 不在 allowlist → `ask`（規則 3）。
-   - cwd 與寫入型重導向目標的範圍檢查由**中央前置邏輯**先做（見「指令規則模型」
-     的中央前置規則）——這兩者不需要 argv 的路徑識別知識：cwd 落在專案外 / 為
-     `unknown` 而後續有相對路徑時 → `ask`；寫入重導向 → 依中央規則處理。
-   - 在 allowlist 且通過前置檢查 → 跑該指令規則。規則在 `evaluate` 內**自行宣告
-     哪些 argv 是路徑**，對每個路徑參數呼叫 `ctx.resolvePath(arg)`；任一回傳
-     `out-of-project` 或 `dynamic` → `ask`（規則 1）；否則 → `allow`。
-     （路徑識別屬各指令的語意知識，故必然發生在 rule 內、而非 rule 之前。）
+   - **中央前置檢查**（見「指令規則模型」的兩條中央前置規則，皆不需 argv 語意，
+     在跑個別 rule 前完成；任一觸發即 `ask`、不再進 rule）：
+     (a) cwd 範圍：`cwd.kind === "known"` 但 path 落在專案根之外（例如 `cd /tmp`
+         後的指令、或 `git -C <專案外路徑>`）→ `ask`。`cwd.kind === "unknown"`
+         本身**不在此處** ask。
+     (b) 寫入型重導向：依中央規則處理（null 裝置特例見該段）。
+   - 通過中央前置檢查 → 跑該指令規則。規則在 `evaluate` 內**自行宣告哪些 argv 是
+     路徑**，對每個路徑參數呼叫 `ctx.resolvePath(arg)`；任一回傳 `out-of-project`
+     或 `dynamic` → `ask`（規則 1）；否則 → `allow`。其中 `cwd.kind === "unknown"`
+     導致相對路徑無法定位的情形，由 `resolvePath` 回傳 `dynamic` 在此處理（見
+     resolvePath 契約 case (b)）——這需要 argv 語意，故必在 rule 內、非中央階段。
 4. `combine`：任一指令 `ask` → 整體 `ask`（附首要原因）；全部 `allow` → `allow`。
 5. 邊界：`parse` 成功（無 `errors`）且確認 AST 中**零個 Command 節點**（純註解 /
    空白 / 空字串）→ `allow`，理由：等同 no-op、不會發生任何事。此 allow 嚴格
@@ -187,8 +191,14 @@ interface CommandRule {
 }
 ```
 
-**中央前置規則（在跑個別 rule 前統一套用）**：任何寫入型重導向（`>` `>>` `>|`
-`&>` `<>`）一律使該指令 → `ask`（除非該指令規則明確 bless，預設不 bless）。
+**中央前置規則之一（cwd 範圍）**：若 `ctx.cwd.kind === "known"` 但其 path 落在
+專案根之外（例如 `cd /tmp` 後的指令、`git -C <專案外路徑>`），該指令一律 `ask`、
+不再跑個別 rule。此檢查純看 cwd、不需 argv 語意，故置於中央前置階段。
+（`cwd.kind === "unknown"` 本身不在此處 ask；只有當 rule 內 `resolvePath` 對相對
+路徑回傳 `dynamic` 時才 ask——見 resolvePath 契約 case (b)。）
+
+**中央前置規則之二（寫入型重導向）**：任何寫入型重導向（`>` `>>` `>|`
+`&>` `&>>` `<>`）一律使該指令 → `ask`（除非該指令規則明確 bless，預設不 bless）。
 這實現「專案內寫入也 ask」。個別指令規則**不需也不應**重複判斷寫入重導向；
 重導向的允許 / 詢問完全由本中央前置規則決定，allowlist 中所有讀取型指令的規則
 只需處理其 argv 與 flag 語意。
