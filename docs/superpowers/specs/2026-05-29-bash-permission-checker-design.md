@@ -114,7 +114,7 @@ interface CommandInvocation {
    - 頂層 `cd <靜態路徑>` → 更新 cwd；`cd <動態>` 或無參數 `cd`（= `$HOME`）→
      自此 cwd 變 `unknown`。
    - git 指令級路徑選項（`-C <path>`、`--git-dir=<path>`、`--work-tree=<path>`、
-     `-c core.worktree=<path>` / `-c core.bare`）：**只覆寫本次 git 指令的有效
+     `-c core.worktree=<path>`）：**只覆寫本次 git 指令的有效
      cwd / 基準**、不外洩到後續語句。這些選項可互相組合，須**解析完全部選項後**
      再算最終路徑（例如 `git -C c --git-dir=a.git --work-tree=b` 的基準相對於
      `c`）。識別與解析皆在 `cwd.ts` 循序追蹤階段完成（與頂層 `cd` 同層級），
@@ -227,7 +227,9 @@ interface CommandRule {
 > 皆**不寫檔**，輸出僅到 stdout，維持 `allow`。`tail -f` / `-F` 不寫檔（僅長時間
 > 阻塞），維持 `allow`。
 
-**有 flag / 參數條件的指令**（命中下列任一寫入或副作用條件 → `ask`，否則 `allow`）：
+**有 flag / 參數條件的指令**（命中下列任一寫入或副作用條件 → `ask`；否則對其宣告
+的輸入路徑參數逐一呼叫 `ctx.resolvePath`，任一 `out-of-project` / `dynamic` →
+`ask`，全部 `in-project` 才 `allow`——與純讀取 coreutils 同樣受範圍檢查約束）：
 
 - `sed`：**腳本掃描白名單**。sed 程式碼即使無 `-i` 也能寫檔 / 執行 shell
   （`w file`、`W file`、`s///w file`、`e` 指令、`s///e` 旗標），這些藏在腳本參數
@@ -284,7 +286,7 @@ interface CommandRule {
     git rule 收到的 `ctx.cwd` 已套用之；可互相組合，路徑檢查必須在解析完全部選項
     後進行）：`-C <path>`（覆寫該次 git 的 cwd，多個累積）、`--git-dir=<path>`、
     `--work-tree=<path>`（改變倉庫 / 工作樹基準）、`-c core.worktree=<path>`
-    / `-c core.bare`（透過 config 改變路徑基準）。其餘 `-c key=val` 視為無害。
+    （透過 config 改變工作樹路徑基準）。其餘 `-c key=val` 視為無害。
 
 **預設排除（→ `ask`，需手動信任才加入）**：
 `rm` `mv` `cp` `mkdir` `touch` `chmod` `chown` `ln` `dd` `tee` `truncate`
@@ -319,7 +321,9 @@ interface CommandRule {
   `awk 'NR>=8940 && NR<=9281' file` / `git diff` / `cat` 於專案內）、
   null 裝置重導向 allow（`grep foo file 2>/dev/null`、
   `cmd > /dev/null 2>&1`）、範圍逸出（`cat /etc/passwd`、`cd /tmp && ls`、`../`
-  逸出）、寫入（`sed -i`、`git commit`、`> redirect`、`mkdir`）、動態（`$VAR`
+  逸出、**flag 條件指令讀專案外**如 `sed -n '1,5p' /etc/passwd`、
+  `awk 'NR<5' /etc/passwd`、`xxd /etc/passwd` → ask）、寫入（`sed -i`、
+  `git commit`、`> redirect`、`mkdir`）、動態（`$VAR`
   路徑、`$(...)`、glob）、cwd 未知後的相對路徑（`cd $X && cat f` → `dynamic` →
   ask）、組合（pipe 中一段寫入、`&&` 串接、subshell、command substitution
   內層寫入）、空指令 / 純註解 → allow、解析錯誤、未知指令、信任擴充（加一條
