@@ -1,0 +1,14 @@
+{
+  "imports": {
+    "unbash": "npm:unbash@3.0.0",
+    "unbash/printer": "npm:unbash@3.0.0/printer",
+    "@std/assert": "jsr:@std/assert@^1.0.0"
+  },
+  "tasks": {
+    "test": "deno test --allow-run --allow-env --allow-read",
+    "check": "deno check src/**/*.ts",
+    "lint": "deno lint",
+    "build": "deno compile --allow-env=CLAUDE_PROJECT_DIR --output dist/permission-checker src/main.ts"
+  },
+  "lint": { "rules": { "tags": ["recommended"] } }
+}
