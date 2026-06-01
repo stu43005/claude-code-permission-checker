@@ -4,6 +4,7 @@ import type { Command } from "../../deps.ts";
 import { gitRule } from "./git.ts";
 import type { RuleContext } from "../types.ts";
 import { resolvePath, resolvePathValue } from "../../engine/scope.ts";
+import { evaluate } from "../../engine/evaluate.ts";
 
 function ctxOf(src: string): RuleContext {
   const cmd = parse(src).commands[0].command as Command;
@@ -113,4 +114,73 @@ Deno.test("git grep without -O still allows", () => {
 
 Deno.test("git log still allows (no dangerous flags)", () => {
   assertEquals(v("git log"), "allow");
+});
+
+// ── New tests for global option allowlist ──────────────────────────────────
+
+Deno.test("git --config-env asks (injects config from env var -> arbitrary exec)", () => {
+  assertEquals(v("git --config-env=core.pager=EVIL log"), "ask");
+  assertEquals(v("git --config-env core.pager=EVIL log"), "ask");
+});
+
+Deno.test("git --exec-path (bare, no value) asks", () => {
+  // --exec-path with no value is a query form; still dangerous (can hijack)
+  assertEquals(v("git --exec-path log"), "ask");
+});
+
+Deno.test("git unknown global option asks", () => {
+  assertEquals(v("git --frobnicate log"), "ask");
+  assertEquals(v("git --upload-pack=/tmp/x fetch"), "ask");
+});
+
+Deno.test("git safe valueless global options allow with read subcommands", () => {
+  assertEquals(v("git -p log"), "allow");
+  assertEquals(v("git --no-pager status"), "allow");
+  assertEquals(v("git --paginate diff"), "allow");
+  assertEquals(v("git --literal-pathspecs status"), "allow");
+  assertEquals(v("git --no-literal-pathspecs status"), "allow");
+  assertEquals(v("git --glob-pathspecs status"), "allow");
+  assertEquals(v("git --noglob-pathspecs status"), "allow");
+  assertEquals(v("git --icase-pathspecs status"), "allow");
+  assertEquals(v("git --no-optional-locks status"), "allow");
+  assertEquals(v("git --bare status"), "allow");
+  assertEquals(v("git --no-replace-objects log"), "allow");
+});
+
+Deno.test("git safe value global options (space form) allow with read subcommands", () => {
+  assertEquals(v("git --namespace foo log"), "allow");
+  assertEquals(v("git --super-prefix x/ status"), "allow");
+});
+
+Deno.test("git safe value global options (= form) allow with read subcommands", () => {
+  assertEquals(v("git --namespace=foo log"), "allow");
+  assertEquals(v("git --super-prefix=x/ status"), "allow");
+  assertEquals(v("git --attr-source=file log"), "allow");
+});
+
+Deno.test("git -C in-project subdir allows at rule level", () => {
+  assertEquals(v("git -C sub status"), "allow");
+});
+
+Deno.test("git log -p (subcommand flag, not global) still allows", () => {
+  assertEquals(v("git log -p"), "allow");
+});
+
+Deno.test("git show -c HEAD (subcommand flag, not global -c) still allows", () => {
+  assertEquals(v("git show -c HEAD"), "allow");
+});
+
+Deno.test("git -p log (global --paginate short form before subcommand) allows", () => {
+  assertEquals(v("git -p log"), "allow");
+});
+
+Deno.test("git --no-pager status allows", () => {
+  assertEquals(v("git --no-pager status"), "allow");
+});
+
+Deno.test("git -C /tmp status asks (out-of-project path, via full pipeline)", () => {
+  // cwd.ts range check handles this via classify.ts, not the git rule itself.
+  // Use the full evaluate() pipeline to confirm end-to-end behavior.
+  const cwd = { kind: "known" as const, path: "/proj" };
+  assertEquals(evaluate("git -C /tmp status", "/proj", cwd).verdict, "ask");
 });
