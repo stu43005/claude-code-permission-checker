@@ -213,6 +213,12 @@ interface CommandRule {
 - 純 fd 複製（`2>&1`、`>&` 之類，無檔案目標）不算寫入型重導向，不觸發 ask。
 - 其餘所有寫入型重導向目標一律 `ask`（即使落在專案內，貫徹「專案內寫入也 ask」）。
 
+**中央前置規則之三（環境變數賦值前綴）**：指令若帶任何 `var=val` 賦值前綴
+（unbash 的 `Command.prefix`）一律 `ask`、不再跑個別 rule。理由：前綴可注入會改變
+執行行為的環境變數（如 `LD_PRELOAD=… cat x`、`LD_AUDIT`、`BASH_ENV=… cmd`、`IFS`、
+`PATH` 等）造成任意碼執行，無法靜態保證安全。此檢查純看是否存在前綴、不需逐一辨識
+變數名，故置於中央前置階段（最保守、零誤放風險）。
+
 ## 預設 allowlist 內容（rules/commands/）
 
 **純讀取 coreutils（無寫入 flag、無位置輸出檔，allow，路徑做範圍檢查）**：
@@ -230,6 +236,11 @@ interface CommandRule {
 **有 flag / 參數條件的指令**（命中下列任一寫入或副作用條件 → `ask`；否則對其宣告
 的輸入路徑參數逐一呼叫 `ctx.resolvePath`，任一 `out-of-project` / `dynamic` →
 `ask`，全部 `in-project` 才 `allow`——與純讀取 coreutils 同樣受範圍檢查約束）：
+
+> **吃路徑值的 flag**：若某 flag 的「值」本身是會被讀取的檔案路徑（如 `grep` /
+> `rg` 的 `-f` / `--file <patternfile>`、`diff` 的 `--from-file` / `--to-file
+> <file>`），該值亦須做範圍檢查（`out-of-project` / `dynamic` → `ask`）；不可只是
+> 當成 flag 的值跳過。其值為非路徑的 flag（如 `-n`、`-A 3`、`-d ,`）跳過即可。
 
 - `sed`：**腳本掃描白名單**。sed 程式碼即使無 `-i` 也能寫檔 / 執行 shell
   （`w file`、`W file`、`s///w file`、`e` 指令、`s///e` 旗標），這些藏在腳本參數
@@ -279,6 +290,9 @@ interface CommandRule {
     `branch`（僅列出，無 `-d` / `-D` / `-m`）`tag`（僅列出）`remote -v`
     `cat-file` `ls-files` `ls-tree` `for-each-ref` `config --get` / `--list`
     `stash list` `reflog` `shortlog` `grep`。
+  - **讀取子指令的危險 flag 例外（→ `ask`）**：任何讀取子指令含 `--output=<file>`
+    （寫檔，如 `git diff --output=x`）→ `ask`；`git grep` 含 `-O` / `-O<pager>` /
+    `--open-files-in-pager[=<pager>]`（會執行任意 pager 程式）→ `ask`。
   - `ask`：`commit` `add` `push` `pull` `fetch` `checkout` `switch` `restore`
     `reset` `merge` `rebase` `clean` `rm` `mv` `stash`（push / pop）`apply`
     `init` `clone` `worktree` `config`（set / unset）。
@@ -286,7 +300,17 @@ interface CommandRule {
     git rule 收到的 `ctx.cwd` 已套用之；可互相組合，路徑檢查必須在解析完全部選項
     後進行）：`-C <path>`（覆寫該次 git 的 cwd，多個累積）、`--git-dir=<path>`、
     `--work-tree=<path>`（改變倉庫 / 工作樹基準）、`-c core.worktree=<path>`
-    （透過 config 改變工作樹路徑基準）。其餘 `-c key=val` 視為無害。
+    （透過 config 改變工作樹路徑基準）。
+  - **危險 config / 外部程式例外（→ `ask`）**：`git config` 可指定外部程式執行
+    （`-c diff.external=<cmd>`、`-c core.pager=<cmd>`、`-c <driver>.textconv=<cmd>`、
+    `-c <driver>.command=<cmd>`、`core.fsmonitor` / `core.sshCommand` /
+    `core.hooksPath` / `core.editor` / `sequence.editor` 等），靜態無法保證安全。
+    因此 `-c` / `--config` **僅放行少數純外觀 config 的 key**（安全 allowlist：
+    `color.*`、`core.quotepath` / `core.quotePath`、`core.abbrev`、`log.date`、
+    `i18n.*`、`advice.*`，以及做路徑檢查的 `core.worktree`）；**其餘任何 `-c key`
+    一律 `ask`**。另 `--ext-diff`（啟用外部 diff driver）、`--exec-path[=<dir>]`
+    （把 `<dir>` 前置到子程序 `$PATH`，可讓 pager/driver 解析到攻擊者程式，且範圍
+    檢查無法擋——可指向專案內目錄）→ `ask`。
 
 **預設排除（→ `ask`，需手動信任才加入）**：
 `rm` `mv` `cp` `mkdir` `touch` `chmod` `chown` `ln` `dd` `tee` `truncate`

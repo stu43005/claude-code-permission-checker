@@ -1,0 +1,50 @@
+import { assertEquals } from "@std/assert";
+import { parse } from "../../deps.ts";
+import type { Command } from "../../deps.ts";
+import { grepRule } from "./grep.ts";
+import type { RuleContext } from "../types.ts";
+import { resolvePath, resolvePathValue } from "../../engine/scope.ts";
+
+function ctxOf(name: string, src: string): RuleContext {
+  const cmd = parse(src).commands[0].command as Command;
+  const cwd = { kind: "known", path: "/proj" } as const;
+  return {
+    name,
+    argv: cmd.suffix,
+    redirects: cmd.redirects,
+    assignments: cmd.prefix,
+    cwd,
+    resolvePath: (w) => resolvePath(w, cwd, "/proj"),
+    resolvePathValue: (v) => resolvePathValue(v, cwd, "/proj"),
+  };
+}
+
+Deno.test("grep in-project allows", () => {
+  assertEquals(grepRule.evaluate(ctxOf("grep", "grep foo bar.txt")).kind, "allow");
+  assertEquals(grepRule.evaluate(ctxOf("grep", "grep -rn TODO src")).kind, "allow");
+});
+
+Deno.test("grep reading out-of-project file asks", () => {
+  assertEquals(grepRule.evaluate(ctxOf("grep", "grep root /etc/passwd")).kind, "ask");
+});
+
+Deno.test("rg -A value skipped, in-project allows", () => {
+  assertEquals(grepRule.evaluate(ctxOf("rg", "rg -A 3 pattern src")).kind, "allow");
+});
+
+Deno.test("rule covers aliases", () => {
+  assertEquals(grepRule.names.includes("egrep"), true);
+  assertEquals(grepRule.names.includes("rg"), true);
+});
+
+Deno.test("grep -f out-of-project pattern file asks", () => {
+  assertEquals(grepRule.evaluate(ctxOf("grep", "grep -f /etc/patterns readme.md")).kind, "ask");
+});
+
+Deno.test("grep --file= out-of-project asks", () => {
+  assertEquals(grepRule.evaluate(ctxOf("grep", "grep --file=/etc/x readme.md")).kind, "ask");
+});
+
+Deno.test("grep -f in-project pattern file allows", () => {
+  assertEquals(grepRule.evaluate(ctxOf("grep", "grep -f patterns.txt readme.md")).kind, "allow");
+});
