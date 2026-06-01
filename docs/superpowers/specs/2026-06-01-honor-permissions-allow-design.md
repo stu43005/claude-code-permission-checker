@@ -104,8 +104,14 @@ export const EMPTY_RULES: PermissionRules = { allow: [], deny: [], ask: [] };
 /** 讀檔器：回傳檔案內容字串；不存在 / 無法讀 → null。注入以利測試。 */
 export type ReadText = (path: string) => string | null;
 
-/** 預設讀檔器：包裹 Deno.readTextFileSync，任何錯誤（含 NotFound / 權限不足）→ null。 */
-export const defaultReadText: ReadText;
+/** 預設讀檔器：任何錯誤（NotFound / 權限 / 路徑為目錄 / I/O）一律吞掉回 null，不區分類型、不重拋。 */
+export const defaultReadText: ReadText = (path) => {
+  try {
+    return Deno.readTextFileSync(path);
+  } catch {
+    return null; // 全部視為「拿不到此來源」
+  }
+};
 
 /**
  * 解析三個來源並合併。env 用於解析使用者家目錄。readText 預設為 defaultReadText。
@@ -177,8 +183,8 @@ export function matchesAny(cmd: string, pats: BashPattern[]): boolean;
 /**
  * 綜合判定：此 invocation 是否應依 settings 升級為 allow。
  *   cmd = reconstructCommand(inv)；null → false
- *   命中 deny 或 ask → false（完整優先序）
- *   命中 allow → true；否則 false
+ *   matchesAny(cmd, rules.deny) 或 matchesAny(cmd, rules.ask) → false（完整優先序）
+ *   matchesAny(cmd, rules.allow) → true；否則 false
  */
 export function settingsAllows(inv: CommandInvocation, rules: PermissionRules): boolean;
 ```
@@ -197,13 +203,18 @@ export function settingsAllows(inv: CommandInvocation, rules: PermissionRules): 
 
 1. 字串須形如 `Bash(<inner>)`（前綴 `Bash(`、結尾 `)`）；否則回 null（忽略 `Read(...)`、`Edit(...)` 等
    非 Bash 工具規則）。
-2. 取出 `<inner>`。
-2.5. 若 `inner === ""`（規則為 `Bash()`）→ 回 null（無意義的空規則，忽略）。
-3. 若 `inner` 以 `:*` 結尾 → `{ kind: "prefix-boundary", prefix: inner 去掉結尾 ":*" }`。
-4. 否則若以 ` *`（空白接星號）結尾 → `{ kind: "prefix-boundary", prefix: inner 去掉結尾 " *" }`。
-5. 否則若以 `*` 結尾（前一字元非空白） → `{ kind: "prefix-loose", prefix: inner 去掉結尾 "*" }`。
+2. 取出 `<inner>`；若 `inner === ""`（規則為 `Bash()`）→ 回 null（無意義的空規則）。
+3. 若 `inner` 以 `:*` 結尾：令 `p` = `inner` 去掉結尾 `":*"`；**若 `p` 不含 `*`** →
+   `{ kind: "prefix-boundary", prefix: p }`；否則往下。
+4. 否則若以 ` *`（空白接星號）結尾：令 `p` = `inner` 去掉結尾 `" *"`；**若 `p` 不含 `*`** →
+   `{ kind: "prefix-boundary", prefix: p }`；否則往下。
+5. 否則若以 `*` 結尾（前一字元非空白）：令 `p` = `inner` 去掉結尾 `"*"`；**若 `p` 不含 `*`** →
+   `{ kind: "prefix-loose", prefix: p }`；否則往下。
 6. 否則若 `inner` 不含 `*` → `{ kind: "exact", text: inner }`。
-7. 其餘（含中段或多個 `*` 等無法可靠解析的形式）→ null。
+7. 其餘（含中段 `*`、多個 `*` 等無法可靠解析的形式）→ null。
+
+如此「prefix 中段含 `*`」的任何形式（如 `Bash(git * status:*)`）都會落到步驟 7 回 null，
+與「中段萬用字元不支援」的非目標自洽。
 
 `matchesPattern` 規則：
 
@@ -273,7 +284,8 @@ export function evaluate(
 return { verdict: "allow", reason: "全部指令均通過（唯讀放行或命中 permissions.allow）" };
 ```
 
-`combine_test.ts` 中斷言此字串的測試需同步更新。
+現行測試（`combine_test.ts` / `evaluate_test.ts`）均只斷言 `verdict`、未斷言此 allow `reason` 字串，
+故改字串不會打破既有斷言；順帶在測試補上對新 reason 的覆蓋（見 §6）。
 
 ### 4.6 `src/main.ts`
 
@@ -320,7 +332,7 @@ deno compile --allow-read --allow-env=CLAUDE_PROJECT_DIR,HOME,USERPROFILE --outp
     `normalizeAbsolute` 後組出的使用者檔路徑為 `C:/Users/X/.claude/settings.json`。
 - **`src/permissions/matcher_test.ts`**
   - `parseBashRule`：`Bash(npm test:*)`→prefix-boundary、`Bash(ls *)`→prefix-boundary、
-    `Bash(ls*)`→prefix-loose、`Bash(git status)`→exact、`Read(./x)`→null、`Bash(git * --x)`→null、`Bash()`→null。
+    `Bash(ls*)`→prefix-loose、`Bash(git status)`→exact、`Read(./x)`→null、`Bash(git * --x)`→null、`Bash(git * status:*)`→null（中段 `*`）、`Bash()`→null。
   - `matchesPattern`：boundary 命中 `ls`、`ls -la`，不命中 `lsof`；loose 命中 `lsof`；
     exact 僅命中完全相等。
   - `reconstructCommand`：name+靜態 argv → `"git diff --stat"`；動態 argv（變數 / `$()` / 未引號 glob）
@@ -332,7 +344,8 @@ deno compile --allow-read --allow-env=CLAUDE_PROJECT_DIR,HOME,USERPROFILE --outp
   - builtin 已 allow 的指令不受 rules 影響（即使 rules 為空或含該指令）。
   - 命中 allow 但同時命中 deny / ask → 維持 ask。
   - 不帶 rules 參數呼叫 → 行為同現況。
-- **`src/engine/combine_test.ts`**：更新 allow 訊息斷言為新措辭。
+- **`src/engine/combine_test.ts`**：現有測試僅斷言 `verdict`、未覆蓋 `reason`；新增一條斷言全 allow 時
+  `reason === "全部指令均通過（唯讀放行或命中 permissions.allow）"`，補上對 allow 訊息的覆蓋。
 - **`src/engine/evaluate_test.ts`**：複合指令逐 invocation——一筆 builtin-allow + 一筆 settings-allow
   → 整體 allow；其中一筆兩者皆不放行 → 整體 ask（最弱環節）。
 - **`src/main_test.ts`（e2e）**：新增 fixture 目錄（版本控制，無需寫檔），內含
