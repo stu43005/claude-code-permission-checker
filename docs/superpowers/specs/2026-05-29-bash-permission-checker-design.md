@@ -300,7 +300,15 @@ interface CommandRule {
     git rule 收到的 `ctx.cwd` 已套用之；可互相組合，路徑檢查必須在解析完全部選項
     後進行）：`-C <path>`（覆寫該次 git 的 cwd，多個累積）、`--git-dir=<path>`、
     `--work-tree=<path>`（改變倉庫 / 工作樹基準）、`-c core.worktree=<path>`
-    （透過 config 改變工作樹路徑基準）。其餘 `-c key=val` 視為無害。
+    （透過 config 改變工作樹路徑基準）。
+  - **危險 config / 外部程式例外（→ `ask`）**：`git config` 可指定外部程式執行
+    （`-c diff.external=<cmd>`、`-c core.pager=<cmd>`、`-c <driver>.textconv=<cmd>`、
+    `-c <driver>.command=<cmd>`、`core.fsmonitor` / `core.sshCommand` /
+    `core.hooksPath` / `core.editor` / `sequence.editor` 等），靜態無法保證安全。
+    因此 `-c` / `--config` **僅放行少數純外觀 config 的 key**（安全 allowlist：
+    `color.*`、`core.quotepath` / `core.quotePath`、`core.abbrev`、`log.date`、
+    `i18n.*`、`advice.*`，以及做路徑檢查的 `core.worktree`）；**其餘任何 `-c key`
+    一律 `ask`**。另 `--ext-diff`（啟用外部 diff driver）→ `ask`。
 
 **預設排除（→ `ask`，需手動信任才加入）**：
 `rm` `mv` `cp` `mkdir` `touch` `chmod` `chown` `ln` `dd` `tee` `truncate`
