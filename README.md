@@ -19,13 +19,18 @@ deno task build
       {
         "matcher": "Bash",
         "hooks": [
-          { "type": "command", "command": "D:\\path\\to\\dist\\permission-checker.exe" }
+          { "type": "command", "command": "D:/path/to/dist/permission-checker.exe" }
         ]
       }
     ]
   }
 }
 ```
+
+> **Windows 路徑風格（重要）**：`command` 一律用**正斜線**（`D:/path/.../x.exe`）。
+> 無 `args` 的 `type: "command"` hook 在 Windows 上以 Git Bash 執行命令字串，bash 會把
+> **反斜線當跳脫字元**——`D:\path\...\x.exe` 會被改寫成 `D:path...x.exe` 而 command
+> not found（exit 127），hook 形同靜默失效。正斜線在 Git Bash 與直接執行兩種模式下皆可。
 
 ## 開發
 
