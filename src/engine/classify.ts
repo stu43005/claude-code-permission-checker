@@ -2,7 +2,7 @@ import type { CommandInvocation } from "../types.ts";
 import type { RuleVerdict } from "../rules/types.ts";
 import { ask } from "../rules/types.ts";
 import { lookupRule } from "../rules/allowlist.ts";
-import { isWithin, resolvePath } from "./scope.ts";
+import { isWithin, resolvePath, resolvePathValue } from "./scope.ts";
 import { hasWriteRedirect } from "./redirect.ts";
 
 /** 對單一指令呼叫判定 allow / ask。 */
@@ -20,6 +20,10 @@ export function classify(inv: CommandInvocation, root: string): RuleVerdict {
   if (hasWriteRedirect(inv.redirects)) {
     return ask(`${inv.name}：寫入型重導向`);
   }
+  // 中央前置規則之三：環境變數賦值前綴（LD_PRELOAD/BASH_ENV 等）可改變執行行為
+  if (inv.assignments.length > 0) {
+    return ask(`${inv.name}：含環境變數賦值前綴，可能改變執行行為`);
+  }
 
   return rule.evaluate({
     name: inv.name,
@@ -28,5 +32,6 @@ export function classify(inv: CommandInvocation, root: string): RuleVerdict {
     assignments: inv.assignments,
     cwd: inv.cwd,
     resolvePath: (w) => resolvePath(w, inv.cwd, root),
+    resolvePathValue: (v) => resolvePathValue(v, inv.cwd, root),
   });
 }

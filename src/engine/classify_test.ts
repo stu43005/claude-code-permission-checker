@@ -37,3 +37,11 @@ Deno.test("read-only in-project allows", () => {
 Deno.test("null-device redirect still allows", () => {
   assertEquals(only("grep x f 2>/dev/null").kind, "allow");
 });
+
+Deno.test("LD_PRELOAD env assignment prefix asks", () => {
+  assertEquals(only("LD_PRELOAD=/tmp/x.so cat a").kind, "ask");
+});
+
+Deno.test("FOO=bar env assignment prefix asks", () => {
+  assertEquals(only("FOO=bar cat a").kind, "ask");
+});

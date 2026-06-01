@@ -57,14 +57,18 @@ export function isWithin(root: string, target: string): boolean {
   return t.startsWith(rSlash);
 }
 
+/** 對「已取得的字串路徑值」做範圍檢查（三態）。 */
+export function resolvePathValue(value: string | null, cwd: CwdState, root: string): PathScope {
+  if (value === null) return "dynamic";
+  if (isAbsolute(value)) {
+    return isWithin(root, value) ? "in-project" : "out-of-project";
+  }
+  if (cwd.kind === "unknown") return "dynamic";
+  const resolved = resolveAgainst(cwd.path, value);
+  return isWithin(root, resolved) ? "in-project" : "out-of-project";
+}
+
 /** 解析單一參數對專案根的範圍（三態）。 */
 export function resolvePath(arg: Word, cwd: CwdState, root: string): PathScope {
-  const val = staticValue(arg);
-  if (val === null) return "dynamic"; // 含展開
-  if (isAbsolute(val)) {
-    return isWithin(root, val) ? "in-project" : "out-of-project";
-  }
-  if (cwd.kind === "unknown") return "dynamic"; // 相對路徑但 cwd 未知
-  const resolved = resolveAgainst(cwd.path, val);
-  return isWithin(root, resolved) ? "in-project" : "out-of-project";
+  return resolvePathValue(staticValue(arg), cwd, root);
 }

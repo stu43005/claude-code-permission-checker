@@ -11,6 +11,8 @@ export interface RuleContext {
   cwd: CwdState;
   /** 對某參數做範圍檢查（內部已綁定 cwd 與 root）。 */
   resolvePath(arg: Word): PathScope;
+  /** 對 flag 的路徑值（字串）做範圍檢查。 */
+  resolvePathValue(value: string | null): PathScope;
 }
 
 export type RuleVerdict =
