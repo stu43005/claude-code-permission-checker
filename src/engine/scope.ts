@@ -4,6 +4,13 @@ import type { CwdState } from "../types.ts";
 
 export type PathScope = "in-project" | "out-of-project" | "dynamic";
 
+/**
+ * 是否為 Windows 目標。MSYS / Git-Bash 的 `/d/` 磁碟路徑慣例只存在於 Windows；
+ * 在 Linux / macOS，`/d/...` 是貨真價實的 POSIX 路徑（且檔名區分大小寫），
+ * 不可改寫。編譯後的 binary 此值固定為編譯目標 OS。
+ */
+const IS_WINDOWS = Deno.build.os === "windows";
+
 /** 反斜線轉斜線。 */
 function toPosix(p: string): string {
   return p.replace(/\\/g, "/");
@@ -21,12 +28,14 @@ export function isAbsolute(p: string): boolean {
  */
 export function normalizeAbsolute(abs: string): string {
   let posix = toPosix(abs);
-  // MSYS / Git-Bash 磁碟路徑：`/d/foo` 等同 Windows `D:/foo`。
+  // 僅 Windows：MSYS / Git-Bash 磁碟路徑 `/d/foo` 等同 `D:/foo`。
   // 單字母頂層段（`/<letter>` 後接 `/` 或結尾）視為磁碟機，轉成 `<LETTER>:/…`，
   // 使 `/d/`、`D:/`、`D:\` 三種寫法正規化為同一字串以便比較。
-  // 一般 POSIX 路徑（`/etc`、`/tmp`、`/usr/…` 頂層段非單字母）不受影響。
-  const msys = posix.match(/^\/([A-Za-z])(\/.*|)$/);
-  if (msys) posix = msys[1].toUpperCase() + ":" + (msys[2] || "/");
+  // Linux / macOS 不套用（`/a/c/d` 是真實 POSIX 路徑、且區分大小寫）。
+  if (IS_WINDOWS) {
+    const msys = posix.match(/^\/([A-Za-z])(\/.*|)$/);
+    if (msys) posix = msys[1].toUpperCase() + ":" + (msys[2] || "/");
+  }
   let prefix = "";
   let rest = posix;
   const drive = posix.match(/^([A-Za-z]):\//);

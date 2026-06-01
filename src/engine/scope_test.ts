@@ -23,23 +23,46 @@ Deno.test("isWithin: exact root and descendant true, sibling false", () => {
   assertEquals(isWithin("/proj", "/etc/passwd"), false);
 });
 
-Deno.test("normalizeAbsolute canonicalizes MSYS drive paths to Windows form", () => {
-  assertEquals(normalizeAbsolute("/d/proj/src"), "D:/proj/src");
-  assertEquals(normalizeAbsolute("/c/Users/x"), "C:/Users/x");
-  assertEquals(normalizeAbsolute("/d"), "D:/");
-  // 一般 POSIX 路徑（頂層段非單字母）不受影響
+// 多字母頂層段的 POSIX 路徑：跨平台皆不應被改寫
+Deno.test("normalizeAbsolute leaves multi-letter POSIX top segments intact", () => {
   assertEquals(normalizeAbsolute("/etc/passwd"), "/etc/passwd");
   assertEquals(normalizeAbsolute("/usr/bin"), "/usr/bin");
   assertEquals(normalizeAbsolute("/tmp"), "/tmp");
 });
 
-Deno.test("isWithin: /d/proj, D:/proj and D:\\proj are equivalent", () => {
-  assertEquals(isWithin("D:/proj", "/d/proj"), true);
-  assertEquals(isWithin("D:\\proj", "/d/proj/src/a.ts"), true);
-  assertEquals(isWithin("/d/proj", "D:/proj/src"), true);
-  // 不同磁碟仍視為專案外
-  assertEquals(isWithin("D:/proj", "/c/Windows/system32"), false);
-  assertEquals(isWithin("D:/proj", "/d/other"), false);
+// MSYS `/d/` ↔ `D:/` 等價僅在 Windows 成立；Linux/macOS 上 `/d/` 是真實 POSIX 路徑
+Deno.test({
+  name: "normalizeAbsolute canonicalizes MSYS drive paths to Windows form (Windows only)",
+  ignore: Deno.build.os !== "windows",
+  fn() {
+    assertEquals(normalizeAbsolute("/d/proj/src"), "D:/proj/src");
+    assertEquals(normalizeAbsolute("/c/Users/x"), "C:/Users/x");
+    assertEquals(normalizeAbsolute("/d"), "D:/");
+  },
+});
+
+Deno.test({
+  name: "isWithin: /d/proj, D:/proj and D:\\proj are equivalent (Windows only)",
+  ignore: Deno.build.os !== "windows",
+  fn() {
+    assertEquals(isWithin("D:/proj", "/d/proj"), true);
+    assertEquals(isWithin("D:\\proj", "/d/proj/src/a.ts"), true);
+    assertEquals(isWithin("/d/proj", "D:/proj/src"), true);
+    // 不同磁碟仍視為專案外
+    assertEquals(isWithin("D:/proj", "/c/Windows/system32"), false);
+    assertEquals(isWithin("D:/proj", "/d/other"), false);
+  },
+});
+
+// Linux/macOS：單字母頂層段是真實 POSIX 路徑，不可改寫成磁碟形式
+Deno.test({
+  name: "normalizeAbsolute keeps single-letter POSIX top segments on non-Windows",
+  ignore: Deno.build.os === "windows",
+  fn() {
+    assertEquals(normalizeAbsolute("/a/c/d"), "/a/c/d");
+    assertEquals(isWithin("/a/c/d", "/a/c/d/file"), true);
+    assertEquals(isWithin("/a/c/d", "/A/c/d/file"), false); // 區分大小寫
+  },
 });
 
 Deno.test("resolvePath: relative in-project under known cwd", () => {
