@@ -19,7 +19,7 @@ export const denoRule: CommandRule = {
       if (t.startsWith("-")) continue;
       return ALLOWED_SUBCOMMANDS.has(t)
         ? allow()
-        : ask(`deno ${t}：僅 check / test / lint 自動允許`);
+        : ask(`deno ${t}：此子指令未自動允許（可能執行任意碼或變更）`);
     }
     return ask("deno：未指定子指令");
   },
