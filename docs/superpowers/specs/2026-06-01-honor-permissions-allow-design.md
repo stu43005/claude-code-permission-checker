@@ -98,6 +98,9 @@ export interface PermissionRules {
   ask: BashPattern[];
 }
 
+/** 空規則常數；單一定義於本檔並 export，供 classify.ts / evaluate.ts 作為預設參數。 */
+export const EMPTY_RULES: PermissionRules = { allow: [], deny: [], ask: [] };
+
 /** 讀檔器：回傳檔案內容字串；不存在 / 無法讀 → null。注入以利測試。 */
 export type ReadText = (path: string) => string | null;
 
@@ -121,7 +124,10 @@ export function loadPermissionRules(
   （`root` 已是正規化的絕對 posix 路徑）。
 - 使用者家目錄：Windows 取 `USERPROFILE`（缺則 `HOME`）；非 Windows 取 `HOME`（缺則 `USERPROFILE`）。
   以 `Deno.build.os === "windows"` 判定平台。家目錄解析不到（兩者皆空）→ 略過使用者來源。
-  使用者檔：`${home}/.claude/settings.json`，組路徑前先把家目錄字串的反斜線轉為 `/`。
+  使用者檔路徑由 `${home}/.claude/settings.json` 組成後，**須通過 `scope.ts` 的 `normalizeAbsolute`**
+  （與 root 同樣處理）再交給 `readText`。理由：`USERPROFILE` 可能是 `C:\Users\X`（反斜線），而 Git-Bash
+  下 `HOME` 可能是 MSYS 形式 `/c/Users/X`；`normalizeAbsolute` 會把兩者都正規化為 `C:/Users/X`
+  （MSYS→drive 轉換僅在 Windows 套用），確保都能被 `Deno.readTextFileSync` 開啟。
 
 解析單一檔內容：
 
@@ -181,11 +187,18 @@ export function settingsAllows(inv: CommandInvocation, rules: PermissionRules): 
 安全理由之一；且 Claude Code 的 `Bash(cmd:*)` 規則比對的是字面字串，`VAR=x cmd` 字面以 `VAR=` 開頭，
 本就不會命中 `cmd:*`。故跳過升級既保守又與 Claude Code 行為一致。
 
+**含未引號 glob 實參不升級的後果**：依 `word.ts`，未引號的 glob 實參（`*` / `?` / `[`，如 `ls *.txt`
+的 `*.txt`）會被 `isStatic` 判為動態 → `staticValue` 回 null → `reconstructCommand` 回 null → 一律不升級、
+維持 ask（保守，與 default-deny 一致）。注意 settings 規則中的 `*`（如 `Bash(ls *)`）是 **pattern 的萬用字元**，
+用來匹配指令前綴，不會被用來放行「指令含展開後 glob 實參」的情形——兩者語意不同，使用者若預期
+`Bash(ls *)` 能放行 `ls *.txt` 會落空（但這是安全方向的保守，非 bug）。
+
 `parseBashRule` 解析步驟：
 
 1. 字串須形如 `Bash(<inner>)`（前綴 `Bash(`、結尾 `)`）；否則回 null（忽略 `Read(...)`、`Edit(...)` 等
    非 Bash 工具規則）。
 2. 取出 `<inner>`。
+2.5. 若 `inner === ""`（規則為 `Bash()`）→ 回 null（無意義的空規則，忽略）。
 3. 若 `inner` 以 `:*` 結尾 → `{ kind: "prefix-boundary", prefix: inner 去掉結尾 ":*" }`。
 4. 否則若以 ` *`（空白接星號）結尾 → `{ kind: "prefix-boundary", prefix: inner 去掉結尾 " *" }`。
 5. 否則若以 `*` 結尾（前一字元非空白） → `{ kind: "prefix-loose", prefix: inner 去掉結尾 "*" }`。
@@ -207,10 +220,9 @@ pattern 形式一律當作不命中是可接受的——最壞情況只是我們
 
 ```ts
 import { settingsAllows } from "../permissions/matcher.ts";
+import { EMPTY_RULES } from "../permissions/settings.ts";
 import type { PermissionRules } from "../permissions/settings.ts";
 import { allow } from "../rules/types.ts";
-
-const EMPTY_RULES: PermissionRules = { allow: [], deny: [], ask: [] };
 
 /** 既有判定主體（原 classify 內容原封不動搬入）。 */
 function classifyBuiltin(inv: CommandInvocation, root: string): RuleVerdict { /* ... */ }
@@ -235,6 +247,9 @@ export function classify(
 新增 `rules` 參數（預設空集合）並下傳至 `classify`；其餘流程不變：
 
 ```ts
+import { EMPTY_RULES } from "../permissions/settings.ts";
+import type { PermissionRules } from "../permissions/settings.ts";
+
 export function evaluate(
   command: string,
   root: string,
@@ -245,6 +260,9 @@ export function evaluate(
   return combine(invocations.map((inv) => classify(inv, root, rules)));
 }
 ```
+
+`evaluate.ts` 既有的 no-op allow 訊息（`"無可執行指令（no-op）"`，現行 evaluate.ts 第 19 行）與本功能無關，
+保持不變，實作者勿改。
 
 ### 4.5 `src/engine/combine.ts`（allow 訊息正確性）
 
@@ -297,9 +315,12 @@ deno compile --allow-read --allow-env=CLAUDE_PROJECT_DIR,HOME,USERPROFILE --outp
   - 家目錄解析：以注入 `EnvReader` 驗證 Windows 取 `USERPROFILE`、非 Windows 取 `HOME`
     （平台相關斷言用 `Deno.test({ ignore: Deno.build.os !== "windows", ... })` 區分）；
     用記錄請求路徑的假 `readText` 驗證組出的三個路徑正確。
+  - fallback：Windows 下 `USERPROFILE` 未設、`HOME` 有值 → 退而取 `HOME`（用記錄路徑的假 `readText` 驗證）。
+  - MSYS 家目錄（Windows-only，`ignore: Deno.build.os !== "windows"`）：`HOME=/c/Users/X` 經
+    `normalizeAbsolute` 後組出的使用者檔路徑為 `C:/Users/X/.claude/settings.json`。
 - **`src/permissions/matcher_test.ts`**
   - `parseBashRule`：`Bash(npm test:*)`→prefix-boundary、`Bash(ls *)`→prefix-boundary、
-    `Bash(ls*)`→prefix-loose、`Bash(git status)`→exact、`Read(./x)`→null、`Bash(git * --x)`→null、`Bash()`→exact 空字串或 null（擇一明確定義並測）。
+    `Bash(ls*)`→prefix-loose、`Bash(git status)`→exact、`Read(./x)`→null、`Bash(git * --x)`→null、`Bash()`→null。
   - `matchesPattern`：boundary 命中 `ls`、`ls -la`，不命中 `lsof`；loose 命中 `lsof`；
     exact 僅命中完全相等。
   - `reconstructCommand`：name+靜態 argv → `"git diff --stat"`；動態 argv（變數 / `$()` / 未引號 glob）
