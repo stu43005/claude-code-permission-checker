@@ -27,8 +27,9 @@ function ghApiMutates(after: string[]): boolean {
     } else if (t.startsWith("-X") && t.length > 2) {
       if (t.slice(2).toUpperCase() !== "GET") return true; // -XPOST 黏寫
     } else if (
-      t === "-f" || t === "-F" || t === "--field" || t === "--raw-field" ||
-      t === "--input" ||
+      t === "-f" || (t.startsWith("-f") && t.length > 2) || // -f key=val / -fkey=val
+      t === "-F" || (t.startsWith("-F") && t.length > 2) || // -F key=@file / -Fkey=@file
+      t === "--field" || t === "--raw-field" || t === "--input" ||
       t.startsWith("--field=") || t.startsWith("--raw-field=") ||
       t.startsWith("--input=")
     ) {

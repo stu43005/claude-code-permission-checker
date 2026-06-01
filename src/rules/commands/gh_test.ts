@@ -45,6 +45,10 @@ Deno.test("gh api GET allows, mutating asks", () => {
   assertEquals(v("gh api -XPATCH repos/o/r"), "ask");
   assertEquals(v("gh api -f name=x repos/o/r"), "ask");
   assertEquals(v("gh api --field a=b repos/o/r"), "ask");
+  assertEquals(v("gh api -fname=x repos/o/r"), "ask"); // 黏寫 -f
+  assertEquals(v("gh api -FFILE=@data.json repos/o/r"), "ask"); // 黏寫 -F
+  assertEquals(v("gh api --method=DELETE repos/o/r"), "ask"); // = 形式
+  assertEquals(v("gh api --method=get repos/o/r"), "allow"); // GET 不分大小寫
 });
 
 Deno.test("gh issue read allows, write asks", () => {
