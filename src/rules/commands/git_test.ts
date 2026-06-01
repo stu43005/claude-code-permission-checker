@@ -60,6 +60,18 @@ Deno.test("git show -c is combined-diff flag (after subcommand), not global conf
   assertEquals(v("git show -c HEAD"), "allow");
 });
 
+Deno.test("git --exec-path asks (prepends PATH, can hijack pager -> arbitrary exec)", () => {
+  assertEquals(v("git --exec-path=/evil log"), "ask");
+  assertEquals(v("git --exec-path=/evil status"), "ask");
+  assertEquals(v("git -p --exec-path=/evil log"), "ask");
+  assertEquals(v("git --exec-path log"), "ask"); // value-less query form
+});
+
+Deno.test("benign global value options before read subcommand still allow", () => {
+  assertEquals(v("git --namespace=foo log"), "allow");
+  assertEquals(v("git --super-prefix=foo/ status"), "allow");
+});
+
 Deno.test("branch list allows, branch -d asks", () => {
   assertEquals(v("git branch"), "allow");
   assertEquals(v("git branch -d feature"), "ask");

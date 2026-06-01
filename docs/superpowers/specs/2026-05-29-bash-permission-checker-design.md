@@ -308,7 +308,9 @@ interface CommandRule {
     因此 `-c` / `--config` **僅放行少數純外觀 config 的 key**（安全 allowlist：
     `color.*`、`core.quotepath` / `core.quotePath`、`core.abbrev`、`log.date`、
     `i18n.*`、`advice.*`，以及做路徑檢查的 `core.worktree`）；**其餘任何 `-c key`
-    一律 `ask`**。另 `--ext-diff`（啟用外部 diff driver）→ `ask`。
+    一律 `ask`**。另 `--ext-diff`（啟用外部 diff driver）、`--exec-path[=<dir>]`
+    （把 `<dir>` 前置到子程序 `$PATH`，可讓 pager/driver 解析到攻擊者程式，且範圍
+    檢查無法擋——可指向專案內目錄）→ `ask`。
 
 **預設排除（→ `ask`，需手動信任才加入）**：
 `rm` `mv` `cp` `mkdir` `touch` `chmod` `chown` `ln` `dd` `tee` `truncate`

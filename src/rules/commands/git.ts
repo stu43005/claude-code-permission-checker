@@ -4,7 +4,7 @@ import { staticValue } from "../../engine/word.ts";
 
 /** git 全域選項中會吃掉下一 token 當值者（不含 -c，單獨處理）。 */
 const GLOBAL_VALUE_OPTS = new Set<string>([
-  "-C", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--super-prefix",
+  "-C", "--git-dir", "--work-tree", "--namespace", "--super-prefix",
 ]);
 
 /** 純讀取子指令（其餘子指令一律 ask）。 */
@@ -56,6 +56,14 @@ function parseSub(
       if (!isSafeConfigKey(inline.split("=")[0])) {
         dangerous = "git：-c 指定了非安全 config（可能執行外部程式）";
       }
+      i += 1;
+      continue;
+    }
+    // 全域 --exec-path[=<dir>]：會把 <dir> 前置到 git 子程序的 PATH，
+    // 進而劫持預設 pager（less）等外部程式 → 可執行任意碼。
+    if (t === "--exec-path" || t.startsWith("--exec-path=")) {
+      dangerous = "git：--exec-path 會改寫 PATH 並可劫持 pager（執行外部程式）";
+      // `--exec-path` 無值（查詢用）或 `--exec-path=<dir>` 皆為單 token。
       i += 1;
       continue;
     }
