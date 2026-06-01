@@ -46,6 +46,21 @@ export const gitRule: CommandRule = {
     if (dynamic) return ask("git：子指令含動態值，無法靜態判定");
     if (sub === null) return ask("git：未指定子指令");
 
+    // 讀取子指令的危險 flag：--output= 寫檔；git grep -O 執行任意 pager
+    if (rest.some((r) => r === "--output" || r.startsWith("--output="))) {
+      return ask(`git ${sub}：--output 會寫檔`);
+    }
+    if (
+      sub === "grep" &&
+      rest.some((r) =>
+        r.startsWith("-O") ||
+        r === "--open-files-in-pager" ||
+        r.startsWith("--open-files-in-pager=")
+      )
+    ) {
+      return ask("git grep：-O / --open-files-in-pager 會執行任意 pager 程式");
+    }
+
     if (READ_SUBCOMMANDS.has(sub)) return allow();
 
     switch (sub) {

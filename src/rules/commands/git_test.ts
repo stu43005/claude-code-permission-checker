@@ -3,7 +3,7 @@ import { parse } from "../../deps.ts";
 import type { Command } from "../../deps.ts";
 import { gitRule } from "./git.ts";
 import type { RuleContext } from "../types.ts";
-import { resolvePath } from "../../engine/scope.ts";
+import { resolvePath, resolvePathValue } from "../../engine/scope.ts";
 
 function ctxOf(src: string): RuleContext {
   const cmd = parse(src).commands[0].command as Command;
@@ -15,6 +15,7 @@ function ctxOf(src: string): RuleContext {
     assignments: cmd.prefix,
     cwd,
     resolvePath: (w) => resolvePath(w, cwd, "/proj"),
+    resolvePathValue: (v) => resolvePathValue(v, cwd, "/proj"),
   };
 }
 
@@ -64,4 +65,21 @@ Deno.test("remote -v allows, remote add asks", () => {
 Deno.test("unknown / dynamic subcommand asks", () => {
   assertEquals(v("git frobnicate"), "ask");
   assertEquals(v("git $SUB"), "ask");
+});
+
+Deno.test("git grep -O / --open-files-in-pager asks (arbitrary pager exec)", () => {
+  assertEquals(v("git grep -O pager foo"), "ask");
+  assertEquals(v("git grep --open-files-in-pager=touch foo"), "ask");
+});
+
+Deno.test("git diff --output= asks (writes file)", () => {
+  assertEquals(v("git diff --output=x"), "ask");
+});
+
+Deno.test("git grep without -O still allows", () => {
+  assertEquals(v("git grep foo"), "allow");
+});
+
+Deno.test("git log still allows (no dangerous flags)", () => {
+  assertEquals(v("git log"), "allow");
 });
