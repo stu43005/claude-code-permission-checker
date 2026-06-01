@@ -3,7 +3,7 @@ import { parse } from "../../deps.ts";
 import type { Command } from "../../deps.ts";
 import { dateRule, fileCmdRule, sortRule, treeRule, yqRule } from "./simple-flag.ts";
 import type { CommandRule, RuleContext } from "../types.ts";
-import { resolvePath } from "../../engine/scope.ts";
+import { resolvePath, resolvePathValue } from "../../engine/scope.ts";
 
 function ctxOf(name: string, src: string): RuleContext {
   const cmd = parse(src).commands[0].command as Command;
@@ -15,6 +15,7 @@ function ctxOf(name: string, src: string): RuleContext {
     assignments: cmd.prefix,
     cwd,
     resolvePath: (w) => resolvePath(w, cwd, "/proj"),
+    resolvePathValue: (v) => resolvePathValue(v, cwd, "/proj"),
   };
 }
 

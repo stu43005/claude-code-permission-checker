@@ -10,10 +10,16 @@ import { flagGatedReader } from "../factory.ts";
 export const fileReaderRule: CommandRule = flagGatedReader({
   names: [
     "cat", "head", "tail", "wc", "ls", "stat", "cut", "tr", "column",
-    "cmp", "diff", "comm", "md5sum", "sha256sum", "hexdump", "jq", "nl", "fold",
+    "cmp", "comm", "md5sum", "sha256sum", "hexdump", "jq", "nl", "fold",
     "basename", "dirname", "realpath", "readlink",
   ],
   // 這些指令無「會寫檔」的 flag（已於 spec 查證）；故 askFlags 留空。
+});
+
+/** diff：位置參數做範圍檢查，且 --from-file / --to-file 路徑值也需範圍檢查。 */
+export const diffRule: CommandRule = flagGatedReader({
+  names: ["diff"],
+  pathValueFlags: ["--from-file", "--to-file"],
 });
 
 /** 不接受檔案路徑操作元、且無寫入能力的純工具：一律 allow。 */

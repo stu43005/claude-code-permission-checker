@@ -3,7 +3,7 @@ import { parse } from "../../deps.ts";
 import type { Command } from "../../deps.ts";
 import { sedRule } from "./sed.ts";
 import type { RuleContext } from "../types.ts";
-import { resolvePath } from "../../engine/scope.ts";
+import { resolvePath, resolvePathValue } from "../../engine/scope.ts";
 
 function ctxOf(src: string): RuleContext {
   const cmd = parse(src).commands[0].command as Command;
@@ -15,6 +15,7 @@ function ctxOf(src: string): RuleContext {
     assignments: cmd.prefix,
     cwd,
     resolvePath: (w) => resolvePath(w, cwd, "/proj"),
+    resolvePathValue: (v) => resolvePathValue(v, cwd, "/proj"),
   };
 }
 

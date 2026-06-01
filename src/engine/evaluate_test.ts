@@ -55,6 +55,11 @@ const cases: Array<{ cmd: string; want: Verdict; cwd?: CwdState; note: string }>
   { cmd: "git -c core.worktree=/outside status", want: "ask", note: "core.worktree out" },
   { cmd: "git -C src status", want: "allow", note: "git -C in-project" },
   { cmd: "git -C /tmp status", want: "ask", note: "git -C out" },
+  // 新增安全修補：環境變數賦值前綴 / grep -f 路徑 / diff --from-file / git grep -O
+  { cmd: "LD_PRELOAD=/x cat a", want: "ask", note: "LD_PRELOAD env prefix" },
+  { cmd: "grep -f /etc/p x", want: "ask", note: "grep -f out-of-project" },
+  { cmd: "diff --from-file=/etc/passwd x", want: "ask", note: "diff --from-file out" },
+  { cmd: "git grep -O pager foo", want: "ask", note: "git grep -O pager" },
   // 邊界
   { cmd: "# just a comment", want: "allow", note: "no-op" },
   { cmd: "", want: "allow", note: "empty" },

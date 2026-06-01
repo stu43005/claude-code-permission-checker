@@ -19,4 +19,5 @@ const VALUE_FLAGS = [
 export const grepRule: CommandRule = flagGatedReader({
   names: ["grep", "egrep", "fgrep", "rg"],
   valueFlags: VALUE_FLAGS,
+  pathValueFlags: ["-f", "--file"],
 });

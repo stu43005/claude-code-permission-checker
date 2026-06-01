@@ -1,9 +1,9 @@
 import { assertEquals } from "@std/assert";
 import { parse } from "../../deps.ts";
 import type { Command } from "../../deps.ts";
-import { cdRule, fileReaderRule, pureUtilRule } from "./coreutils.ts";
+import { cdRule, diffRule, fileReaderRule, pureUtilRule } from "./coreutils.ts";
 import type { RuleContext } from "../types.ts";
-import { resolvePath } from "../../engine/scope.ts";
+import { resolvePath, resolvePathValue } from "../../engine/scope.ts";
 import type { CwdState } from "../../types.ts";
 
 function ctxOf(src: string, cwd: CwdState = { kind: "known", path: "/proj" }): RuleContext {
@@ -15,6 +15,7 @@ function ctxOf(src: string, cwd: CwdState = { kind: "known", path: "/proj" }): R
     assignments: cmd.prefix,
     cwd,
     resolvePath: (w) => resolvePath(w, cwd, "/proj"),
+    resolvePathValue: (v) => resolvePathValue(v, cwd, "/proj"),
   };
 }
 
@@ -48,4 +49,16 @@ Deno.test("rules expose expected names", () => {
   assertEquals(fileReaderRule.names.includes("cat"), true);
   assertEquals(pureUtilRule.names.includes("echo"), true);
   assertEquals(cdRule.names, ["cd"]);
+});
+
+Deno.test("diff --from-file= out-of-project asks", () => {
+  assertEquals(diffRule.evaluate(ctxOf("diff --from-file=/etc/passwd readme.md")).kind, "ask");
+});
+
+Deno.test("diff out-of-project positional asks", () => {
+  assertEquals(diffRule.evaluate(ctxOf("diff readme.md /etc/passwd")).kind, "ask");
+});
+
+Deno.test("diff in-project files allows", () => {
+  assertEquals(diffRule.evaluate(ctxOf("diff a.txt b.txt")).kind, "allow");
 });
