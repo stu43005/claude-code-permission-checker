@@ -20,7 +20,13 @@ export function isAbsolute(p: string): boolean {
  * 假設輸入已是絕對路徑；Windows drive 一律轉大寫以便比較。
  */
 export function normalizeAbsolute(abs: string): string {
-  const posix = toPosix(abs);
+  let posix = toPosix(abs);
+  // MSYS / Git-Bash 磁碟路徑：`/d/foo` 等同 Windows `D:/foo`。
+  // 單字母頂層段（`/<letter>` 後接 `/` 或結尾）視為磁碟機，轉成 `<LETTER>:/…`，
+  // 使 `/d/`、`D:/`、`D:\` 三種寫法正規化為同一字串以便比較。
+  // 一般 POSIX 路徑（`/etc`、`/tmp`、`/usr/…` 頂層段非單字母）不受影響。
+  const msys = posix.match(/^\/([A-Za-z])(\/.*|)$/);
+  if (msys) posix = msys[1].toUpperCase() + ":" + (msys[2] || "/");
   let prefix = "";
   let rest = posix;
   const drive = posix.match(/^([A-Za-z]):\//);

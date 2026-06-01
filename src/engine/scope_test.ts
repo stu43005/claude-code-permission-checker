@@ -8,7 +8,8 @@ function firstArg(src: string) {
 }
 
 Deno.test("normalizeAbsolute collapses . and ..", () => {
-  assertEquals(normalizeAbsolute("/a/b/../c/./d"), "/a/c/d");
+  // 多字母頂層段，純測 . / .. 折疊（單字母段會被當磁碟機，另有測試涵蓋）
+  assertEquals(normalizeAbsolute("/srv/b/../c/./d"), "/srv/c/d");
 });
 
 Deno.test("normalizeAbsolute keeps windows drive and uppercases it", () => {
@@ -20,6 +21,25 @@ Deno.test("isWithin: exact root and descendant true, sibling false", () => {
   assertEquals(isWithin("/proj", "/proj/src/a.ts"), true);
   assertEquals(isWithin("/proj", "/proj-other/a"), false);
   assertEquals(isWithin("/proj", "/etc/passwd"), false);
+});
+
+Deno.test("normalizeAbsolute canonicalizes MSYS drive paths to Windows form", () => {
+  assertEquals(normalizeAbsolute("/d/proj/src"), "D:/proj/src");
+  assertEquals(normalizeAbsolute("/c/Users/x"), "C:/Users/x");
+  assertEquals(normalizeAbsolute("/d"), "D:/");
+  // 一般 POSIX 路徑（頂層段非單字母）不受影響
+  assertEquals(normalizeAbsolute("/etc/passwd"), "/etc/passwd");
+  assertEquals(normalizeAbsolute("/usr/bin"), "/usr/bin");
+  assertEquals(normalizeAbsolute("/tmp"), "/tmp");
+});
+
+Deno.test("isWithin: /d/proj, D:/proj and D:\\proj are equivalent", () => {
+  assertEquals(isWithin("D:/proj", "/d/proj"), true);
+  assertEquals(isWithin("D:\\proj", "/d/proj/src/a.ts"), true);
+  assertEquals(isWithin("/d/proj", "D:/proj/src"), true);
+  // 不同磁碟仍視為專案外
+  assertEquals(isWithin("D:/proj", "/c/Windows/system32"), false);
+  assertEquals(isWithin("D:/proj", "/d/other"), false);
 });
 
 Deno.test("resolvePath: relative in-project under known cwd", () => {
