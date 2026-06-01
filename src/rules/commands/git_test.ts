@@ -38,7 +38,26 @@ Deno.test("write subcommands ask", () => {
 
 Deno.test("global path options before read subcommand still allow at rule level", () => {
   assertEquals(v("git -C sub status"), "allow");
-  assertEquals(v("git -c core.pager=cat log"), "allow");
+  assertEquals(v("git -c core.pager=cat log"), "ask"); // core.pager can execute arbitrary programs
+});
+
+Deno.test("git -c with unsafe config key asks (arbitrary exec)", () => {
+  assertEquals(v("git -c diff.external=touch diff"), "ask");
+  assertEquals(v("git -c core.pager=cat log"), "ask");
+});
+
+Deno.test("git -c with safe config keys allows", () => {
+  assertEquals(v("git -c color.ui=false log"), "allow");
+  assertEquals(v("git -c core.quotepath=false status"), "allow");
+  assertEquals(v("git -c core.worktree=sub status"), "allow");
+});
+
+Deno.test("git diff --ext-diff asks (external diff driver exec)", () => {
+  assertEquals(v("git diff --ext-diff"), "ask");
+});
+
+Deno.test("git show -c is combined-diff flag (after subcommand), not global config", () => {
+  assertEquals(v("git show -c HEAD"), "allow");
 });
 
 Deno.test("branch list allows, branch -d asks", () => {
