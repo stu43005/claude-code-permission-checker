@@ -8,6 +8,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 解析 Bash 指令，只在「純唯讀且全部落在當前專案內」時回 `allow`，其餘回 `ask`。**永不回 `deny`**。
 從 stdin 收 hook JSON、往 stdout 寫 decision JSON、**永遠 `exit 0`**。
 
+此外，會在 runtime 讀取使用者的 `permissions.allow`：原本會 `ask`、但已被使用者在 settings.json 明確放行
+（且未被 `deny`/`ask` 命中）的指令，升級為 `allow`（見「hook 決策 vs settings.json 權限的優先序」）。
+
 ## 指令
 
 ```bash
@@ -33,7 +36,8 @@ echo '{"tool_name":"Bash","tool_input":{"command":"cat README.md"},"cwd":"D:/pro
 ## 架構（評估管線）
 
 `main.ts` 讀 stdin → 若 `tool_name !== "Bash"` 直接 return（不輸出）→ `resolveProjectRoot`（讀
-`$CLAUDE_PROJECT_DIR`；未設定 → ask）→ `evaluate()`：
+`$CLAUDE_PROJECT_DIR`；未設定 → ask）→ `loadPermissionRules`（讀三個 settings 檔，見 `permissions/`）→
+`evaluate(…, rules)`：
 
 ```
 parse.ts (unbash)  →  walk.ts  →  classify.ts (每指令)  →  combine.ts (最弱環節)
@@ -45,13 +49,21 @@ parse.ts (unbash)  →  walk.ts  →  classify.ts (每指令)  →  combine.ts (
   `&&`/`BraceGroup` 持久、subshell/pipeline 不持久、控制流含 cd → 之後標 unknown）、列舉
   command substitution `$(…)` 內層指令、把 Statement / 複合結構的重導向繼承給內部指令、對 `git`
   套用 `gitEffectiveCwd`（`-C`/`--git-dir`/`--work-tree`/`-c core.worktree`）。
-- **`classify.ts`** 對單一指令依序判定：`name` 為 null（動態）→ ask；不在 allowlist → ask；
-  **三條中央前置規則**（見下）→ ask；最後跑該指令的 `CommandRule.evaluate`。
+- **`classify.ts`** 分兩層：`classifyBuiltin` 對單一指令依序判定（`name` 為 null（動態）→ ask；不在
+  allowlist → ask；**三條中央前置規則**（見下）→ ask；最後跑該指令的 `CommandRule.evaluate`）；外層
+  `classify(inv, root, rules)` 在 builtin 判 `ask` 時，呼叫 `settingsAllows` 嘗試以 `permissions.allow`
+  升級為 `allow`（命中 allow 且未被 deny/ask 命中才升級；builtin 已判 `allow` 者原樣返回，不受 rules 影響）。
 - **`scope.ts`** 純詞法路徑解析（不碰檔案系統）。`resolvePath`/`resolvePathValue` 回三態
   `in-project` / `out-of-project` / `dynamic`，後兩者 → ask。
 - **`rules/`**：`types.ts`（`CommandRule`/`RuleContext`/`RuleVerdict` + `allow()`/`ask()`）、
   `flags.ts`（flag matcher、positionals）、`factory.ts`（`flagGatedReader`）、
   `allowlist.ts`（name → rule 索引，載入時偵測重複 name）、`commands/*.ts`（每類指令一檔）。
+- **`permissions/`**：`settings.ts`（`loadPermissionRules`：讀專案 `.claude/settings.json`、
+  `.claude/settings.local.json`、使用者 `~/.claude/settings.json`，抽出 `permissions.{allow,deny,ask}` 中
+  的 `Bash(...)` 規則並 union；家目錄依平台解析 `USERPROFILE`/`HOME`；fail-safe：讀檔/解析失敗退化為空
+  規則、永不丟例外/回 null）、`matcher.ts`（`parseBashRule` 解析 `Bash(...)`、`matchesPattern`/`matchesAny`
+  字串匹配、`reconstructCommand` 把 invocation 還原成可比對字串、`settingsAllows` 綜合判定）。`matcher.ts`
+  對 `settings.ts` 僅 `import type`（型別循環編譯期抹除，無 runtime 循環）。
 
 ### 三條中央前置規則（在跑個別 rule 之前，於 classify.ts；個別 rule 不需重複處理）
 
@@ -138,5 +150,20 @@ parse.ts (unbash)  →  walk.ts  →  classify.ts (每指令)  →  combine.ts (
 ### hook 決策 vs settings.json 權限的優先序（重要）
 
 `PreToolUse` hook 回 `ask` 會**蓋過** `permissions.allow`（most-restrictive-wins：deny > ask > allow）。
-所以要讓某指令自動放行，必須讓**這個檢查器自己回 `allow`**（加規則 + rebuild）；光在 settings.json
-加 `permissions.allow` 不會生效。hook 的 `allow` 不會突破 settings 既有的 `deny`。
+為解決此痛點，本檢查器在 runtime 讀取使用者的 `permissions.allow`：當 builtin 判 `ask`、但該指令命中
+`permissions.allow`（且未被 `permissions.deny`/`ask` 命中）時，檢查器**自己回 `allow`**——等效把矩陣中
+`(hook=ask, settings=allow)` 那格從詢問改為放行（見 `permissions/` 與 `classify.ts` 的升級層）。
+
+因此要讓某指令自動放行有兩條路：
+- **(a) 加 allowlist 規則 + rebuild**：適合通用唯讀指令（改 `rules/commands/*.ts` → `allowlist.ts` → build）。
+- **(b) 在 settings.json 的 `permissions.allow` 加該指令**：適合專案/個人特定指令，免改碼。**現在會生效**
+  （這推翻了本工具早期「光加 `permissions.allow` 不會生效」的行為）。
+
+仍須注意：
+- hook 的 `allow` **不會**突破 Claude Code 既有的 `permissions.deny`/`ask`（官方語意：hook allow 只略過
+  互動提示、不覆寫 deny/ask 規則）。本檢查器讀 deny/ask 並在升級前自我否決，是為了輸出一致；安全則由
+  Claude Code 端再次保證。
+- 升級僅在**能靜態還原指令字串**（name 非動態、無賦值前綴、argv 全靜態）時發生；動態 token、`Bash(*)`
+  等會匹配一切的空 prefix、以及無法可靠解析的 pattern 一律不升級（維持 default-deny）。
+- 讀取來源：專案 `.claude/settings.json`、`.claude/settings.local.json`、使用者 `~/.claude/settings.json`
+  （**不含** enterprise managed-settings）。讀檔失敗一律 fail-safe 退化為「無此來源規則」。
