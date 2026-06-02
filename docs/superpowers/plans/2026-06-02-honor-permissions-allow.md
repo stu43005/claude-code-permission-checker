@@ -1054,21 +1054,59 @@ git commit -m "feat: load permission rules in main and grant read/env in build"
 
 - [ ] **Step 2: 寫失敗測試（e2e 升級）**
 
-於 `src/main_test.ts`：(a) 在 `runHook` 的 `args` 加入 `--allow-read`；(b) 末尾新增兩個 e2e 測試。
+於 `src/main_test.ts`：(a) 兩處 `Deno.Command` 都加 `--allow-read` 與 `clearEnv: true`；(b) 末尾新增兩個 e2e 測試。
 
-把 `runHook` 內的 `args` 由：
+**(a-1)** 把 `runHook` 內的 `Deno.Command` 選項由：
 
 ```ts
+  const cmd = new Deno.Command("deno", {
     args: ["run", "--allow-env", "src/main.ts"],
+    env: { CLAUDE_PROJECT_DIR: projectDir },
+    stdin: "piped",
+    stdout: "piped",
+    stderr: "null",
+  });
+```
+
+改為（加 `--allow-read`；加 `clearEnv: true` 隔離父行程環境，避免開發者真實 `HOME`/`USERPROFILE` 洩漏進子行程而讀到本機真實 `~/.claude/settings.json`、污染測試）：
+
+```ts
+  const cmd = new Deno.Command("deno", {
+    args: ["run", "--allow-env", "--allow-read", "src/main.ts"],
+    clearEnv: true,
+    env: { CLAUDE_PROJECT_DIR: projectDir },
+    stdin: "piped",
+    stdout: "piped",
+    stderr: "null",
+  });
+```
+
+**(a-2)** 「malformed stdin」測試內的 inline `Deno.Command` 同樣處理（加 `--allow-read` 與 `clearEnv: true`），由：
+
+```ts
+  const cmd = new Deno.Command("deno", {
+    args: ["run", "--allow-env", "src/main.ts"],
+    env: { CLAUDE_PROJECT_DIR: "/proj" },
+    stdin: "piped",
+    stdout: "piped",
+    stderr: "null",
+  });
 ```
 
 改為：
 
 ```ts
+  const cmd = new Deno.Command("deno", {
     args: ["run", "--allow-env", "--allow-read", "src/main.ts"],
+    clearEnv: true,
+    env: { CLAUDE_PROJECT_DIR: "/proj" },
+    stdin: "piped",
+    stdout: "piped",
+    stderr: "null",
+  });
 ```
 
-末尾新增：
+**(b)** 末尾新增：
 
 ```ts
 const SETTINGS_FIXTURE = `${Deno.cwd()}/src/testdata/proj-with-settings`;
@@ -1090,12 +1128,14 @@ Deno.test("e2e: command not in settings allow -> ask", async () => {
 });
 ```
 
-- [ ] **Step 3: 跑測試確認新案例先失敗（未加 --allow-read 時）後通過**
+- [ ] **Step 3: 跑測試確認通過**
 
 Run: `deno test --allow-run --allow-env --allow-read src/main_test.ts`
 Expected: PASS（升級案例回 allow、未命中案例回 ask；既有 4 個 e2e 仍通過）。
 
-> 說明：子行程 env 僅含 `CLAUDE_PROJECT_DIR`，未帶 `HOME`/`USERPROFILE`，故使用者來源被略過，測試只驗證專案 fixture 的 allow，互不污染。
+> 說明：本 Task 疊在 Task 1–8 之上（升級邏輯已接好），故新 e2e 測試直接通過。`clearEnv: true` 使子行程
+> env 僅含 `CLAUDE_PROJECT_DIR`、不帶 `HOME`/`USERPROFILE`，使用者來源被略過，測試只驗證專案 fixture 的
+> allow，與本機真實設定互不污染。
 
 - [ ] **Step 4: 全測試 + check + lint**
 
