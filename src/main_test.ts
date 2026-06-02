@@ -3,7 +3,8 @@ import { assertEquals } from "@std/assert";
 /** 以子行程執行 main.ts，餵入 hook JSON，回傳 stdout。 */
 async function runHook(payload: unknown, projectDir: string): Promise<string> {
   const cmd = new Deno.Command("deno", {
-    args: ["run", "--allow-env", "src/main.ts"],
+    args: ["run", "--allow-env", "--allow-read", "src/main.ts"],
+    clearEnv: true,
     env: { CLAUDE_PROJECT_DIR: projectDir },
     stdin: "piped",
     stdout: "piped",
@@ -43,7 +44,8 @@ Deno.test("e2e: non-Bash tool -> no output", async () => {
 
 Deno.test("e2e: malformed stdin -> ask, never crash", async () => {
   const cmd = new Deno.Command("deno", {
-    args: ["run", "--allow-env", "src/main.ts"],
+    args: ["run", "--allow-env", "--allow-read", "src/main.ts"],
+    clearEnv: true,
     env: { CLAUDE_PROJECT_DIR: "/proj" },
     stdin: "piped",
     stdout: "piped",
@@ -56,5 +58,23 @@ Deno.test("e2e: malformed stdin -> ask, never crash", async () => {
   const { stdout, code } = await child.output();
   const out = new TextDecoder().decode(stdout).trim();
   assertEquals(code, 0);
+  assertEquals(JSON.parse(out).hookSpecificOutput.permissionDecision, "ask");
+});
+
+const SETTINGS_FIXTURE = `${Deno.cwd()}/src/testdata/proj-with-settings`;
+
+Deno.test("e2e: command matching settings allow -> allow (upgrade)", async () => {
+  const out = await runHook(
+    { tool_name: "Bash", tool_input: { command: "npm test --silent" }, cwd: SETTINGS_FIXTURE },
+    SETTINGS_FIXTURE,
+  );
+  assertEquals(JSON.parse(out).hookSpecificOutput.permissionDecision, "allow");
+});
+
+Deno.test("e2e: command not in settings allow -> ask", async () => {
+  const out = await runHook(
+    { tool_name: "Bash", tool_input: { command: "npm run build" }, cwd: SETTINGS_FIXTURE },
+    SETTINGS_FIXTURE,
+  );
   assertEquals(JSON.parse(out).hookSpecificOutput.permissionDecision, "ask");
 });

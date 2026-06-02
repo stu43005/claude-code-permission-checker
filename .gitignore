@@ -1,5 +1,8 @@
 # Claude Code local working state
 .claude/
+# But allow test fixtures that happen to include .claude directories
+!src/testdata/**/.claude/
+!src/testdata/**/.claude/**
 
 # Compiled binary output
 /dist/
