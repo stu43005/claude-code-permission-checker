@@ -2,6 +2,7 @@ import { parseHookInput, readStdin, renderDecision } from "./hook/io.ts";
 import { resolveProjectRoot } from "./project.ts";
 import { evaluate } from "./engine/evaluate.ts";
 import { normalizeAbsolute } from "./engine/scope.ts";
+import { loadPermissionRules } from "./permissions/settings.ts";
 import type { CwdState, Decision } from "./types.ts";
 
 function initialCwd(cwd: string | undefined, root: string): CwdState {
@@ -38,7 +39,8 @@ async function main(): Promise<void> {
     };
   } else {
     const command = input.tool_input?.command ?? "";
-    decision = evaluate(command, root, initialCwd(input.cwd, root));
+    const rules = loadPermissionRules(Deno.env, root);
+    decision = evaluate(command, root, initialCwd(input.cwd, root), rules);
   }
   console.log(renderDecision(decision));
 }
