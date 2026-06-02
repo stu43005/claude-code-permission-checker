@@ -199,22 +199,34 @@ export function settingsAllows(inv: CommandInvocation, rules: PermissionRules): 
 用來匹配指令前綴，不會被用來放行「指令含展開後 glob 實參」的情形——兩者語意不同，使用者若預期
 `Bash(ls *)` 能放行 `ls *.txt` 會落空（但這是安全方向的保守，非 bug）。
 
+**引號與空白**：`staticValue` 回傳的是**去引號後**的字面值，`reconstructCommand` 以單一空白 join、
+不重新加引號、不逸出內含空白。故含空白的引號實參與使用者字面不同（`grep "foo bar" f` →
+`"grep foo bar f"`），可能無法命中對應 pattern（保守，維持 ask，符合 default-deny）；反向「拆開後多 token
+意外命中較寬 pattern」最壞只是輸出一個會被 Claude Code deny/ask 覆蓋的 allow，無安全危害（best-effort 一致性層）。
+
+**型別循環引用**：`settings.ts` 與 `matcher.ts` 互相引用對方的型別（`BashPattern` ↔ `PermissionRules`）。
+兩邊**務必都用 `import type`**——僅型別的循環在編譯期被抹除，不產生 runtime 循環；勿改為值匯入，否則會
+形成真正的循環相依。`EMPTY_RULES`（值）只單向由 `classify.ts` / `evaluate.ts` 匯入，無循環。
+
 `parseBashRule` 解析步驟：
 
 1. 字串須形如 `Bash(<inner>)`（前綴 `Bash(`、結尾 `)`）；否則回 null（忽略 `Read(...)`、`Edit(...)` 等
    非 Bash 工具規則）。
 2. 取出 `<inner>`；若 `inner === ""`（規則為 `Bash()`）→ 回 null（無意義的空規則）。
-3. 若 `inner` 以 `:*` 結尾：令 `p` = `inner` 去掉結尾 `":*"`；**若 `p` 不含 `*`** →
-   `{ kind: "prefix-boundary", prefix: p }`；否則往下。
-4. 否則若以 ` *`（空白接星號）結尾：令 `p` = `inner` 去掉結尾 `" *"`；**若 `p` 不含 `*`** →
-   `{ kind: "prefix-boundary", prefix: p }`；否則往下。
-5. 否則若以 `*` 結尾（前一字元非空白）：令 `p` = `inner` 去掉結尾 `"*"`；**若 `p` 不含 `*`** →
-   `{ kind: "prefix-loose", prefix: p }`；否則往下。
-6. 否則若 `inner` 不含 `*` → `{ kind: "exact", text: inner }`。
-7. 其餘（含中段 `*`、多個 `*` 等無法可靠解析的形式）→ null。
+3. 若 `inner` 以 `:*` 結尾：令 `p` = `inner` 去掉結尾 `":*"`；**若 `p === ""` 或 `p` 含 `*` → 回 null**；
+   否則 → `{ kind: "prefix-boundary", prefix: p }`。
+4. 否則若 `inner` 以 ` *`（空白接星號）結尾：令 `p` = `inner` 去掉結尾 `" *"`；
+   **若 `p === ""` 或 `p` 含 `*` → 回 null**；否則 → `{ kind: "prefix-boundary", prefix: p }`。
+5. 否則若 `inner` 以 `*` 結尾（此時必非 `:*` 或 ` *`，已由步驟 3/4 處理）：令 `p` = `inner` 去掉結尾 `"*"`；
+   **若 `p === ""` 或 `p` 含 `*` → 回 null**；否則 → `{ kind: "prefix-loose", prefix: p }`。
+6. 否則若 `inner` 不含 `*`（步驟 2 已保證非空）→ `{ kind: "exact", text: inner }`。
+7. 其餘（中段 `*`、多個 `*` 等無法可靠解析的形式）→ null。
 
-如此「prefix 中段含 `*`」的任何形式（如 `Bash(git * status:*)`）都會落到步驟 7 回 null，
-與「中段萬用字元不支援」的非目標自洽。
+**拒絕空 prefix 至關重要**：`Bash(*)` / `Bash(:*)` / `Bash( *)` 去掉通配後 `p === ""`，若不擋會產生
+匹配「所有指令」的 pattern，等於一條規則就把所有 ask 升級為 allow——直接違反本工具「誤 allow 不可接受」
+的核心不變量（Claude Code 的 deny/ask 雖仍會擋真正危險者，但本工具自身契約不容許這種放行）。故一律回 null。
+同理「prefix 中段含 `*`」（如 `Bash(git * status:*)`）也落到 null，與「中段萬用字元不支援」的非目標自洽。
+經此處理後，`matchesPattern` 收到的 `prefix` / `exact text` 必為非空字串。
 
 `matchesPattern` 規則：
 
@@ -257,6 +269,8 @@ export function classify(
 
 新增 `rules` 參數（預設空集合）並下傳至 `classify`；其餘流程不變：
 
+完整結構（既有的 fail-safe `try/catch`、`errors` 檢查、no-op 分支一律保留，僅新增 `rules` 參數與下傳）：
+
 ```ts
 import { EMPTY_RULES } from "../permissions/settings.ts";
 import type { PermissionRules } from "../permissions/settings.ts";
@@ -267,13 +281,24 @@ export function evaluate(
   initialCwd: CwdState,
   rules: PermissionRules = EMPTY_RULES,
 ): Decision {
-  // ... parse / walk 不變 ...
-  return combine(invocations.map((inv) => classify(inv, root, rules)));
+  try {
+    const { script, errors } = parseCommand(command);
+    if (errors.length > 0) {
+      return { verdict: "ask", reason: "指令語法無法可靠解析" };
+    }
+    const invocations = walk(script, initialCwd, root);
+    if (invocations.length === 0) {
+      return { verdict: "allow", reason: "無可執行指令（no-op）" };
+    }
+    return combine(invocations.map((inv) => classify(inv, root, rules)));
+  } catch (_err) {
+    return { verdict: "ask", reason: "權限檢查器內部錯誤，保守交付人工確認" };
+  }
 }
 ```
 
-`evaluate.ts` 既有的 no-op allow 訊息（`"無可執行指令（no-op）"`，現行 evaluate.ts 第 19 行）與本功能無關，
-保持不變，實作者勿改。
+唯一變更是新增 `rules` 參數並傳入 `classify`；其餘（try/catch fail-safe、語法錯誤 → ask、
+no-op allow 訊息 `"無可執行指令（no-op）"`）一律不動。
 
 ### 4.5 `src/engine/combine.ts`（allow 訊息正確性）
 
@@ -332,11 +357,13 @@ deno compile --allow-read --allow-env=CLAUDE_PROJECT_DIR,HOME,USERPROFILE --outp
     `normalizeAbsolute` 後組出的使用者檔路徑為 `C:/Users/X/.claude/settings.json`。
 - **`src/permissions/matcher_test.ts`**
   - `parseBashRule`：`Bash(npm test:*)`→prefix-boundary、`Bash(ls *)`→prefix-boundary、
-    `Bash(ls*)`→prefix-loose、`Bash(git status)`→exact、`Read(./x)`→null、`Bash(git * --x)`→null、`Bash(git * status:*)`→null（中段 `*`）、`Bash()`→null。
+    `Bash(ls*)`→prefix-loose、`Bash(git status)`→exact、`Read(./x)`→null、`Bash(git * --x)`→null、`Bash(git * status:*)`→null（中段 `*`）、
+    `Bash()`→null、`Bash(*)`→null、`Bash(:*)`→null、`Bash( *)`→null（空 prefix，匹配一切，必拒）。
   - `matchesPattern`：boundary 命中 `ls`、`ls -la`，不命中 `lsof`；loose 命中 `lsof`；
     exact 僅命中完全相等。
-  - `reconstructCommand`：name+靜態 argv → `"git diff --stat"`；動態 argv（變數 / `$()` / 未引號 glob）
-    → null；有賦值前綴 → null；動態 name → null。
+  - `reconstructCommand`：name+靜態 argv → `"git diff --stat"`；含空白的引號實參去引號後以單空白 join
+    （`grep "foo bar" f` → `"grep foo bar f"`）；動態 argv（變數 / `$()` / 未引號 glob）→ null；
+    有賦值前綴 → null；動態 name → null。
   - `settingsAllows`：命中 allow → true；同時命中 deny → false；同時命中 ask → false；
     三類皆不命中 → false；`reconstructCommand` 回 null → false。
 - **`src/engine/classify_test.ts`（新增案例）**
