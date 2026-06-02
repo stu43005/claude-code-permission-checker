@@ -1,3 +1,6 @@
+import type { CommandInvocation } from "../types.ts";
+import { staticValue } from "../engine/word.ts";
+
 /** 解析後的 Bash(...) 規則。prefix / text 經 parseBashRule 保證非空。 */
 export type BashPattern =
   | { kind: "exact"; text: string }
@@ -46,4 +49,23 @@ export function matchesPattern(cmd: string, pat: BashPattern): boolean {
 /** 是否命中任一 pattern。 */
 export function matchesAny(cmd: string, pats: BashPattern[]): boolean {
   return pats.some((p) => matchesPattern(cmd, p));
+}
+
+/**
+ * 把 invocation 還原成單一可比對指令字串。
+ * - name === null（動態指令名）→ null
+ * - 有賦值前綴（VAR=val）→ null（env 前綴可改變行為，且 Claude Code 字面比對亦不會命中 cmd:*）
+ * - 任一 argv 動態（變數 / $() / 未引號 glob，staticValue 回 null）→ null
+ * 否則回 [name, ...argv 靜態值].join(" ")。引號值已去引號、不重新加引號；不含重導向。
+ */
+export function reconstructCommand(inv: CommandInvocation): string | null {
+  if (inv.name === null) return null;
+  if (inv.assignments.length > 0) return null;
+  const parts: string[] = [inv.name];
+  for (const w of inv.argv) {
+    const v = staticValue(w);
+    if (v === null) return null;
+    parts.push(v);
+  }
+  return parts.join(" ");
 }

@@ -1,5 +1,16 @@
 import { assertEquals } from "@std/assert";
-import { matchesAny, matchesPattern, parseBashRule } from "./matcher.ts";
+import { parseCommand } from "../engine/parse.ts";
+import { walk } from "../engine/walk.ts";
+import type { CwdState } from "../types.ts";
+import { matchesAny, matchesPattern, parseBashRule, reconstructCommand } from "./matcher.ts";
+
+const ROOT = "/proj";
+const START: CwdState = { kind: "known", path: "/proj" };
+
+/** 取單一指令的第一筆 invocation。 */
+function firstInv(src: string) {
+  return walk(parseCommand(src).script, START, ROOT)[0];
+}
 
 Deno.test("parseBashRule: :* -> prefix-boundary", () => {
   assertEquals(parseBashRule("Bash(npm test:*)"), { kind: "prefix-boundary", prefix: "npm test" });
@@ -64,4 +75,32 @@ Deno.test("matchesAny: true if any pattern matches", () => {
   const pats = [parseBashRule("Bash(git status)")!, parseBashRule("Bash(npm test:*)")!];
   assertEquals(matchesAny("npm test --silent", pats), true);
   assertEquals(matchesAny("rm -rf x", pats), false);
+});
+
+Deno.test("reconstructCommand: name + static argv joined by single space", () => {
+  assertEquals(reconstructCommand(firstInv("git diff --stat")), "git diff --stat");
+});
+
+Deno.test("reconstructCommand: quoted arg is de-quoted, single-space joined", () => {
+  assertEquals(reconstructCommand(firstInv('grep "foo bar" f')), "grep foo bar f");
+});
+
+Deno.test("reconstructCommand: dynamic argv (variable) -> null", () => {
+  assertEquals(reconstructCommand(firstInv("cat $FILE")), null);
+});
+
+Deno.test("reconstructCommand: command substitution arg -> null", () => {
+  assertEquals(reconstructCommand(firstInv("cat $(ls)")), null);
+});
+
+Deno.test("reconstructCommand: unquoted glob arg -> null", () => {
+  assertEquals(reconstructCommand(firstInv("cat *.txt")), null);
+});
+
+Deno.test("reconstructCommand: assignment prefix -> null", () => {
+  assertEquals(reconstructCommand(firstInv("FOO=bar cat a")), null);
+});
+
+Deno.test("reconstructCommand: dynamic command name -> null", () => {
+  assertEquals(reconstructCommand(firstInv("$CMD a")), null);
 });
