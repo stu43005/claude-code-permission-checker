@@ -1,5 +1,6 @@
 import type { CommandInvocation } from "../types.ts";
 import { staticValue } from "../engine/word.ts";
+import type { PermissionRules } from "./settings.ts";
 
 /** 解析後的 Bash(...) 規則。prefix / text 經 parseBashRule 保證非空。 */
 export type BashPattern =
@@ -68,4 +69,18 @@ export function reconstructCommand(inv: CommandInvocation): string | null {
     parts.push(v);
   }
   return parts.join(" ");
+}
+
+/**
+ * 綜合判定：此 invocation 是否應依 settings 升級為 allow。
+ *   cmd = reconstructCommand(inv)；null → false
+ *   matchesAny(cmd, deny) 或 matchesAny(cmd, ask) → false（完整優先序）
+ *   matchesAny(cmd, allow) → true；否則 false
+ */
+export function settingsAllows(inv: CommandInvocation, rules: PermissionRules): boolean {
+  const cmd = reconstructCommand(inv);
+  if (cmd === null) return false;
+  if (matchesAny(cmd, rules.deny)) return false;
+  if (matchesAny(cmd, rules.ask)) return false;
+  return matchesAny(cmd, rules.allow);
 }

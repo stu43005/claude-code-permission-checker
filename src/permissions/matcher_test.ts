@@ -2,7 +2,8 @@ import { assertEquals } from "@std/assert";
 import { parseCommand } from "../engine/parse.ts";
 import { walk } from "../engine/walk.ts";
 import type { CwdState } from "../types.ts";
-import { matchesAny, matchesPattern, parseBashRule, reconstructCommand } from "./matcher.ts";
+import { matchesAny, matchesPattern, parseBashRule, reconstructCommand, settingsAllows } from "./matcher.ts";
+import type { PermissionRules } from "./settings.ts";
 
 const ROOT = "/proj";
 const START: CwdState = { kind: "known", path: "/proj" };
@@ -103,4 +104,32 @@ Deno.test("reconstructCommand: assignment prefix -> null", () => {
 
 Deno.test("reconstructCommand: dynamic command name -> null", () => {
   assertEquals(reconstructCommand(firstInv("$CMD a")), null);
+});
+
+/** 由字串規則組出 PermissionRules。 */
+function rulesOf(spec: { allow?: string[]; deny?: string[]; ask?: string[] }): PermissionRules {
+  const conv = (xs?: string[]) => (xs ?? []).map((s) => parseBashRule(s)!).filter(Boolean);
+  return { allow: conv(spec.allow), deny: conv(spec.deny), ask: conv(spec.ask) };
+}
+
+Deno.test("settingsAllows: allow match -> true", () => {
+  assertEquals(settingsAllows(firstInv("npm test --silent"), rulesOf({ allow: ["Bash(npm test:*)"] })), true);
+});
+
+Deno.test("settingsAllows: also denied -> false", () => {
+  const rules = rulesOf({ allow: ["Bash(npm test:*)"], deny: ["Bash(npm test:*)"] });
+  assertEquals(settingsAllows(firstInv("npm test"), rules), false);
+});
+
+Deno.test("settingsAllows: also asked -> false", () => {
+  const rules = rulesOf({ allow: ["Bash(npm test:*)"], ask: ["Bash(npm test:*)"] });
+  assertEquals(settingsAllows(firstInv("npm test"), rules), false);
+});
+
+Deno.test("settingsAllows: no allow match -> false", () => {
+  assertEquals(settingsAllows(firstInv("npm run build"), rulesOf({ allow: ["Bash(npm test:*)"] })), false);
+});
+
+Deno.test("settingsAllows: non-reconstructable (dynamic) -> false", () => {
+  assertEquals(settingsAllows(firstInv("cat $FILE"), rulesOf({ allow: ["Bash(cat:*)"] })), false);
 });
