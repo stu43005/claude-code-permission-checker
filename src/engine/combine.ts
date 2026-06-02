@@ -6,5 +6,5 @@ export function combine(verdicts: RuleVerdict[]): Decision {
   for (const v of verdicts) {
     if (v.kind === "ask") return { verdict: "ask", reason: v.reason };
   }
-  return { verdict: "allow", reason: "純唯讀指令，全部路徑位於專案內" };
+  return { verdict: "allow", reason: "全部指令均通過（唯讀放行或命中 permissions.allow）" };
 }
