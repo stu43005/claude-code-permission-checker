@@ -1,12 +1,14 @@
 import type { CommandInvocation } from "../types.ts";
 import type { RuleVerdict } from "../rules/types.ts";
-import { ask } from "../rules/types.ts";
+import { allow, ask } from "../rules/types.ts";
 import { lookupRule } from "../rules/allowlist.ts";
 import { isWithin, resolvePath, resolvePathValue } from "./scope.ts";
 import { hasWriteRedirect } from "./redirect.ts";
+import { settingsAllows } from "../permissions/matcher.ts";
+import { EMPTY_RULES, type PermissionRules } from "../permissions/settings.ts";
 
-/** 對單一指令呼叫判定 allow / ask。 */
-export function classify(inv: CommandInvocation, root: string): RuleVerdict {
+/** 既有的中央前置規則 + allowlist 規則判定。 */
+function classifyBuiltin(inv: CommandInvocation, root: string): RuleVerdict {
   if (inv.name === null) return ask("動態指令名，無法判定");
 
   const rule = lookupRule(inv.name);
@@ -34,4 +36,16 @@ export function classify(inv: CommandInvocation, root: string): RuleVerdict {
     resolvePath: (w) => resolvePath(w, inv.cwd, root),
     resolvePathValue: (v) => resolvePathValue(v, inv.cwd, root),
   });
+}
+
+/** 對單一指令呼叫判定 allow / ask；builtin 判 ask 時，命中 settings allow（未被 deny/ask 命中）則升級。 */
+export function classify(
+  inv: CommandInvocation,
+  root: string,
+  rules: PermissionRules = EMPTY_RULES,
+): RuleVerdict {
+  const v = classifyBuiltin(inv, root);
+  if (v.kind === "allow") return v;
+  if (settingsAllows(inv, rules)) return allow();
+  return v;
 }

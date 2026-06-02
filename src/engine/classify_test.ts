@@ -3,9 +3,21 @@ import { parseCommand } from "./parse.ts";
 import { walk } from "./walk.ts";
 import { classify } from "./classify.ts";
 import type { CwdState } from "../types.ts";
+import { parseBashRule } from "../permissions/matcher.ts";
+import type { PermissionRules } from "../permissions/settings.ts";
 
 const ROOT = "/proj";
 const START: CwdState = { kind: "known", path: "/proj" };
+
+function rulesOf(spec: { allow?: string[]; deny?: string[]; ask?: string[] }): PermissionRules {
+  const conv = (xs?: string[]) => (xs ?? []).map((s) => parseBashRule(s)!).filter(Boolean);
+  return { allow: conv(spec.allow), deny: conv(spec.deny), ask: conv(spec.ask) };
+}
+
+function onlyWith(src: string, rules: PermissionRules) {
+  const invs = walk(parseCommand(src).script, START, ROOT);
+  return classify(invs[0], ROOT, rules);
+}
 
 function only(src: string) {
   const invs = walk(parseCommand(src).script, START, ROOT);
@@ -44,4 +56,26 @@ Deno.test("LD_PRELOAD env assignment prefix asks", () => {
 
 Deno.test("FOO=bar env assignment prefix asks", () => {
   assertEquals(only("FOO=bar cat a").kind, "ask");
+});
+
+Deno.test("settings allow upgrades ask -> allow", () => {
+  assertEquals(onlyWith("npm test x", rulesOf({ allow: ["Bash(npm test:*)"] })).kind, "allow");
+});
+
+Deno.test("builtin allow stays allow regardless of rules", () => {
+  assertEquals(onlyWith("cat src/a.ts", rulesOf({ allow: ["Bash(npm test:*)"] })).kind, "allow");
+});
+
+Deno.test("deny blocks the upgrade -> stays ask", () => {
+  const rules = rulesOf({ allow: ["Bash(npm test:*)"], deny: ["Bash(npm test:*)"] });
+  assertEquals(onlyWith("npm test", rules).kind, "ask");
+});
+
+Deno.test("ask rule blocks the upgrade -> stays ask", () => {
+  const rules = rulesOf({ allow: ["Bash(npm test:*)"], ask: ["Bash(npm test:*)"] });
+  assertEquals(onlyWith("npm test", rules).kind, "ask");
+});
+
+Deno.test("no rules arg behaves as before (npm asks)", () => {
+  assertEquals(only("npm test").kind, "ask");
 });
