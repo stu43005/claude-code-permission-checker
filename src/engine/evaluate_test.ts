@@ -1,6 +1,8 @@
 import { assertEquals } from "@std/assert";
 import { evaluate } from "./evaluate.ts";
 import type { CwdState, Verdict } from "../types.ts";
+import { parseBashRule } from "../permissions/matcher.ts";
+import type { PermissionRules } from "../permissions/settings.ts";
 
 const ROOT = "/proj";
 const AT_ROOT: CwdState = { kind: "known", path: "/proj" };
@@ -75,4 +77,28 @@ for (const c of cases) {
 Deno.test("trusted extension example: a custom allow rule would allow", () => {
   // 信任擴充以加入 allowlist 規則為之（見 allowlist_test）；此處確認 cat allow
   assertEquals(evaluate("cat README.md", ROOT, AT_ROOT).verdict, "allow");
+});
+
+function rulesOf(spec: { allow?: string[]; deny?: string[]; ask?: string[] }): PermissionRules {
+  const conv = (xs?: string[]) => (xs ?? []).map((s) => parseBashRule(s)!).filter(Boolean);
+  return { allow: conv(spec.allow), deny: conv(spec.deny), ask: conv(spec.ask) };
+}
+
+Deno.test("evaluate: settings allow upgrades a single ask command", () => {
+  const rules = rulesOf({ allow: ["Bash(npm test:*)"] });
+  assertEquals(evaluate("npm test --silent", ROOT, AT_ROOT, rules).verdict, "allow");
+});
+
+Deno.test("evaluate: compound builtin-allow + settings-allow -> allow", () => {
+  const rules = rulesOf({ allow: ["Bash(npm test:*)"] });
+  assertEquals(evaluate("git diff && npm test", ROOT, AT_ROOT, rules).verdict, "allow");
+});
+
+Deno.test("evaluate: compound with one un-allowed command -> ask (weakest link)", () => {
+  const rules = rulesOf({ allow: ["Bash(npm test:*)"] });
+  assertEquals(evaluate("git diff && rm x", ROOT, AT_ROOT, rules).verdict, "ask");
+});
+
+Deno.test("evaluate: no rules arg keeps current behavior", () => {
+  assertEquals(evaluate("npm test", ROOT, AT_ROOT).verdict, "ask");
 });
