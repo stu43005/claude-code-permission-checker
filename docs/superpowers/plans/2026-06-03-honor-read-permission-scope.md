@@ -841,7 +841,9 @@ import { resolvePath, resolvePathValue, rootScope } from "../../engine/scope.ts"
 
 - [ ] **Step 7: 於 `classify_test.ts` 新增外部整合測試**
 
-於檔頭新增匯入：
+於檔頭，把 Task 2 Step 5 已加入的 `import { EMPTY_READ_SCOPE } from "../permissions/path_scope.ts";`
+**擴充為下面這一行**（同一條 import 補上 `parsePathRule` 與 `type ReadScope`；全檔對 `path_scope.ts`
+僅保留這一條 import，避免重複 import `EMPTY_READ_SCOPE`）：
 
 ```ts
 import { EMPTY_READ_SCOPE, parsePathRule, type ReadScope } from "../permissions/path_scope.ts";
