@@ -1,0 +1,376 @@
+# 設計規格：沿用 Read/Edit/Write 權限規則放寬唯讀指令的路徑範圍
+
+- 日期：2026-06-03
+- 狀態：設計（待實作）
+
+## 1. 背景與問題
+
+本工具是 Claude Code 的 `PreToolUse`（matcher `Bash`）hook：解析 Bash 指令，
+只在「純唯讀且全部落在當前專案內」時回 `allow`，其餘回 `ask`，**永不 `deny`、永遠 `exit 0`**。
+既有功能（見 2026-06-01 規格）已會 runtime 讀取 `permissions.allow` 中的 `Bash(...)` 規則，
+在 builtin 判 `ask` 時嘗試升級為 `allow`。
+
+### 1.1 痛點
+
+Deno 的 npm 快取放在使用者目錄外（Windows 為 `%LOCALAPPDATA%/deno/npm`，即
+`C:\Users\<user>\AppData\Local\deno\npm`），位於**專案範圍外**。使用者已在 settings.json 以
+`Read(...)` 規則允許讀取該目錄，期望 agent 能用 `grep`/`cat` 等指令查閱套件原始碼。
+
+但本工具目前：
+
+1. **路徑範圍檢查只認單一專案根**（`scope.ts` 的 `isWithin(root, …)`）。deno 快取在專案外
+   → `resolvePathValue` 回 `out-of-project` → 中央/個別規則判 `ask`。
+2. **runtime 升級層只讀 `Bash(...)` 規則**（`classify.ts` → `settingsAllows`），
+   **完全不看 `Read(...)`/`Edit(...)`/`Write(...)`**。
+
+因此使用者設的 `Read(...)` 對「經 Bash 執行的 grep」毫無作用 —— 這就是痛點根因。
+
+### 1.2 已查證的 Claude Code 語意（官方文件 + GitHub issue 交叉驗證）
+
+來源：<https://code.claude.com/docs/en/permissions>、<https://code.claude.com/docs/en/hooks-guide>、
+<https://code.claude.com/docs/en/sandboxing>（信心度：高）。
+
+1. **Bash 工具原生無路徑感知。** 官方：Bash 權限「只檢查 `Bash` 是否在權限清單，不解析指令裡的
+   路徑去比對」。→ 使用者看到的「讀專案外就被問」**是本 hook 自己加的**，不是 CC 原生行為。
+   故本 hook 回 `allow` 對「沒命中任何 `Bash(...)` 規則、預設會跳提示」的指令**確實能略過提示放行**。
+2. **`permissionDecision: "allow"` 的語意**：官方原文「skip the interactive permission prompt」。
+   `allow` 不會突破 settings 的 `deny`/`ask`（`deny > ask > allow`，most-restrictive-wins）。
+3. **`Read()/Edit()` 規則的官方定位**：文件稱其「套用於 Claude 內建檔案工具，**不**套用於 Bash
+   subprocess」。另有 GitHub issue 反映新版存在「未公開的跨工具掃描器」會用 `Read()/Edit()` 的
+   **deny** 規則結構性比對來擋 Bash —— 但**那是 deny 方向**；**allow 方向不會自動放行 Bash**。
+   故 `Read()` allow 不會讓 CC 自己放行 grep，本 hook 仍是唯一能把該 grep 變 `allow` 的環節
+   （此 GitHub issue 細節信心度中、僅供佐證，不影響本功能成立的結論）。
+4. **`Read(...)` 路徑模式語法**：遵循 gitignore 規範，四種前綴：
+   - `//path` ＝ **檔案系統絕對路徑**（例：`Read(//Users/alice/secrets/**)`）。
+   - `~/path` ＝ **家目錄相對**（例：`Read(~/Documents/*.pdf)`）。
+   - `/path` ＝ **專案根相對**（例：`Read(/src/**)`）。`/Users/alice` 是專案相對、**不是**絕對。
+   - `path` 或 `./path` ＝ **cwd 相對**；裸檔名 `Read(.env)` ≡ `Read(**/.env)`（任意深度）。
+   - `*` 匹配單層、`**` 遞迴；無 glob 的純路徑＝字面匹配該檔/該目錄本身（**不遞迴**）。
+   - Windows 正規化為 POSIX：`C:\Users\alice` → `/c/Users/alice`；絕對寫法用 `//c/…`。
+5. **sandbox 是 OS 層**：若使用者啟用 `sandbox.filesystem`，專案外路徑會在 **OS 層**被擋，
+   與 hook 決策無關。預設（未開 sandbox）時本 hook 的 `allow` 完全有效（見 §7 限制）。
+
+### 1.3 本功能要改的事
+
+把「路徑範圍判定」的「allow 區域」從**僅專案根**，擴充為
+**專案根 ∪（使用者以 `Read()/Edit()/Write()` allow 宣告、且未被 deny/ask 否決的外部唯讀位置）**。
+**只放寬「讀取位置」**，不放寬任何寫入/執行偵測。
+
+## 2. 目標與非目標
+
+### 目標
+
+- runtime 解析三處 settings（專案 `.claude/settings.json`、`.claude/settings.local.json`、
+  使用者 `~/.claude/settings.json`）`permissions.{allow,deny,ask}` 中的
+  `Read(...)`/`Edit(...)`/`Write(...)` 規則，抽出「外部唯讀範圍」。
+- 讓 `scope.ts` 的三態判定在「指令路徑落在外部允許範圍且未被否決」時回 `in-project`，
+  使既有唯讀規則自然放行；`classify.ts` 的 cwd 中央前置檢查同步沿用此擴充範圍。
+- 全程 fail-safe：任何讀檔／解析失敗退化為「無此來源規則」，永不丟例外、永遠 `exit 0`。
+
+### 非目標（YAGNI，刻意排除）
+
+- **不**處理 `/`（專案相對）與 `path`/`./path`（cwd 相對）前綴：前者解析回專案內、本就 in-scope
+  （加了是 no-op）；後者語義模糊且 cwd 另有中央檢查。**只認 `//` 與 `~/`**。
+- **不**支援中段 glob（`dir/*.json`、`**/foo`、`a*b/**`）與裸檔名（`.env`≡`**/.env`）：
+  無法化約為「乾淨的目錄 root」或「精確單檔」者一律忽略（維持 ask，default-safe）。
+- **不**讀 enterprise managed-settings.json。
+- **不**放寬任何寫入/執行偵測（寫入重導向、賦值前綴、非唯讀指令）—— 見 §6 不變量。
+- **不**引入快取（hook 每次 Bash 呼叫都是獨立進程）。
+- **不**改動既有 `Bash(...)` 升級層（`settingsAllows`）：兩機制並存（見 §5）。
+
+## 3. 架構與資料流
+
+新增邏輯掛在既有「settings 載入」與「scope 範圍判定」兩層，不改 parse / walk / combine 職責。
+
+```
+main.ts
+  ├─ resolveProjectRoot(env)                                （既有）
+  ├─ loadPermissionRules(env, root)                          （擴充：附帶 readScope）
+  └─ evaluate(command, root, initialCwd, rules)              （既有簽名不變）
+        └─ classify(inv, root, rules)                        （既有簽名不變）
+              ├─ 由 root + rules.readScope 組裝 ScopeConfig   （新增，於 classify 內）
+              ├─ classifyBuiltin(inv, scope)                 （cwd 檢查 + 規則閉包改用 scope）
+              │     └─ resolvePath / resolvePathValue(…, scope)（scope.ts 簽名擴充）
+              └─ settingsAllows(inv, rules)                  （既有 Bash() 升級層，不變）
+```
+
+## 4. 詳細設計
+
+### 4.1 新型別：ReadScope 與 PermissionRules 擴充
+
+於 `src/permissions/path_scope.ts`（新檔）定義：
+
+```ts
+/** 由 Read()/Edit()/Write() 規則化約而來的外部唯讀範圍（路徑皆為已正規化的絕對 POSIX 形式）。 */
+export interface ReadScope {
+  /** 目錄 root（來自結尾 `/**` 的遞迴模式）；以 isWithin 比對「在其下」。 */
+  roots: string[];
+  /** 精確單一路徑（來自無 glob 的字面模式）；以正規化後字串相等比對。 */
+  files: string[];
+}
+
+/** 空 ReadScope 常數。 */
+export const EMPTY_READ_SCOPE: ReadScope = { roots: [], files: [] };
+```
+
+於 `src/permissions/settings.ts` 的 `PermissionRules` 追加欄位（既有欄位不動）：
+
+```ts
+export interface PermissionRules {
+  allow: BashPattern[];
+  deny: BashPattern[];
+  ask: BashPattern[];
+  /** 新增：由 Read/Edit/Write 規則化約的外部唯讀範圍。 */
+  readScope: {
+    /** allow 側 Read∪Edit∪Write 的聯集（可讀來源）。 */
+    allow: ReadScope;
+    /** deny+ask 側 Read∪Edit∪Write 的聯集（否決放寬；保守，寧可多問）。 */
+    block: ReadScope;
+  };
+}
+```
+
+`EMPTY_RULES` 同步補上 `readScope: { allow: EMPTY_READ_SCOPE, block: EMPTY_READ_SCOPE }`。
+
+### 4.2 模式解析：parsePathRule
+
+於 `src/permissions/path_scope.ts` 實作。輸入單一規則字串與已解析的家目錄，輸出一筆 scope entry：
+
+```ts
+export type PathScopeEntry =
+  | { kind: "root"; path: string }   // 目錄 root，已正規化絕對 POSIX
+  | { kind: "file"; path: string };  // 精確單檔，已正規化絕對 POSIX
+
+/**
+ * 解析 "Read(...)" / "Edit(...)" / "Write(...)" 規則為外部唯讀 scope entry。
+ * 只認 `//`（絕對）與 `~/`（家目錄）前綴；其餘前綴、含 glob 的複雜形式、否定模式 → null（忽略）。
+ * home 為 null（無法解析家目錄）時，`~/` 規則一律回 null。
+ */
+export function parsePathRule(rule: string, home: string | null): PathScopeEntry | null;
+```
+
+**演算法（逐步，default-safe：任何不確定 → 回 null）：**
+
+1. 用 `^(Read|Edit|Write)\((.+)\)$` 比對；不符 → null。取括號內字串 `inner`（`.+` 保證非空）。
+2. **否定模式**：`inner` 以 `!` 開頭 → null（不支援）。
+3. **解析前綴為「半成品絕對 POSIX 字串 `p`」**：
+   - `inner` 以 `//` 開頭 → 去掉**一個**前導 `/`，得 `p = inner.slice(1)`（`//c/foo/**` → `/c/foo/**`）。
+   - `inner` 以 `~/` 開頭 → `home === null` 回 null；否則 `p = toPosix(home) + "/" + inner.slice(2)`。
+   - 其餘（`/path`、`path`、`./path`）→ null（非目標前綴）。
+4. **分類 `p`（以是否含 glob 字元 `*`、`?`、`[`、`]` 判定）：**
+   - `p` 以 `/**` 結尾：取 `base = p.slice(0, -3)`；若 `base === ""` → 視為檔案系統根
+     `base = "/"`；**若 `base` 仍含任何 glob 字元 → null**（如 `/c/foo*/**`）；
+     否則回 `{ kind: "root", path: normalizeAbsolute(base) }`。
+   - `p` 完全不含 glob 字元：回 `{ kind: "file", path: normalizeAbsolute(p) }`。
+   - 其餘（含 glob 但非乾淨結尾 `/**`，如 `/c/dir/*.json`、`/c/**/foo`）→ null（忽略）。
+
+> **跨平台**：`normalizeAbsolute` 在 Windows 會把 `/c/foo` → `C:/foo`（與專案根、指令路徑同形式）；
+> 在 Linux 不套用磁碟轉換（`/c/` 是真 POSIX）。此行為由既有 `scope.ts` 保證，本檔直接複用。
+> `toPosix`（反斜線轉斜線）需自 `scope.ts` 匯出供本檔使用（目前為私有，改為 `export`）。
+
+### 4.3 建構 readScope（settings.ts 載入時）
+
+`loadPermissionRules` 既有迴圈會逐檔 `parseFile` 得 `Bash(...)` 規則。擴充為：對每個 settings 檔的
+`permissions.{allow,deny,ask}` 原始字串陣列，除既有 `parseRuleList`（Bash）外，新增
+`parsePathRuleList(value, home)`：對每個字串呼叫 `parsePathRule`，把非 null 結果依 `kind` 收進一個
+`ReadScope`（`root`→`roots`、`file`→`files`）。
+
+聯集規則：
+
+- `readScope.allow` ＝ 所有檔案的 **allow 陣列**化約結果之聯集（Read∪Edit∪Write 已在 `parsePathRule`
+  層不分工具一視同仁，故只需依 allow/deny/ask 分桶）。
+- `readScope.block` ＝ 所有檔案的 **deny 陣列 ∪ ask 陣列**化約結果之聯集。
+
+`home` 由既有 `resolveHome(env)` 取得（已實作；無法解析時回 null，`~/` 規則自然被忽略）。
+fail-safe：解析任一規則字串丟例外時，該條忽略（`parsePathRule` 本身不應丟例外，但 `parsePathRuleList`
+仍以 try/catch 逐條兜底）；任一檔失敗僅該檔貢獻空 `ReadScope`。
+
+### 4.4 scope.ts：ScopeConfig 與三態判定擴充
+
+新增型別與判定函式；既有 `isAbsolute`/`normalizeAbsolute`/`isWithin`/`resolveAgainst` 不變，
+`toPosix` 改為 `export`。
+
+```ts
+import type { ReadScope } from "../permissions/path_scope.ts";
+
+/** 範圍設定：專案根 + 外部允許/否決唯讀範圍。 */
+export interface ScopeConfig {
+  root: string;
+  allow: ReadScope;
+  block: ReadScope;
+}
+
+/**
+ * 已正規化絕對 POSIX 路徑是否落在「允許讀取的位置」：
+ *   專案根內 → true；
+ *   否則 命中 allow.(roots|files) 且 未命中 block.(roots|files) → true；
+ *   其餘 → false。
+ * block 優先於 allow（保守）。
+ */
+export function isReadScoped(absPosix: string, scope: ScopeConfig): boolean {
+  // block 優先
+  if (scope.block.roots.some((r) => isWithin(r, absPosix))) return false;
+  if (scope.block.files.some((f) => isWithin(f, absPosix) && f === absPosix)) return false;
+  if (isWithin(scope.root, absPosix)) return true;
+  if (scope.allow.roots.some((r) => isWithin(r, absPosix))) return true;
+  if (scope.allow.files.some((f) => f === absPosix)) return true;
+  return false;
+}
+```
+
+> 註：`files` 已於載入時 `normalizeAbsolute`，`absPosix` 亦為正規化值，故 `f === absPosix` 字串相等
+> 即正確（無需再呼叫 normalize）。`block.files` 用 `f === absPosix` 精確比對（單檔否決只擋該檔本身）。
+
+`resolvePathValue` / `resolvePath` 簽名由「`root: string`」改為「`scope: ScopeConfig`」：
+
+```ts
+export function resolvePathValue(value: string | null, cwd: CwdState, scope: ScopeConfig): PathScope {
+  if (value === null) return "dynamic";
+  let abs: string;
+  if (isAbsolute(value)) {
+    abs = normalizeAbsolute(value);
+  } else {
+    if (cwd.kind === "unknown") return "dynamic";
+    abs = resolveAgainst(cwd.path, value);
+  }
+  return isReadScoped(abs, scope) ? "in-project" : "out-of-project";
+}
+
+export function resolvePath(arg: Word, cwd: CwdState, scope: ScopeConfig): PathScope {
+  return resolvePathValue(staticValue(arg), cwd, scope);
+}
+```
+
+行為等價性保證：當 `scope.allow`/`scope.block` 皆空時，`isReadScoped` 退化為「僅 `isWithin(root,…)`」，
+與既有行為完全一致（既有測試不需改判定，只需改傳參）。
+
+### 4.5 classify.ts：組裝 ScopeConfig 並沿用於 cwd 檢查與規則閉包
+
+`classify(inv, root, rules)` 內由 `root` 與 `rules.readScope` 組裝 `scope`，傳入 `classifyBuiltin`：
+
+```ts
+function classifyBuiltin(inv: CommandInvocation, scope: ScopeConfig): RuleVerdict {
+  if (inv.name === null) return ask("動態指令名，無法判定");
+  const rule = lookupRule(inv.name);
+  if (!rule) return ask(`未列入 allowlist 的指令：${inv.name}`);
+
+  // 中央前置規則之一：cwd 範圍（known 但不在「專案 ∪ 外部允許唯讀範圍」）
+  if (inv.cwd.kind === "known" && !isReadScoped(normalizeAbsolute(inv.cwd.path), scope)) {
+    return ask(`工作目錄超出允許範圍：${inv.cwd.path}`);
+  }
+  if (hasWriteRedirect(inv.redirects)) return ask(`${inv.name}：寫入型重導向`);
+  if (inv.assignments.length > 0) return ask(`${inv.name}：含環境變數賦值前綴，可能改變執行行為`);
+
+  return rule.evaluate({
+    name: inv.name,
+    argv: inv.argv,
+    redirects: inv.redirects,
+    assignments: inv.assignments,
+    cwd: inv.cwd,
+    resolvePath: (w) => resolvePath(w, inv.cwd, scope),
+    resolvePathValue: (v) => resolvePathValue(v, inv.cwd, scope),
+  });
+}
+
+export function classify(inv, root, rules = EMPTY_RULES): RuleVerdict {
+  const scope: ScopeConfig = { root, allow: rules.readScope.allow, block: rules.readScope.block };
+  const v = classifyBuiltin(inv, scope);
+  if (v.kind === "allow") return v;
+  if (settingsAllows(inv, rules)) return allow();
+  return v;
+}
+```
+
+> `inv.cwd.path` 在 walk 階段已正規化，但此處仍包一次 `normalizeAbsolute` 以保險（冪等）。
+> `RuleContext` 介面與所有個別規則（`rules/commands/*.ts`）**不需改動**：閉包簽名對外不變。
+
+## 5. 與既有 Bash() 升級層（settingsAllows）的關係
+
+兩機制正交、並存，**不**互相取代：
+
+- **Bash() 升級層**（既有）：處理「能靜態還原成完整指令字串、且該字串命中 `Bash(...)` allow」的整條指令放行。
+- **Read-scope 放寬**（本功能）：處理「唯讀指令的路徑落在外部允許讀取位置」——即使該指令字串沒有對應的
+  `Bash(...)` 規則，只要它本就是 allowlist 內的唯讀指令、且路徑被 `Read()/Edit()/Write()` 涵蓋即放行。
+
+執行順序（見 §4.5）：先跑 `classifyBuiltin`（已含 Read-scope 放寬）；若仍 `ask`，再嘗試 Bash() 升級。
+
+## 6. 安全不變量（不可違反）
+
+1. **只放寬「讀取位置」**：寫入型重導向、賦值前綴、非唯讀指令不在 allowlist —— 這些偵測**原樣不動**，
+   且都在 path-scope 之外（與路徑無關）。放寬 in-project 不會讓任何寫入/執行被放行。
+2. **維護不變量（明訂）**：allowlist 僅收**唯讀指令**。因為「放寬 in-project」是全域作用於所有
+   `resolvePath` 呼叫，故**未來若新增會寫檔的指令，其寫入目標路徑不得依賴本 scope 放寬**——
+   該類指令本就不該進 allowlist；若有需要，須另設不吃放寬的判定路徑。
+3. **block 優先於 allow**：deny/ask 側任一 `Read/Edit/Write` 命中即否決放寬（§4.4），與
+   `deny > ask > allow` 一致，且與 CC 未公開跨工具掃描器以 Read/Edit deny 擋 Bash 的方向一致。
+4. **default-safe**：只認 `//`/`~/` 前綴、`/**` 目錄與精確單檔；其餘形式忽略 → 維持 ask。
+   動態 token（`staticValue` 回 null）仍回 `dynamic` → ask。
+5. **fail-safe**：解析/讀檔失敗退化為空 `ReadScope`，永不丟例外、永遠 `exit 0`。
+
+## 7. 限制與已知邊界
+
+- **sandbox**：若使用者啟用 `sandbox.filesystem`，專案外路徑在 OS 層被擋，hook `allow` 不足以放行；
+  使用者需另把該目錄加入 sandbox 的 `allowRead`。本工具不處理 sandbox（非目標），但 CLAUDE.md 應註記。
+- **CC 既有 deny/ask**：本 hook 的 `allow` 不突破 CC 端 `Bash(...)` deny/ask 與 managed deny；
+  安全由 CC 再次保證。
+- **裸檔名 / 中段 glob 不支援**：如 `Read(.env)`（≡任意深度）、`Read(//c/dir/*.json)` 一律忽略，
+  對應指令維持 ask（誤 ask 可接受）。
+- **`//**`（整個檔案系統）**：`Read(//**)` 會化約成 root `/`，使一切外部路徑視為可讀。這是使用者
+  的明確宣告，照常尊重；其跨平台磁碟比對為 best-effort（`normalizeAbsolute("/")` → `/`）。
+
+## 8. 測試策略
+
+### 8.1 單元測試
+
+- **`path_scope_test.ts`（新）**：`parsePathRule` 對以下逐一驗證——
+  - `//` 絕對 `/**` → root；`~/` `/**` → root（含 home 串接）；`~/` 但 home=null → null。
+  - 無 glob 單檔（`//c/foo/bar.txt`、`~/.zshrc`）→ file。
+  - 中段 glob（`//c/dir/*.json`、`//c/**/foo`、`//c/a*b/**`）→ null。
+  - 非目標前綴（`/src/**`、`src/**`、`./x`、`.env`）→ null。
+  - 否定（`!//c/x`）→ null；非 Read/Edit/Write（`Bash(ls)`）→ null。
+  - `Edit(...)`/`Write(...)` 與 `Read(...)` 化約結果一致。
+  - Windows 專屬斷言（`//c/...` → `C:/...`）以 `ignore: Deno.build.os !== "windows"` 區分；
+    Linux 專屬（`/c/...` 維持 POSIX、區分大小寫）以反向 ignore 區分。
+- **`settings_test.ts`（擴充）**：多檔 union——allow 側進 `readScope.allow`、deny+ask 側進
+  `readScope.block`；缺檔/壞 JSON fail-safe 回空 readScope。
+- **`scope_test.ts`（擴充）**：`isReadScoped` 與三態——
+  - allow.roots 命中 → in-project；同時 block.roots 命中 → out-of-project（block 優先）。
+  - allow.files 精確相等 → in-project；其子路徑不命中（單檔不遞迴）。
+  - scope.allow/block 皆空 → 退化為「僅專案根」與既有行為一致。
+  - 既有測試改傳 `ScopeConfig`（allow/block 空）而非裸 `root`。
+- **`classify_test.ts`（擴充）**：cwd 落在外部 allow root 時，唯讀指令放行；落在 block 時 ask；
+  外部允許目錄內仍含寫入重導向 → ask（驗證不變量 §6.1）。
+
+### 8.2 Operational verification（改規則後必做）
+
+`deno task build` 後，於含下列 settings 的環境餵 JSON 給 binary：
+
+```jsonc
+// .claude/settings.json: { "permissions": { "allow": ["Read(//c/Users/<user>/AppData/Local/deno/npm/**)"] } }
+```
+
+```bash
+# 期望 allow、exit 0（路徑落在 Read() 宣告的外部 root）
+echo '{"tool_name":"Bash","tool_input":{"command":"grep -r needle /c/Users/<user>/AppData/Local/deno/npm"},"cwd":"D:/proj"}' \
+  | CLAUDE_PROJECT_DIR="D:/proj" ./dist/permission-checker.exe
+
+# 反例：未被任何 Read() 涵蓋的外部路徑 → 期望 ask
+echo '{"tool_name":"Bash","tool_input":{"command":"grep -r needle /c/Windows/System32"},"cwd":"D:/proj"}' \
+  | CLAUDE_PROJECT_DIR="D:/proj" ./dist/permission-checker.exe
+```
+
+## 9. 檔案變更清單
+
+- **新增** `src/permissions/path_scope.ts`：`ReadScope`、`EMPTY_READ_SCOPE`、`PathScopeEntry`、
+  `parsePathRule`。
+- **新增** `src/permissions/path_scope_test.ts`。
+- **修改** `src/permissions/settings.ts`：`PermissionRules` 加 `readScope`、`EMPTY_RULES` 補欄位、
+  `loadPermissionRules` 建構 `readScope`（新增 `parsePathRuleList`）。
+- **修改** `src/permissions/settings_test.ts`：補 readScope union / fail-safe 案例。
+- **修改** `src/engine/scope.ts`：`toPosix` 改 export、新增 `ScopeConfig`/`isReadScoped`、
+  `resolvePathValue`/`resolvePath` 簽名由 `root` 改 `scope`。
+- **修改** `src/engine/scope_test.ts`：改傳 `ScopeConfig`、補放寬/否決案例。
+- **修改** `src/engine/classify.ts`：組裝 `ScopeConfig`、cwd 檢查與閉包改用 `scope`。
+- **修改** `src/engine/classify_test.ts`：補外部 allow/block 案例。
+- **修改** `CLAUDE.md`：於「hook 決策 vs settings.json 權限的優先序」一節補述本機制與 sandbox 限制。
+- **不改** `main.ts`、`evaluate.ts`、`combine.ts`、`walk.ts`、`rules/**`、`matcher.ts`（簽名皆不變）。
