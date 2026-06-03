@@ -5,7 +5,7 @@ import { classify } from "./classify.ts";
 import type { CwdState } from "../types.ts";
 import { parseBashRule } from "../permissions/matcher.ts";
 import type { PermissionRules } from "../permissions/settings.ts";
-import { EMPTY_READ_SCOPE } from "../permissions/path_scope.ts";
+import { EMPTY_READ_SCOPE, parsePathRule, type ReadScope } from "../permissions/path_scope.ts";
 
 const ROOT = "/proj";
 const START: CwdState = { kind: "known", path: "/proj" };
@@ -82,4 +82,62 @@ Deno.test("ask rule blocks the upgrade -> stays ask", () => {
 
 Deno.test("no rules arg behaves as before (npm asks)", () => {
   assertEquals(only("npm test").kind, "ask");
+});
+
+function rulesWithRead(readAllow: string[]): PermissionRules {
+  const allow: ReadScope = { roots: [], files: [] };
+  for (const r of readAllow) {
+    const e = parsePathRule(r, null);
+    if (e?.kind === "root") allow.roots.push(e.path);
+    else if (e?.kind === "file") allow.files.push(e.path);
+  }
+  return {
+    bash: { allow: [], deny: [], ask: [] },
+    readScope: { allow, deny: EMPTY_READ_SCOPE, ask: EMPTY_READ_SCOPE },
+  };
+}
+
+Deno.test("external Read() allow widens read-only command -> allow", () => {
+  const r = onlyWith("grep needle /srv/pkg/a.ts", rulesWithRead(["Read(//srv/pkg/**)"]));
+  assertEquals(r.kind, "allow");
+});
+
+Deno.test("external path not covered by Read() -> ask", () => {
+  assertEquals(onlyWith("grep needle /etc/passwd", rulesWithRead(["Read(//srv/pkg/**)"])).kind, "ask");
+});
+
+Deno.test("write redirect inside external allow dir still asks", () => {
+  assertEquals(onlyWith("grep x /srv/pkg/a > /srv/pkg/out", rulesWithRead(["Read(//srv/pkg/**)"])).kind, "ask");
+});
+
+Deno.test("cwd inside external allow dir, read-only command -> allow", () => {
+  const invs = walk(parseCommand("cd /srv/pkg && cat a").script, START, ROOT);
+  const cat = invs.find((i) => i.name === "cat")!;
+  assertEquals(classify(cat, ROOT, rulesWithRead(["Read(//srv/pkg/**)"])).kind, "allow");
+});
+
+Deno.test("external path under allow root but also denied -> ask (integration)", () => {
+  const rules: PermissionRules = {
+    bash: { allow: [], deny: [], ask: [] },
+    readScope: {
+      allow: { roots: ["/srv/pkg"], files: [] },
+      deny: { roots: ["/srv/pkg/secret"], files: [] },
+      ask: EMPTY_READ_SCOPE,
+    },
+  };
+  assertEquals(onlyWith("grep needle /srv/pkg/secret/a", rules).kind, "ask");
+});
+
+Deno.test("cwd under allow root but also ask-listed -> ask (integration)", () => {
+  const rules: PermissionRules = {
+    bash: { allow: [], deny: [], ask: [] },
+    readScope: {
+      allow: { roots: ["/srv/pkg"], files: [] },
+      deny: EMPTY_READ_SCOPE,
+      ask: { roots: ["/srv/pkg/secret"], files: [] },
+    },
+  };
+  const invs = walk(parseCommand("cd /srv/pkg/secret && cat a").script, START, ROOT);
+  const cat = invs.find((i) => i.name === "cat")!;
+  assertEquals(classify(cat, ROOT, rules).kind, "ask");
 });

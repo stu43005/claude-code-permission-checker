@@ -1,7 +1,7 @@
 import { assertEquals } from "@std/assert";
 import { parse } from "../deps.ts";
 import type { Command } from "../deps.ts";
-import { isWithin, normalizeAbsolute, resolvePath, type PathScope } from "./scope.ts";
+import { isReadScoped, isWithin, normalizeAbsolute, resolvePath, rootScope, type PathScope, type ScopeConfig } from "./scope.ts";
 
 function firstArg(src: string) {
   return (parse(src).commands[0].command as Command).suffix[0];
@@ -69,42 +69,86 @@ Deno.test("resolvePath: relative in-project under known cwd", () => {
   const scope: PathScope = resolvePath(
     firstArg("cat src/a.ts"),
     { kind: "known", path: "/proj" },
-    "/proj",
+    rootScope("/proj"),
   );
   assertEquals(scope, "in-project");
 });
 
 Deno.test("resolvePath: absolute outside project", () => {
   assertEquals(
-    resolvePath(firstArg("cat /etc/passwd"), { kind: "known", path: "/proj" }, "/proj"),
+    resolvePath(firstArg("cat /etc/passwd"), { kind: "known", path: "/proj" }, rootScope("/proj")),
     "out-of-project",
   );
 });
 
 Deno.test("resolvePath: relative escaping via .. is out-of-project", () => {
   assertEquals(
-    resolvePath(firstArg("cat ../secret"), { kind: "known", path: "/proj" }, "/proj"),
+    resolvePath(firstArg("cat ../secret"), { kind: "known", path: "/proj" }, rootScope("/proj")),
     "out-of-project",
   );
 });
 
 Deno.test("resolvePath: dynamic arg is dynamic", () => {
   assertEquals(
-    resolvePath(firstArg("cat $X"), { kind: "known", path: "/proj" }, "/proj"),
+    resolvePath(firstArg("cat $X"), { kind: "known", path: "/proj" }, rootScope("/proj")),
     "dynamic",
   );
 });
 
 Deno.test("resolvePath: relative arg with unknown cwd is dynamic", () => {
   assertEquals(
-    resolvePath(firstArg("cat a.ts"), { kind: "unknown" }, "/proj"),
+    resolvePath(firstArg("cat a.ts"), { kind: "unknown" }, rootScope("/proj")),
     "dynamic",
   );
 });
 
 Deno.test("resolvePath: absolute arg resolves even when cwd unknown", () => {
   assertEquals(
-    resolvePath(firstArg("cat /proj/a.ts"), { kind: "unknown" }, "/proj"),
+    resolvePath(firstArg("cat /proj/a.ts"), { kind: "unknown" }, rootScope("/proj")),
     "in-project",
   );
+});
+
+function scopeWith(
+  allowRoots: string[] = [],
+  denyRoots: string[] = [],
+  askRoots: string[] = [],
+  allowFiles: string[] = [],
+): ScopeConfig {
+  return {
+    root: "/proj",
+    allow: { roots: allowRoots, files: allowFiles },
+    deny: { roots: denyRoots, files: [] },
+    ask: { roots: askRoots, files: [] },
+  };
+}
+
+Deno.test("isReadScoped: project root always in (root-first)", () => {
+  assertEquals(isReadScoped("/proj/a", rootScope("/proj")), true);
+});
+
+Deno.test("isReadScoped: external allow root widens to in-scope", () => {
+  assertEquals(isReadScoped("/srv/pkg/x", scopeWith(["/srv/pkg"])), true);
+});
+
+Deno.test("isReadScoped: external not covered -> false", () => {
+  assertEquals(isReadScoped("/etc/passwd", scopeWith(["/srv/pkg"])), false);
+});
+
+Deno.test("isReadScoped: deny vetoes external allow", () => {
+  assertEquals(isReadScoped("/srv/pkg/secret", scopeWith(["/srv/pkg"], ["/srv/pkg/secret"])), false);
+});
+
+Deno.test("isReadScoped: ask vetoes external allow", () => {
+  assertEquals(isReadScoped("/srv/pkg/secret", scopeWith(["/srv/pkg"], [], ["/srv/pkg/secret"])), false);
+});
+
+Deno.test("isReadScoped: project path NOT demoted by external deny (root-first)", () => {
+  assertEquals(isReadScoped("/proj/a", scopeWith([], ["/proj"])), true);
+});
+
+Deno.test("isReadScoped: allow file exact match only (no recurse)", () => {
+  const s = scopeWith([], [], [], ["/srv/f.txt"]);
+  assertEquals(isReadScoped("/srv/f.txt", s), true);
+  assertEquals(isReadScoped("/srv/f.txt/child", s), false);
 });

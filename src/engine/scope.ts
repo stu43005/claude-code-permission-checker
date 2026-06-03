@@ -1,6 +1,7 @@
 import type { Word } from "../deps.ts";
 import { staticValue } from "./word.ts";
 import type { CwdState } from "../types.ts";
+import type { ReadScope } from "../permissions/path_scope.ts";
 
 export type PathScope = "in-project" | "out-of-project" | "dynamic";
 
@@ -72,18 +73,57 @@ export function isWithin(root: string, target: string): boolean {
   return t.startsWith(rSlash);
 }
 
+/** 範圍設定：專案根 + 外部唯讀範圍三分類（allow/deny/ask，與 settings 對齊）。 */
+export interface ScopeConfig {
+  root: string;
+  allow: ReadScope;
+  deny: ReadScope;
+  ask: ReadScope;
+}
+
+/** 由裸 root 字串組成「無外部放寬」的 ScopeConfig；供既有測試與不需外部範圍的呼叫端使用（向後相容）。 */
+export function rootScope(root: string): ScopeConfig {
+  return {
+    root,
+    allow: { roots: [], files: [] },
+    deny: { roots: [], files: [] },
+    ask: { roots: [], files: [] },
+  };
+}
+
+/** 單一 ReadScope 是否命中（roots 用 isWithin、files 用精確相等）。 */
+function hits(s: ReadScope, absPosix: string): boolean {
+  return s.roots.some((r) => isWithin(r, absPosix)) || s.files.some((f) => f === absPosix);
+}
+
+/**
+ * 已正規化絕對 POSIX 路徑是否落在「允許讀取的位置」（政策合併在此決策層，非載入層）：
+ *   專案根內 → true（永遠允許，不受外部 deny/ask 影響，保留「只放寬、不收窄」語義）；
+ *   否則（外部）命中 deny → false；命中 ask → false（兩者皆否決放寬，維持 deny>ask>allow）；
+ *   否則 命中 allow → true；其餘 → false。
+ */
+export function isReadScoped(absPosix: string, scope: ScopeConfig): boolean {
+  if (isWithin(scope.root, absPosix)) return true; // root-first：專案內永遠允許
+  if (hits(scope.deny, absPosix)) return false;
+  if (hits(scope.ask, absPosix)) return false;
+  if (hits(scope.allow, absPosix)) return true;
+  return false;
+}
+
 /** 對「已取得的字串路徑值」做範圍檢查（三態）。 */
-export function resolvePathValue(value: string | null, cwd: CwdState, root: string): PathScope {
+export function resolvePathValue(value: string | null, cwd: CwdState, scope: ScopeConfig): PathScope {
   if (value === null) return "dynamic";
+  let abs: string;
   if (isAbsolute(value)) {
-    return isWithin(root, value) ? "in-project" : "out-of-project";
+    abs = normalizeAbsolute(value);
+  } else {
+    if (cwd.kind === "unknown") return "dynamic";
+    abs = resolveAgainst(cwd.path, value);
   }
-  if (cwd.kind === "unknown") return "dynamic";
-  const resolved = resolveAgainst(cwd.path, value);
-  return isWithin(root, resolved) ? "in-project" : "out-of-project";
+  return isReadScoped(abs, scope) ? "in-project" : "out-of-project";
 }
 
 /** 解析單一參數對專案根的範圍（三態）。 */
-export function resolvePath(arg: Word, cwd: CwdState, root: string): PathScope {
-  return resolvePathValue(staticValue(arg), cwd, root);
+export function resolvePath(arg: Word, cwd: CwdState, scope: ScopeConfig): PathScope {
+  return resolvePathValue(staticValue(arg), cwd, scope);
 }

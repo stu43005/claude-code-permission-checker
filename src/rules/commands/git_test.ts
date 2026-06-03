@@ -3,7 +3,7 @@ import { parse } from "../../deps.ts";
 import type { Command } from "../../deps.ts";
 import { gitRule } from "./git.ts";
 import type { RuleContext } from "../types.ts";
-import { resolvePath, resolvePathValue } from "../../engine/scope.ts";
+import { resolvePath, resolvePathValue, rootScope } from "../../engine/scope.ts";
 import { evaluate } from "../../engine/evaluate.ts";
 
 function ctxOf(src: string): RuleContext {
@@ -15,8 +15,8 @@ function ctxOf(src: string): RuleContext {
     redirects: cmd.redirects,
     assignments: cmd.prefix,
     cwd,
-    resolvePath: (w) => resolvePath(w, cwd, "/proj"),
-    resolvePathValue: (v) => resolvePathValue(v, cwd, "/proj"),
+    resolvePath: (w) => resolvePath(w, cwd, rootScope("/proj")),
+    resolvePathValue: (v) => resolvePathValue(v, cwd, rootScope("/proj")),
   };
 }
 
