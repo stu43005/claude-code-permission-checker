@@ -77,6 +77,11 @@ Deno.test("parsePathRule: // absolute /** -> root", () => {
   assertEquals(parsePathRule("Read(//srv/pkg/**)", null), { kind: "root", path: "/srv/pkg" });
 });
 
+Deno.test("parsePathRule: //** -> whole-filesystem root '/'", () => {
+  // §7 邊界：base === "" → "/"；normalizeAbsolute("/") 兩平台皆為 "/"
+  assertEquals(parsePathRule("Read(//**)", null), { kind: "root", path: "/" });
+});
+
 Deno.test("parsePathRule: ~/ /** -> root with home joined", () => {
   assertEquals(parsePathRule("Read(~/cache/**)", "/srv/home"), { kind: "root", path: "/srv/home/cache" });
 });
@@ -880,6 +885,32 @@ Deno.test("cwd inside external allow dir, read-only command -> allow", () => {
   const cat = invs.find((i) => i.name === "cat")!;
   assertEquals(classify(cat, ROOT, rulesWithRead(["Read(//srv/pkg/**)"])).kind, "allow");
 });
+
+Deno.test("external path under allow root but also denied -> ask (integration)", () => {
+  const rules: PermissionRules = {
+    bash: { allow: [], deny: [], ask: [] },
+    readScope: {
+      allow: { roots: ["/srv/pkg"], files: [] },
+      deny: { roots: ["/srv/pkg/secret"], files: [] },
+      ask: EMPTY_READ_SCOPE,
+    },
+  };
+  assertEquals(onlyWith("grep needle /srv/pkg/secret/a", rules).kind, "ask");
+});
+
+Deno.test("cwd under allow root but also ask-listed -> ask (integration)", () => {
+  const rules: PermissionRules = {
+    bash: { allow: [], deny: [], ask: [] },
+    readScope: {
+      allow: { roots: ["/srv/pkg"], files: [] },
+      deny: EMPTY_READ_SCOPE,
+      ask: { roots: ["/srv/pkg/secret"], files: [] },
+    },
+  };
+  const invs = walk(parseCommand("cd /srv/pkg/secret && cat a").script, START, ROOT);
+  const cat = invs.find((i) => i.name === "cat")!;
+  assertEquals(classify(cat, ROOT, rules).kind, "ask");
+});
 ```
 
 - [ ] **Step 8: 跑 check + lint + 全測試**
@@ -944,12 +975,19 @@ Expected: 輸出 decision 為 **allow**、exit 0。
 Run（外部路徑未被任何規則涵蓋 → 期望 ask）：
 
 ```bash
-echo '{"tool_name":"Bash","tool_input":{"command":"grep -r needle /c/other"},"cwd":"'"$TMP"'"}' \
+echo '{"tool_name":"Bash","tool_input":{"command":"grep -r needle /c/Windows/System32"},"cwd":"'"$TMP"'"}' \
   | CLAUDE_PROJECT_DIR="$TMP" ./dist/permission-checker.exe
 ```
 
 Expected: 輸出 decision 為 **ask**、exit 0。
 
+> ⚠️ 第二例驗的是「未涵蓋 → ask」，但 `loadPermissionRules` 永遠會讀使用者
+> `~/.claude/settings.json`（三來源之一）。若該檔含寬鬆的 `Read(//c/**)` 之類規則，此例的外部
+> 路徑可能被升級成 allow 而非 ask——這不是實作 bug，而是開發機環境污染（與本檔「binary 回 allow
+> 但 builtin 應為 ask 時先查 settings.json」同類）。故選用 `/c/Windows/System32` 這種使用者幾乎
+> 不會 `Read()` allow 的系統路徑；若仍回 allow，先檢查 `~/.claude/settings.json` 是否有涵蓋該路徑的
+> 規則，必要時改用一個確定未被任何來源 `Read()/Edit()/Write()` 涵蓋的路徑重測。
+>
 > 若第一例未回 allow：先確認 `$TMP/.claude/settings.json` 內容正確、且測試路徑 `/c/extcache/...`
 > 在 `Read(//c/extcache/**)` 化約的 root（Windows 上為 `C:/extcache`）之下；再確認未啟用 sandbox。
 > dist/ 已 gitignore，不入版控，無需 commit。
