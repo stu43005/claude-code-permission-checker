@@ -33,6 +33,13 @@ echo '{"tool_name":"Bash","tool_input":{"command":"cat README.md"},"cwd":"D:/pro
   | CLAUDE_PROJECT_DIR="D:/proj" ./dist/permission-checker.exe   # 期望 allow、exit 0
 ```
 
+**⚠️ binary 回 `allow` 但 builtin 應為 `ask` 時，先檢查 settings.json——這不是失敗，是功能正常**：
+operational verification 會讀取真實的 settings.json（含使用者 `~/.claude/settings.json`，三來源 union）。
+若某指令 builtin 判 `ask`、單元測試也判 `ask`，但 binary 卻回 `allow`，且 reason 為「命中 permissions.allow」，
+代表該指令被 `permissions.allow`（如 `Bash(deno test *)`）升級了——這正是 `(hook=ask, settings=allow) → allow`
+的設計行為（見下「hook 決策 vs settings.json 權限的優先序」），**屬合法、不是 bug**。要單獨驗證 builtin 分類
+本身，請以單元測試（rule 的 `evaluate`）為準，或在不含對應 `permissions.allow` 的環境下餵 JSON。
+
 ## 架構（評估管線）
 
 `main.ts` 讀 stdin → 若 `tool_name !== "Bash"` 直接 return（不輸出）→ `resolveProjectRoot`（讀
