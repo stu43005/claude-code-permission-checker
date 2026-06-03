@@ -12,7 +12,7 @@ export type PathScope = "in-project" | "out-of-project" | "dynamic";
 const IS_WINDOWS = Deno.build.os === "windows";
 
 /** 反斜線轉斜線。 */
-function toPosix(p: string): string {
+export function toPosix(p: string): string {
   return p.replace(/\\/g, "/");
 }
 
