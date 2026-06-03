@@ -23,14 +23,33 @@ function v(src: string) {
   return denoRule.evaluate(ctxOf(src)).kind;
 }
 
-Deno.test("deno check / test / lint allow", () => {
+Deno.test("deno check / lint / info allow", () => {
   assertEquals(v("deno check src/main.ts"), "allow");
-  assertEquals(v("deno test"), "allow");
-  assertEquals(v("deno test --allow-env src/x_test.ts"), "allow");
   assertEquals(v("deno lint"), "allow");
+  assertEquals(v("deno lint src/main.ts"), "allow");
+  assertEquals(v("deno info"), "allow");
+  assertEquals(v("deno info jsr:@std/http/file-server"), "allow");
 });
 
-Deno.test("deno run / task / compile / eval ask", () => {
+Deno.test("deno lint --fix asks (改寫原始碼)", () => {
+  assertEquals(v("deno lint --fix"), "ask");
+  assertEquals(v("deno lint --fix src/main.ts"), "ask");
+  assertEquals(v("deno lint src/main.ts --fix"), "ask");
+});
+
+Deno.test("deno lint 唯讀旗標仍 allow", () => {
+  assertEquals(v("deno lint --json"), "allow");
+  assertEquals(v("deno lint --rules"), "allow");
+  assertEquals(v("deno lint --compact src/main.ts"), "allow");
+});
+
+Deno.test("deno lint 含動態 token 的旗標 asks", () => {
+  assertEquals(v("deno lint $FLAG"), "ask");
+});
+
+Deno.test("deno test / run / task / compile / eval ask", () => {
+  assertEquals(v("deno test"), "ask");
+  assertEquals(v("deno test --allow-env src/x_test.ts"), "ask");
   assertEquals(v("deno run x.ts"), "ask");
   assertEquals(v("deno task build"), "ask");
   assertEquals(v("deno compile src/main.ts"), "ask");
