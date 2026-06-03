@@ -38,8 +38,11 @@ Deno.test("parsePathRule: non-target prefix -> null", () => {
   assertEquals(parsePathRule("Read(.env)", null), null);
 });
 
-Deno.test("parsePathRule: negation -> null; non-RRW tool -> null", () => {
+Deno.test("parsePathRule: negation -> null", () => {
   assertEquals(parsePathRule("Read(!//srv/x)", null), null);
+});
+
+Deno.test("parsePathRule: non-RRW tool -> null", () => {
   assertEquals(parsePathRule("Bash(ls)", null), null);
 });
 

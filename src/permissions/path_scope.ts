@@ -34,7 +34,7 @@ export function parsePathRule(rule: string, home: string | null): PathScopeEntry
     p = inner.slice(1); // 去一個前導斜線：//c/foo/** -> /c/foo/**
   } else if (inner.startsWith("~/")) {
     if (home === null) return null;
-    p = toPosix(home) + "/" + inner.slice(2);
+    p = toPosix(home).replace(/\/$/, "") + "/" + inner.slice(2);
   } else {
     return null; // /path（專案相對）、path、./path（cwd 相對）皆非目標前綴
   }
