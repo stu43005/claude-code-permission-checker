@@ -4,6 +4,7 @@ import { walk } from "../engine/walk.ts";
 import type { CwdState } from "../types.ts";
 import { matchesAny, matchesPattern, parseBashRule, reconstructCommand, settingsAllows } from "./matcher.ts";
 import type { PermissionRules } from "./settings.ts";
+import { EMPTY_READ_SCOPE } from "./path_scope.ts";
 
 const ROOT = "/proj";
 const START: CwdState = { kind: "known", path: "/proj" };
@@ -109,7 +110,10 @@ Deno.test("reconstructCommand: dynamic command name -> null", () => {
 /** 由字串規則組出 PermissionRules。 */
 function rulesOf(spec: { allow?: string[]; deny?: string[]; ask?: string[] }): PermissionRules {
   const conv = (xs?: string[]) => (xs ?? []).map((s) => parseBashRule(s)!).filter(Boolean);
-  return { allow: conv(spec.allow), deny: conv(spec.deny), ask: conv(spec.ask) };
+  return {
+    bash: { allow: conv(spec.allow), deny: conv(spec.deny), ask: conv(spec.ask) },
+    readScope: { allow: EMPTY_READ_SCOPE, deny: EMPTY_READ_SCOPE, ask: EMPTY_READ_SCOPE },
+  };
 }
 
 Deno.test("settingsAllows: allow match -> true", () => {

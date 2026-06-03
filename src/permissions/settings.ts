@@ -1,15 +1,31 @@
 import type { EnvReader } from "../project.ts";
 import { normalizeAbsolute } from "../engine/scope.ts";
 import { type BashPattern, parseBashRule } from "./matcher.ts";
+import { EMPTY_READ_SCOPE, parsePathRule, type ReadScope } from "./path_scope.ts";
 
-export interface PermissionRules {
+/** Bash(...) 規則三分類（對齊 settings permissions 結構）。 */
+export interface BashRules {
   allow: BashPattern[];
   deny: BashPattern[];
   ask: BashPattern[];
 }
 
-/** 空規則常數，供 classify.ts / evaluate.ts 作為預設參數（只讀，勿變動）。 */
-export const EMPTY_RULES: PermissionRules = { allow: [], deny: [], ask: [] };
+/** Read/Edit/Write 化約的外部唯讀範圍三分類（與 settings 對齊；deny/ask 不在載入層合併）。 */
+export interface ReadScopeRules {
+  allow: ReadScope;
+  deny: ReadScope;
+  ask: ReadScope;
+}
+
+export interface PermissionRules {
+  bash: BashRules; // 原扁平的 { allow, deny, ask } 移入此層
+  readScope: ReadScopeRules;
+}
+
+export const EMPTY_RULES: PermissionRules = {
+  bash: { allow: [], deny: [], ask: [] },
+  readScope: { allow: EMPTY_READ_SCOPE, deny: EMPTY_READ_SCOPE, ask: EMPTY_READ_SCOPE },
+};
 
 /** 讀檔器：回傳檔案內容字串；不存在 / 無法讀 → null。注入以利測試。 */
 export type ReadText = (path: string) => string | null;
@@ -24,7 +40,14 @@ export const defaultReadText: ReadText = (path) => {
 };
 
 function emptyRules(): PermissionRules {
-  return { allow: [], deny: [], ask: [] };
+  return {
+    bash: { allow: [], deny: [], ask: [] },
+    readScope: {
+      allow: { roots: [], files: [] },
+      deny: { roots: [], files: [] },
+      ask: { roots: [], files: [] },
+    },
+  };
 }
 
 function parseRuleList(value: unknown): BashPattern[] {
@@ -38,7 +61,25 @@ function parseRuleList(value: unknown): BashPattern[] {
   return out;
 }
 
-function parseFile(content: string | null): PermissionRules {
+function parsePathRuleList(value: unknown, home: string | null): ReadScope {
+  const out: ReadScope = { roots: [], files: [] };
+  if (!Array.isArray(value)) return out;
+  for (const el of value) {
+    if (typeof el !== "string") continue;
+    let entry: ReturnType<typeof parsePathRule>;
+    try {
+      entry = parsePathRule(el, home);
+    } catch {
+      entry = null;
+    }
+    if (entry === null) continue;
+    if (entry.kind === "root") out.roots.push(entry.path);
+    else out.files.push(entry.path);
+  }
+  return out;
+}
+
+function parseFile(content: string | null, home: string | null): PermissionRules {
   if (content === null) return emptyRules();
   let parsed: unknown;
   try {
@@ -51,9 +92,16 @@ function parseFile(content: string | null): PermissionRules {
   if (typeof perms !== "object" || perms === null) return emptyRules();
   const p = perms as Record<string, unknown>;
   return {
-    allow: parseRuleList(p.allow),
-    deny: parseRuleList(p.deny),
-    ask: parseRuleList(p.ask),
+    bash: {
+      allow: parseRuleList(p.allow),
+      deny: parseRuleList(p.deny),
+      ask: parseRuleList(p.ask),
+    },
+    readScope: {
+      allow: parsePathRuleList(p.allow, home),
+      deny: parsePathRuleList(p.deny, home),
+      ask: parsePathRuleList(p.ask, home),
+    },
   };
 }
 
@@ -89,13 +137,17 @@ export function loadPermissionRules(
     for (const path of paths) {
       let rules: PermissionRules;
       try {
-        rules = parseFile(readText(path));
+        rules = parseFile(readText(path), home);
       } catch {
         rules = emptyRules();
       }
-      merged.allow.push(...rules.allow);
-      merged.deny.push(...rules.deny);
-      merged.ask.push(...rules.ask);
+      merged.bash.allow.push(...rules.bash.allow);
+      merged.bash.deny.push(...rules.bash.deny);
+      merged.bash.ask.push(...rules.bash.ask);
+      for (const k of ["allow", "deny", "ask"] as const) {
+        merged.readScope[k].roots.push(...rules.readScope[k].roots);
+        merged.readScope[k].files.push(...rules.readScope[k].files);
+      }
     }
     return merged;
   } catch {

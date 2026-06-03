@@ -1,6 +1,7 @@
 import { assertEquals } from "@std/assert";
 import type { EnvReader } from "../project.ts";
 import { EMPTY_RULES, loadPermissionRules, type ReadText } from "./settings.ts";
+import { EMPTY_READ_SCOPE } from "./path_scope.ts";
 
 const ROOT = "/proj";
 
@@ -16,8 +17,13 @@ function fakeEnv(map: Record<string, string>): EnvReader {
 
 const noHome = fakeEnv({});
 
-Deno.test("EMPTY_RULES has three empty lists", () => {
-  assertEquals(EMPTY_RULES, { allow: [], deny: [], ask: [] });
+const EMPTY_NESTED = {
+  bash: { allow: [], deny: [], ask: [] },
+  readScope: { allow: EMPTY_READ_SCOPE, deny: EMPTY_READ_SCOPE, ask: EMPTY_READ_SCOPE },
+};
+
+Deno.test("EMPTY_RULES is empty bash + empty readScope", () => {
+  assertEquals(EMPTY_RULES, EMPTY_NESTED);
 });
 
 Deno.test("extracts Bash rules from a single project settings file", () => {
@@ -33,17 +39,17 @@ Deno.test("extracts Bash rules from a single project settings file", () => {
     ROOT,
     fakeReadText({ "/proj/.claude/settings.json": content }),
   );
-  assertEquals(rules.allow, [
+  assertEquals(rules.bash.allow, [
     { kind: "prefix-boundary", prefix: "npm test" },
     { kind: "exact", text: "git status" },
   ]);
-  assertEquals(rules.deny, [{ kind: "prefix-boundary", prefix: "rm" }]);
-  assertEquals(rules.ask, [{ kind: "prefix-boundary", prefix: "curl" }]);
+  assertEquals(rules.bash.deny, [{ kind: "prefix-boundary", prefix: "rm" }]);
+  assertEquals(rules.bash.ask, [{ kind: "prefix-boundary", prefix: "curl" }]);
 });
 
 Deno.test("missing file -> empty", () => {
   const rules = loadPermissionRules(noHome, ROOT, fakeReadText({}));
-  assertEquals(rules, { allow: [], deny: [], ask: [] });
+  assertEquals(rules, EMPTY_NESTED);
 });
 
 Deno.test("malformed JSON -> empty, no throw", () => {
@@ -52,7 +58,7 @@ Deno.test("malformed JSON -> empty, no throw", () => {
     ROOT,
     fakeReadText({ "/proj/.claude/settings.json": "not json {{{" }),
   );
-  assertEquals(rules, { allow: [], deny: [], ask: [] });
+  assertEquals(rules, EMPTY_NESTED);
 });
 
 Deno.test("permissions not an object -> empty", () => {
@@ -61,7 +67,7 @@ Deno.test("permissions not an object -> empty", () => {
     ROOT,
     fakeReadText({ "/proj/.claude/settings.json": JSON.stringify({ permissions: 42 }) }),
   );
-  assertEquals(rules, { allow: [], deny: [], ask: [] });
+  assertEquals(rules, EMPTY_NESTED);
 });
 
 Deno.test("top-level not an object (array/number) -> empty", () => {
@@ -70,7 +76,7 @@ Deno.test("top-level not an object (array/number) -> empty", () => {
     ROOT,
     fakeReadText({ "/proj/.claude/settings.json": "[1,2,3]" }),
   );
-  assertEquals(rules, { allow: [], deny: [], ask: [] });
+  assertEquals(rules, EMPTY_NESTED);
 });
 
 Deno.test("rule list not an array -> that list empty", () => {
@@ -80,8 +86,8 @@ Deno.test("rule list not an array -> that list empty", () => {
     ROOT,
     fakeReadText({ "/proj/.claude/settings.json": content }),
   );
-  assertEquals(rules.allow, []);
-  assertEquals(rules.deny, [{ kind: "prefix-boundary", prefix: "rm" }]);
+  assertEquals(rules.bash.allow, []);
+  assertEquals(rules.bash.deny, [{ kind: "prefix-boundary", prefix: "rm" }]);
 });
 
 Deno.test("merges project + local + user (union)", () => {
@@ -95,7 +101,7 @@ Deno.test("merges project + local + user (union)", () => {
       "/home/u/.claude/settings.json": JSON.stringify({ permissions: { allow: ["Bash(c:*)"] } }),
     }),
   );
-  assertEquals(rules.allow.map((p) => (p as { prefix: string }).prefix), ["a", "b", "c"]);
+  assertEquals(rules.bash.allow.map((p) => (p as { prefix: string }).prefix), ["a", "b", "c"]);
 });
 
 Deno.test("requests the three expected file paths (posix home)", () => {
@@ -151,4 +157,48 @@ Deno.test({
     loadPermissionRules(fakeEnv({ HOME: "/c/Users/X" }), "D:/proj", reader);
     assertEquals(requested[2], "C:/Users/X/.claude/settings.json");
   },
+});
+
+Deno.test("extracts Read/Edit/Write into readScope buckets; deny/ask kept separate", () => {
+  const content = JSON.stringify({
+    permissions: {
+      allow: ["Read(//srv/a/**)", "Bash(ls:*)"],
+      deny: ["Edit(//srv/b/**)"],
+      ask: ["Write(//srv/c/x.txt)"],
+    },
+  });
+  const rules = loadPermissionRules(
+    noHome,
+    ROOT,
+    fakeReadText({ "/proj/.claude/settings.json": content }),
+  );
+  assertEquals(rules.readScope.allow, { roots: ["/srv/a"], files: [] });
+  assertEquals(rules.readScope.deny, { roots: ["/srv/b"], files: [] });
+  assertEquals(rules.readScope.ask, { roots: [], files: ["/srv/c/x.txt"] });
+  // Bash 與 readScope 並存、互不干擾
+  assertEquals(rules.bash.allow, [{ kind: "prefix-boundary", prefix: "ls" }]);
+});
+
+Deno.test("readScope.allow unions roots across files", () => {
+  const env = fakeEnv({ HOME: "/home/u", USERPROFILE: "/home/u" });
+  const rules = loadPermissionRules(
+    env,
+    ROOT,
+    fakeReadText({
+      "/proj/.claude/settings.json": JSON.stringify({ permissions: { allow: ["Read(//srv/a/**)"] } }),
+      "/home/u/.claude/settings.json": JSON.stringify({ permissions: { allow: ["Read(//srv/b/**)"] } }),
+    }),
+  );
+  assertEquals(rules.readScope.allow.roots, ["/srv/a", "/srv/b"]);
+});
+
+Deno.test("missing/garbage file -> empty readScope (fail-safe)", () => {
+  const rules = loadPermissionRules(
+    noHome,
+    ROOT,
+    fakeReadText({ "/proj/.claude/settings.json": "not json {{{" }),
+  );
+  assertEquals(rules.readScope.allow, EMPTY_READ_SCOPE);
+  assertEquals(rules.readScope.deny, EMPTY_READ_SCOPE);
+  assertEquals(rules.readScope.ask, EMPTY_READ_SCOPE);
 });

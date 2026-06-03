@@ -3,6 +3,7 @@ import { evaluate } from "./evaluate.ts";
 import type { CwdState, Verdict } from "../types.ts";
 import { parseBashRule } from "../permissions/matcher.ts";
 import type { PermissionRules } from "../permissions/settings.ts";
+import { EMPTY_READ_SCOPE } from "../permissions/path_scope.ts";
 
 const ROOT = "/proj";
 const AT_ROOT: CwdState = { kind: "known", path: "/proj" };
@@ -81,7 +82,10 @@ Deno.test("trusted extension example: a custom allow rule would allow", () => {
 
 function rulesOf(spec: { allow?: string[]; deny?: string[]; ask?: string[] }): PermissionRules {
   const conv = (xs?: string[]) => (xs ?? []).map((s) => parseBashRule(s)!).filter(Boolean);
-  return { allow: conv(spec.allow), deny: conv(spec.deny), ask: conv(spec.ask) };
+  return {
+    bash: { allow: conv(spec.allow), deny: conv(spec.deny), ask: conv(spec.ask) },
+    readScope: { allow: EMPTY_READ_SCOPE, deny: EMPTY_READ_SCOPE, ask: EMPTY_READ_SCOPE },
+  };
 }
 
 Deno.test("evaluate: settings allow upgrades a single ask command", () => {

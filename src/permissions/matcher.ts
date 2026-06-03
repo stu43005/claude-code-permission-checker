@@ -80,7 +80,7 @@ export function reconstructCommand(inv: CommandInvocation): string | null {
 export function settingsAllows(inv: CommandInvocation, rules: PermissionRules): boolean {
   const cmd = reconstructCommand(inv);
   if (cmd === null) return false;
-  if (matchesAny(cmd, rules.deny)) return false;
-  if (matchesAny(cmd, rules.ask)) return false;
-  return matchesAny(cmd, rules.allow);
+  if (matchesAny(cmd, rules.bash.deny)) return false;
+  if (matchesAny(cmd, rules.bash.ask)) return false;
+  return matchesAny(cmd, rules.bash.allow);
 }

@@ -5,13 +5,17 @@ import { classify } from "./classify.ts";
 import type { CwdState } from "../types.ts";
 import { parseBashRule } from "../permissions/matcher.ts";
 import type { PermissionRules } from "../permissions/settings.ts";
+import { EMPTY_READ_SCOPE } from "../permissions/path_scope.ts";
 
 const ROOT = "/proj";
 const START: CwdState = { kind: "known", path: "/proj" };
 
 function rulesOf(spec: { allow?: string[]; deny?: string[]; ask?: string[] }): PermissionRules {
   const conv = (xs?: string[]) => (xs ?? []).map((s) => parseBashRule(s)!).filter(Boolean);
-  return { allow: conv(spec.allow), deny: conv(spec.deny), ask: conv(spec.ask) };
+  return {
+    bash: { allow: conv(spec.allow), deny: conv(spec.deny), ask: conv(spec.ask) },
+    readScope: { allow: EMPTY_READ_SCOPE, deny: EMPTY_READ_SCOPE, ask: EMPTY_READ_SCOPE },
+  };
 }
 
 function onlyWith(src: string, rules: PermissionRules) {
