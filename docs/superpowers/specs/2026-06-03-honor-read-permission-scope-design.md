@@ -435,19 +435,24 @@ echo '{"tool_name":"Bash","tool_input":{"command":"grep -r needle /c/Windows/Sys
   分離 union 與 fail-safe 案例。
 - **修改** `src/permissions/matcher.ts`：`settingsAllows` 改讀 `rules.bash.{deny,ask,allow}`
   （邏輯與簽名不變）。
-- **修改** `src/permissions/matcher_test.ts`：建構 `PermissionRules` 的測試改用新結構（`bash` 子物件）。
+- **修改** `src/permissions/matcher_test.ts`：`rulesOf` helper（行 110-112）回傳值改為
+  `{ bash: { allow, deny, ask }, readScope: { allow/deny/ask 皆 EMPTY_READ_SCOPE } }`（Bash 規則
+  移入 `bash`、`readScope` 三桶填空），並匯入 `EMPTY_READ_SCOPE`；其餘斷言不變。
 - **修改** `src/engine/scope.ts`：`toPosix` 改 export、新增 `ScopeConfig`/`isReadScoped`/`rootScope`、
   `resolvePathValue`/`resolvePath` 簽名由 `root: string` 改 `scope: ScopeConfig`；對 `path_scope.ts`
   僅 `import type { ReadScope }`（避免 runtime 循環）。
 - **修改** `src/engine/scope_test.ts`：直接呼叫 `resolvePath` 的各處（行 69/79/86/93/100/107 區）由裸
   `"/proj"` 改傳 `rootScope("/proj")`；補放寬/否決/「專案內不被 deny/ask 降級」案例。
 - **修改** `src/engine/classify.ts`：組裝 `ScopeConfig`、cwd 檢查與閉包改用 `scope`。
-- **修改** `src/engine/classify_test.ts`：改用新結構 `PermissionRules`、補外部 allow/deny/ask 案例。
+- **修改** `src/engine/classify_test.ts`：`rulesOf` helper（行 12-14）同上改為新結構（`bash`+空
+  `readScope`、匯入 `EMPTY_READ_SCOPE`）；補外部 allow/deny/ask 案例。
 - **修改** 10 個 `src/rules/commands/*_test.ts` 的 `ctxOf` helper：`resolvePath(w, cwd, "/proj")` 與
   `resolvePathValue(v, cwd, "/proj")` 改傳 `rootScope("/proj")`（檔案：`grep`、`awk`、`coreutils`、
   `deno`、`find`、`gh`、`git`、`sed`、`simple-flag`、`positional-output`）。**production `rules/**`
   規則本體與 `RuleContext` 介面不變**——僅這些測試 helper 因直接呼叫 `scope.ts` 而需配合新簽名。
 - **修改** `CLAUDE.md`：於「hook 決策 vs settings.json 權限的優先序」一節補述本機制與 sandbox 限制。
-- **修改（若有構造 `PermissionRules` 字面值）** `src/engine/evaluate_test.ts`：改用新結構；行為斷言不變。
+- **修改** `src/engine/evaluate_test.ts`：`rulesOf` helper（行 82-84）回傳扁平 `{ allow, deny, ask }`
+  必須改為新結構（`bash`+空 `readScope`、匯入 `EMPTY_READ_SCOPE`）——否則 `deno task check` 失敗；
+  行為斷言不變。（此三檔 `rulesOf` 共用同一「扁平→巢狀」轉換。）
 - **不改**（production）`main.ts`、`evaluate.ts`（已轉發 `rules`，見 §4.5）、`combine.ts`、`walk.ts`、
   `rules/commands/*.ts`（規則本體）、`rules/types.ts`：簽名與行為皆不變。
