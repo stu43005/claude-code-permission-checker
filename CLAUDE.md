@@ -174,3 +174,13 @@ parse.ts (unbash)  →  walk.ts  →  classify.ts (每指令)  →  combine.ts (
   等會匹配一切的空 prefix、以及無法可靠解析的 pattern 一律不升級（維持 default-deny）。
 - 讀取來源：專案 `.claude/settings.json`、`.claude/settings.local.json`、使用者 `~/.claude/settings.json`
   （**不含** enterprise managed-settings）。讀檔失敗一律 fail-safe 退化為「無此來源規則」。
+
+此外，本檢查器也沿用 `permissions.{allow,deny,ask}` 中的 `Read()/Edit()/Write()` 規則放寬「讀取位置」：
+凡純唯讀指令（allowlist 內）其路徑落在使用者以這些規則 allow 宣告、且未被 deny/ask 否決的外部目錄／
+單檔時，視為 in-project 而放行。只認 `//`（絕對）與 `~/`（家目錄）前綴、`/**` 目錄與無 glob 單檔；
+其餘形式（中段 glob、裸檔名、專案/ cwd 相對前綴）一律忽略、維持 ask。判定為 root-first：專案內路徑
+永遠 in-project，外部路徑才依 deny → ask → allow 決定（deny/ask 皆否決放寬）。**只放寬讀取位置，
+不放寬任何寫入型重導向／賦值前綴／非唯讀指令偵測**。
+
+⚠️ sandbox 限制：若啟用 `sandbox.filesystem`，專案外路徑會在 OS 層被擋，與本 hook 的 allow 無關；
+此時還需把該目錄加入 sandbox 的 `allowRead` 才能真正讀取。
