@@ -393,7 +393,8 @@ export function classify(inv, root, rules = EMPTY_RULES): RuleVerdict {
 - **`settings_test.ts`（擴充）**：`PermissionRules` 重構後 `bash` 與 `readScope` 各三桶——驗證多檔
   union 後 allow→`readScope.allow`、deny→`readScope.deny`、ask→`readScope.ask` **各自分離不合併**，
   且 `bash.{allow,deny,ask}` 仍正確；缺檔/壞 JSON fail-safe 回空 `BashRules`/`ReadScopeRules`；
-  既有斷言改讀 `rules.bash.*`。
+  既有欄位讀取斷言改讀 `rules.bash.*`，既有**整物件相等斷言**（`EMPTY_RULES` 與各 fail-safe 案例）
+  改為新巢狀形狀（見 §9）。
 - **`scope_test.ts`（擴充）**：`isReadScoped` 與三態——
   - allow.roots 命中（且不在 deny/ask）→ in-project；**外部**路徑同時命中 deny.roots 或 ask.roots
     → out-of-project（分別驗證 deny、ask 皆 veto）。
@@ -431,8 +432,15 @@ echo '{"tool_name":"Bash","tool_input":{"command":"grep -r needle /c/Windows/Sys
   ReadScopeRules }`（既有三分類移入 `bash`，新增 `ReadScopeRules` 之 `allow`/`deny`/`ask`）；
   `EMPTY_RULES`、`emptyRules()`、`parseFile`、`loadPermissionRules` 同步改為產出/合併兩組三桶；
   新增 `parsePathRuleList`、匯入 `path_scope.ts`。
-- **修改** `src/permissions/settings_test.ts`：斷言改讀 `rules.bash.*`；補 `readScope.{allow,deny,ask}`
-  分離 union 與 fail-safe 案例。
+- **修改** `src/permissions/settings_test.ts`：
+  - 欄位讀取斷言改讀 `rules.bash.{allow,deny,ask}`（原 `rules.allow/deny/ask`）。
+  - **整物件相等斷言改為新巢狀形狀**：`EMPTY_RULES`（行 20）與四個 fail-safe 案例（missing file /
+    malformed JSON / permissions not object / top-level not object，行 46/55/64/73）原為
+    `assertEquals(…, { allow: [], deny: [], ask: [] })`，必改為
+    `{ bash: { allow: [], deny: [], ask: [] }, readScope: { allow: EMPTY_READ_SCOPE,
+    deny: EMPTY_READ_SCOPE, ask: EMPTY_READ_SCOPE } }`（並匯入 `EMPTY_READ_SCOPE`）——否則
+    `deno task test` 失敗；測試名「EMPTY_RULES has three empty lists」同步更新以免語義過時。
+  - 補 `readScope.{allow,deny,ask}` 分離 union 與 fail-safe 案例。
 - **修改** `src/permissions/matcher.ts`：`settingsAllows` 改讀 `rules.bash.{deny,ask,allow}`
   （邏輯與簽名不變）。
 - **修改** `src/permissions/matcher_test.ts`：`rulesOf` helper（行 110-112）回傳值改為
