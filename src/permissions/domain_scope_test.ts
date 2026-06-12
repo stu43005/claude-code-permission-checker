@@ -3,6 +3,7 @@ import {
   type DomainScope,
   EMPTY_DOMAIN_SCOPE,
   matchesDomain,
+  matchesPreapproved,
   parseDomainRule,
 } from "./domain_scope.ts";
 
@@ -100,4 +101,39 @@ Deno.test("matchesDomain subdomain of TLD wildcard", () => {
   const s = scopeOf(["WebFetch(domain:*.com)"]);
   assertEquals(matchesDomain("example.com", s), true);
   assertEquals(matchesDomain("com", s), false);
+});
+
+Deno.test("preapproved exact hostname allows", () => {
+  assertEquals(matchesPreapproved("docs.python.org", "/3/library/json.html"), true);
+  assertEquals(matchesPreapproved("developer.mozilla.org", "/"), true);
+});
+
+Deno.test("preapproved is exact match, not subdomain or suffix", () => {
+  // 子網域不放行
+  assertEquals(matchesPreapproved("www.python.org", "/"), false);
+  // 精確條目不得被當作後綴
+  assertEquals(matchesPreapproved("other.readthedocs.io", "/"), false);
+  assertEquals(matchesPreapproved("readthedocs.io", "/"), false);
+  // requests.readthedocs.io 本身在列
+  assertEquals(matchesPreapproved("requests.readthedocs.io", "/en/latest/"), true);
+});
+
+Deno.test("preapproved path prefix entries", () => {
+  assertEquals(matchesPreapproved("github.com", "/anthropics"), true);
+  assertEquals(matchesPreapproved("github.com", "/anthropics/claude-code"), true);
+  // 非該前綴的 path 不放行
+  assertEquals(matchesPreapproved("github.com", "/evil"), false);
+  assertEquals(matchesPreapproved("github.com", "/anthropics-evil"), false);
+  // path 條目的 host 不得整 host 放行
+  assertEquals(matchesPreapproved("huggingface.co", "/"), false);
+  assertEquals(matchesPreapproved("huggingface.co", "/blog"), false);
+  assertEquals(matchesPreapproved("huggingface.co", "/docs"), true);
+  assertEquals(matchesPreapproved("vercel.com", "/docs/cli"), true);
+  assertEquals(matchesPreapproved("vercel.com", "/pricing"), false);
+});
+
+Deno.test("preapproved rejects percent-encoded path tricks", () => {
+  assertEquals(matchesPreapproved("github.com", "/anthropics/%2e%2e/evil"), false);
+  assertEquals(matchesPreapproved("github.com", "/anthropics/%252f"), false);
+  assertEquals(matchesPreapproved("github.com", "/anthropics/%5cx"), false);
 });

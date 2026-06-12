@@ -56,3 +56,133 @@ export function matchesDomain(host: string, scope: DomainScope): boolean {
   if (scope.exact.has(host)) return true;
   return scope.suffixes.some((s) => host.endsWith("." + s));
 }
+
+/**
+ * 內建 preapproved 文件網域清單。逐字快照自 Claude Code 2.1.173 binary（90 條、89 唯一，
+ * learn.microsoft.com 原始碼中重複兩次）。重抽指令：
+ *   grep -a -o 'new Set(\[[^]]*docs\.python\.org[^]]*\])' <claude binary>
+ * 含 `/` 的條目於載入時推導為 path 前綴（該 host 不入精確 Set）；其餘為 hostname 精確比對。
+ */
+const PREAPPROVED: string[] = [
+  "platform.claude.com",
+  "code.claude.com",
+  "modelcontextprotocol.io",
+  "github.com/anthropics",
+  "agentskills.io",
+  "docs.python.org",
+  "en.cppreference.com",
+  "docs.oracle.com",
+  "learn.microsoft.com",
+  "developer.mozilla.org",
+  "go.dev",
+  "pkg.go.dev",
+  "www.php.net",
+  "docs.swift.org",
+  "kotlinlang.org",
+  "ruby-doc.org",
+  "doc.rust-lang.org",
+  "www.typescriptlang.org",
+  "react.dev",
+  "angular.io",
+  "vuejs.org",
+  "nextjs.org",
+  "expressjs.com",
+  "nodejs.org",
+  "bun.sh",
+  "jquery.com",
+  "getbootstrap.com",
+  "tailwindcss.com",
+  "d3js.org",
+  "threejs.org",
+  "redux.js.org",
+  "webpack.js.org",
+  "jestjs.io",
+  "reactrouter.com",
+  "docs.djangoproject.com",
+  "flask.palletsprojects.com",
+  "fastapi.tiangolo.com",
+  "pandas.pydata.org",
+  "numpy.org",
+  "www.tensorflow.org",
+  "pytorch.org",
+  "scikit-learn.org",
+  "matplotlib.org",
+  "requests.readthedocs.io",
+  "jupyter.org",
+  "laravel.com",
+  "symfony.com",
+  "wordpress.org/documentation",
+  "docs.spring.io",
+  "hibernate.org",
+  "tomcat.apache.org",
+  "gradle.org",
+  "maven.apache.org",
+  "asp.net",
+  "dotnet.microsoft.com",
+  "blazor.net",
+  "reactnative.dev",
+  "docs.flutter.dev",
+  "developer.apple.com",
+  "developer.android.com",
+  "keras.io",
+  "spark.apache.org",
+  "huggingface.co/docs",
+  "www.kaggle.com/docs",
+  "www.mongodb.com",
+  "redis.io",
+  "www.postgresql.org",
+  "dev.mysql.com",
+  "www.sqlite.org",
+  "graphql.org",
+  "prisma.io",
+  "docs.getdbt.com",
+  "docs.aws.amazon.com",
+  "cloud.google.com",
+  "learn.microsoft.com",
+  "kubernetes.io",
+  "www.docker.com",
+  "www.terraform.io",
+  "www.ansible.com",
+  "vercel.com/docs",
+  "docs.stripe.com",
+  "docs.netlify.com",
+  "devcenter.heroku.com",
+  "cypress.io",
+  "selenium.dev",
+  "docs.unity.com",
+  "docs.unrealengine.com",
+  "git-scm.com",
+  "nginx.org",
+  "httpd.apache.org",
+];
+
+const PREAPPROVED_HOSTS = new Set<string>();
+const PREAPPROVED_PATH_PREFIXES = new Map<string, string[]>();
+for (const entry of PREAPPROVED) {
+  const slash = entry.indexOf("/");
+  if (slash === -1) {
+    PREAPPROVED_HOSTS.add(entry);
+    continue;
+  }
+  // 含 path 的條目：僅入 path Map，host 不入精確 Set（否則該 host 任意 path 都會誤放）
+  const host = entry.slice(0, slash);
+  const prefix = entry.slice(slash);
+  const arr = PREAPPROVED_PATH_PREFIXES.get(host);
+  if (arr) arr.push(prefix);
+  else PREAPPROVED_PATH_PREFIXES.set(host, [prefix]);
+}
+
+/**
+ * host 是否命中 preapproved（hostname 精確；path 條目需 pathname 等於前綴或在其下）。
+ * pathname 含百分號編碼的 `/` `\` `.`（含多重編碼如 %252f）→ 一律不放行（對齊官方 NX_）。
+ */
+export function matchesPreapproved(host: string, pathname: string): boolean {
+  if (PREAPPROVED_HOSTS.has(host)) return true;
+  const prefixes = PREAPPROVED_PATH_PREFIXES.get(host);
+  if (!prefixes) return false;
+  if (/%(25)*(2f|5c|2e)/i.test(pathname)) return false;
+  for (const p of prefixes) {
+    if (pathname === p || pathname.startsWith(p + "/")) return true;
+  }
+  return false;
+}
