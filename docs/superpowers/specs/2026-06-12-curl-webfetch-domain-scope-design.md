@@ -62,9 +62,11 @@
 
 - 正規化：host/suffix 一律 lowercase、去除尾端多餘的 `.`（對齊官方 `PX_`）。
 - **忽略（回 `null`）的形式**：`*` 出現在非「整體 `*`」與非「前綴 `*.`」位置（官方 schema
-  驗證本就拒絕中段 `*`）；內容含 `://`、`/`、`:`（port）、空字串；非 `WebFetch(domain:...)`
-  形狀者。忽略 = 該條規則不貢獻任何效果（包括 deny/ask 位置——與 readScope 對不支援形式的
-  處理一致，於文件註明此保守性取捨）。
+  驗證本就拒絕中段 `*`）；內容含 `://`、`/`、`:`、空字串；非 `WebFetch(domain:...)`
+  形狀者。其中「含 `:` 一律忽略」同時涵蓋 port 形式與 IPv6 literal（`domain:[::1]` 因含
+  `:` 被忽略——IPv6 屬保守不支援，無法以規則宣告，見 §4 邊界）。忽略 = 該條規則不貢獻
+  任何效果（包括 deny/ask 位置——與 readScope 對不支援形式的處理一致，於文件註明此保守性
+  取捨）。
 - `kind: "all"`（`domain:*`）在三個位置都有效：allow 位置 = 放行所有網域（使用者顯式選擇，
   官方亦如此語意）；deny/ask 位置 = 否決一切升級。
 
@@ -81,8 +83,17 @@ host 已是 URL parser 產出的合法 hostname，無需 regex）。
 2. `protocol` 非 `http:`/`https:` → `invalid`。
 3. `username` 或 `password` 非空（userinfo 視同憑證）→ `invalid`。
 4. URL 字串含 curl 多重展開字元 `{`、`}`、`[`、`]` → `invalid`
-   （braces 可展開成不同 host；不論是否帶 `-g` 一律保守拒絕）。
-5. 取 `hostname`（lowercase、忽略 port），依序：
+   （braces 可展開成不同 host；不論是否帶 `-g` 一律保守拒絕）。**此檢查不可省略**：
+   shell 層的 glob 偵測（§6.3）攔不到引號保護的 `"https://x/{a,b}"`，但 curl 仍會展開——
+   缺了這條會誤 allow。
+5. **Host 正規化與邊界**：取 `hostname`（URL parser 已 lowercase、不含 port）後：
+   - 去除尾端多餘的 `.`（`host.replace(/\.+$/, "")`）——對齊官方規則端正規化；否則
+     `http://docs.python.org./` 會與官方行為不一致（官方放行、我們 ask）。
+   - hostname 以 `[` 開頭（IPv6 literal）→ 直接 `not-allowed`（規則端因含 `:` 無法宣告
+     IPv6，屬已知不支援，保守 ask）。
+   - IDN：以 `URL` 產出的 punycode（`xn--`）hostname 為準比對；規則端若為 Unicode 不另
+     轉換、視為不相等（保守 ask）。
+6. 對正規化後的 host 依序判定：
    - 命中 `deny` scope → `not-allowed`
    - 命中 `ask` scope → `not-allowed`
    - 命中 `allow` scope → `allowed`
@@ -97,6 +108,13 @@ host 已是 URL parser 產出的合法 hostname，無需 regex）。
 `learn.microsoft.com` 原始碼中重複出現兩次）。官方結構為單一扁平清單：不含 `/` 的條目為
 hostname 精確比對；含 `/` 的條目於載入時推導為「hostname → path 前綴」Map。本實作照搬此
 結構（單一 `PREAPPROVED` 常數陣列 + module 載入時推導）。
+
+**推導規則**：不含 `/` 的條目 → 加入 hostname 精確 Set；含 `/` 的條目 → **僅**加入 path
+Map（host → prefix 陣列），**不得**將其 hostname 加入精確 Set——否則 `huggingface.co` 的
+任意 path 都會被誤放（誤 allow，安全方向錯誤）。故 `github.com`、`wordpress.org`、
+`huggingface.co`、`www.kaggle.com`、`vercel.com` 僅在對應 path 前綴下放行，裸 host 或其他
+path → `not-allowed`。`learn.microsoft.com` 重複兩條皆為純 hostname，進 Set 自然去重、
+無其他影響。
 
 ```
 platform.claude.com, code.claude.com, modelcontextprotocol.io, github.com/anthropics,
@@ -170,9 +188,20 @@ www.kaggle.com → /docs      vercel.com → /docs
 ### 6.3 URL 抽取與約束
 
 - URL = 全部位置參數 + 每個 `--url` 的值。零個 URL → ask。
-- 每個 URL 的 word 必須靜態（`staticValue` 非 null）且不含 shell glob 字元（沿 `word.ts`
-  的詞法偵測；未加引號的 `[]` 可能被 shell 展開）→ 否則 ask。
-- 通過後以 §4 `resolveUrl` 判定；**全部** URL 為 `allowed` 才放行。
+- **位置參數抽取必須排除所有吃值安全旗標（§6.1 第二組）的值 token**：`--opt val` /
+  `-A val` 形式跳過其後一個 token；黏值、`--opt=val`、聚合短旗標形式的值已併入同一
+  token、不另計。實作上若沿用 `flags.ts` 的 `positionals`，其 `valueFlags` 必須完整涵蓋
+  §6.1 全部吃值旗標；且既有 `positionals` 不認得聚合短旗標（`-sSm10`），須先自行拆解
+  聚合形式再判定。漏扣的最壞情況是多出一個假 URL → 走 §4 判定（多半 `invalid` → ask），
+  屬安全方向，但不應依賴此兜底。
+- 每個 URL 的 word 必須靜態（`staticValue` 非 null）且不含 shell glob 字元 → 否則 ask。
+  注意 `word.ts` 的詞法 glob 偵測僅涵蓋 `* ? [`（不含 `] { }`）；curl 自身的 brace/range
+  展開由 §4 第 4 步在 URL 字串層獨立攔截（`{ } [ ]` 四字元），兩層互補、缺一不可。
+  unbash 把結構化的 BraceExpansion 視為動態 word → `staticValue` 回 null → ask，但引號
+  保護的 `"{a,b}"` 是靜態字面值，只能靠 §4 第 4 步攔截。
+- 通過後以 §4 `resolveUrl` 判定；`invalid` 或 `not-allowed` 任一即視為該 URL 未通過 →
+  整體 ask（兩態在本規則中等價，三態僅供測試與 reason 訊息區分原因）；唯有**全部** URL
+  皆為 `allowed` 才放行。
 - `-L` 已決策為允許：視「初始 URL 在允許網域」為足夠授權，接受重導向可能離開該網域
   （與 WebFetch tool 的跨 host 重導向防護語意不同，文件註明）。
 
@@ -187,8 +216,12 @@ www.kaggle.com → /docs      vercel.com → /docs
   fail-safe 行為不變。
 - **修改 `src/rules/types.ts`**：`RuleContext` 增加
   `resolveUrl(value: string): "allowed" | "not-allowed" | "invalid"`。
-- **修改 `src/engine/classify.ts`**：與 `resolvePath` 同處注入 `resolveUrl`（closure 持有
-  `rules.webFetch` 三個 scope 與 preapproved）。
+- **修改 `src/engine/classify.ts`**：`classifyBuiltin` 現行簽名只收 `(inv, scope)`，拿不到
+  `rules.webFetch`，須擴充為 `classifyBuiltin(inv, scope, webFetch)`（`webFetch` 即
+  `PermissionRules["webFetch"]`，由外層 `classify` 傳入）；於建構 `RuleContext` 的物件
+  字面值中，與 `resolvePath`/`resolvePathValue` 並列加入
+  `resolveUrl: (v) => resolveUrl(v, webFetch)`。`resolveUrl` 內部呼叫 `matchesDomain` 與
+  `matchesPreapproved`；preapproved 由 `domain_scope.ts` 模組常數提供，不經參數傳遞。
 - **新增 `src/rules/commands/curl.ts`** 並於 `src/rules/allowlist.ts` 註冊。
 - 既有 `settingsAllows` 升級層不動：`Bash(curl ...)` 字串規則照常可升級，與本功能疊加
   （任一路徑判 allow 即 allow）。
