@@ -595,24 +595,25 @@ EOF
 
 - [ ] **Step 1: Write the failing tests**
 
-在 `src/permissions/settings_test.ts` 檔尾追加（import 區補上
-`import { EMPTY_DOMAIN_SCOPE } from "./domain_scope.ts";`，若既有 import 已有同來源則合併）：
+在 `src/permissions/settings_test.ts` 檔尾追加（import 區新增獨立一行
+`import { EMPTY_DOMAIN_SCOPE } from "./domain_scope.ts";`——既有的 `EMPTY_READ_SCOPE`
+來自 `./path_scope.ts`，是不同來源，不可合併）。測試沿用該檔既有 helper：
+`fakeReadText`（吃 `Record<string, string>`）、`fakeEnv`、`noHome`、`ROOT`：
 
 ```ts
 Deno.test("loadPermissionRules parses WebFetch domain rules", () => {
-  const files = new Map<string, string>([
-    [
-      "/proj/.claude/settings.json",
-      JSON.stringify({
-        permissions: {
-          allow: ["WebFetch(domain:api.example.com)", "WebFetch(domain:*.cdn.example.com)"],
-          deny: ["WebFetch(domain:evil.example.com)"],
-          ask: ["WebFetch(domain:*)"],
-        },
-      }),
-    ],
-  ]);
-  const rules = loadPermissionRules(envOf({}), "/proj", (p) => files.get(p) ?? null);
+  const content = JSON.stringify({
+    permissions: {
+      allow: ["WebFetch(domain:api.example.com)", "WebFetch(domain:*.cdn.example.com)"],
+      deny: ["WebFetch(domain:evil.example.com)"],
+      ask: ["WebFetch(domain:*)"],
+    },
+  });
+  const rules = loadPermissionRules(
+    noHome,
+    ROOT,
+    fakeReadText({ "/proj/.claude/settings.json": content }),
+  );
   assertEquals(rules.webFetch.allow.exact.has("api.example.com"), true);
   assertEquals(rules.webFetch.allow.suffixes, ["cdn.example.com"]);
   assertEquals(rules.webFetch.deny.exact.has("evil.example.com"), true);
@@ -620,44 +621,48 @@ Deno.test("loadPermissionRules parses WebFetch domain rules", () => {
 });
 
 Deno.test("loadPermissionRules unions webFetch across sources", () => {
-  const files = new Map<string, string>([
-    [
-      "/proj/.claude/settings.json",
-      JSON.stringify({ permissions: { allow: ["WebFetch(domain:a.example.com)"] } }),
-    ],
-    [
-      "/proj/.claude/settings.local.json",
-      JSON.stringify({ permissions: { allow: ["WebFetch(domain:b.example.com)"] } }),
-    ],
-  ]);
-  const rules = loadPermissionRules(envOf({}), "/proj", (p) => files.get(p) ?? null);
+  const rules = loadPermissionRules(
+    noHome,
+    ROOT,
+    fakeReadText({
+      "/proj/.claude/settings.json": JSON.stringify({
+        permissions: { allow: ["WebFetch(domain:a.example.com)"] },
+      }),
+      "/proj/.claude/settings.local.json": JSON.stringify({
+        permissions: { allow: ["WebFetch(domain:b.example.com)"] },
+      }),
+    }),
+  );
   assertEquals(rules.webFetch.allow.exact.has("a.example.com"), true);
   assertEquals(rules.webFetch.allow.exact.has("b.example.com"), true);
 });
 
 Deno.test("loadPermissionRules ignores unsupported WebFetch forms", () => {
-  const files = new Map<string, string>([
-    [
-      "/proj/.claude/settings.json",
-      JSON.stringify({
-        permissions: { allow: ["WebFetch(domain:api-*.example.com)", "WebFetch(domain:x.com:8080)"] },
-      }),
-    ],
-  ]);
-  const rules = loadPermissionRules(envOf({}), "/proj", (p) => files.get(p) ?? null);
+  const content = JSON.stringify({
+    permissions: { allow: ["WebFetch(domain:api-*.example.com)", "WebFetch(domain:x.com:8080)"] },
+  });
+  const rules = loadPermissionRules(
+    noHome,
+    ROOT,
+    fakeReadText({ "/proj/.claude/settings.json": content }),
+  );
   assertEquals(rules.webFetch.allow.exact.size, 0);
   assertEquals(rules.webFetch.allow.suffixes, []);
   assertEquals(rules.webFetch.allow.all, false);
 });
 ```
 
-注意：`settings_test.ts` 既有的 `envOf` helper 與「期望整物件相等」的斷言寫法照舊；
-既有測試中以整物件 `assertEquals` 比對 `PermissionRules` 的期望值 literal（如 `:22` 附近的
-`readScope: { allow: EMPTY_READ_SCOPE, ... }`）必須同步補上：
+另外，`settings_test.ts` 既有的共用期望值常數 `EMPTY_NESTED`（現檔 `:20-23`，被
+「`EMPTY_RULES is empty...`」「`missing file -> empty`」「`malformed JSON -> empty`」
+「`permissions not an object`」「`top-level not an object`」等以整物件 `assertEquals`
+比對的測試共用）必須在 `readScope:` 行之後補上一行——只需改這一處即涵蓋上述全部測試：
 
 ```ts
-webFetch: { allow: EMPTY_DOMAIN_SCOPE, deny: EMPTY_DOMAIN_SCOPE, ask: EMPTY_DOMAIN_SCOPE },
+  webFetch: { allow: EMPTY_DOMAIN_SCOPE, deny: EMPTY_DOMAIN_SCOPE, ask: EMPTY_DOMAIN_SCOPE },
 ```
+
+（`@std/assert` 的 `assertEquals` 對 Set 做結構性深度比較，兩個空 Set 相等；新測試刻意
+以 `.exact.has(...)` / `.suffixes` / `.all` 逐欄位斷言，不依賴整 DomainScope 物件相等。）
 
 - [ ] **Step 2: Run tests to verify they fail**
 
@@ -749,16 +754,25 @@ function parseDomainRuleList(value: unknown): DomainScope {
       }
 ```
 
-(g) 同步修正三個既有測試檔的 `PermissionRules` literal（型別補欄位，行為不變）。
-`src/permissions/matcher_test.ts` 與 `src/engine/evaluate_test.ts` 與
-`src/engine/classify_test.ts` 的 `rulesOf` helper、以及 `classify_test.ts` 中直接建構
-`PermissionRules` 的 literal（約 `:94-99`、`:120-140` 三處），每個物件追加同一行：
+(g) 同步修正三個既有測試檔的 `PermissionRules` literal（型別補欄位，行為不變），
+每個物件在 `readScope:` 行之後追加同一行：
 
 ```ts
     webFetch: { allow: EMPTY_DOMAIN_SCOPE, deny: EMPTY_DOMAIN_SCOPE, ask: EMPTY_DOMAIN_SCOPE },
 ```
 
-並在各檔 import 區追加：
+受影響的 literal **共六處**（以內容定位為準，行號為現檔參考值）：
+
+1. `src/permissions/matcher_test.ts` — `rulesOf` helper 的回傳物件（`:111-117`）
+2. `src/engine/evaluate_test.ts` — `rulesOf` helper 的回傳物件（`:83-89`）
+3. `src/engine/classify_test.ts` — `rulesOf` helper 的回傳物件（`:13-19`）
+4. `src/engine/classify_test.ts` — `rulesWithRead` helper 的回傳物件（`:94-97`）
+5. `src/engine/classify_test.ts` — 測試「external path under allow root but also denied」
+   內的 inline literal（`:120-127`）
+6. `src/engine/classify_test.ts` — 測試「cwd under allow root but also ask-listed」
+   內的 inline literal（`:132-139`）
+
+並在各檔 import 區追加（獨立一行，不與既有 import 合併）：
 
 ```ts
 import { EMPTY_DOMAIN_SCOPE } from "../permissions/domain_scope.ts";
@@ -798,27 +812,24 @@ EOF
 - [ ] **Step 1: Write the failing test**
 
 在 `src/engine/classify_test.ts` 檔尾追加（此測試走 classify 端到端，驗證 resolveUrl
-已被注入並由 webFetch 規則驅動；curl 規則尚未存在，故先用 rules 物件直接驗證
-classify 對「未列入 allowlist 指令」不受影響、且型別接通——真正的 e2e 在 Task 6/7）：
+已被注入並由 webFetch 規則驅動；curl 規則尚未存在，故先固定基準行為與型別接通——
+真正的 allow 路徑 e2e 在後續整合階段）。使用該檔**既有**的 `onlyWith(src, rules)` helper
+（內部已做 walk + classify，回傳 verdict）：
 
 ```ts
-Deno.test("classify passes webFetch rules through (type wiring)", () => {
-  // curl 尚未註冊 → ask（未列入 allowlist）；本測試先固定此基準行為，
-  // Task 6 註冊 curl 後將由 curl_test 與 Task 7 的 e2e 接手驗證 allow 路徑。
-  const inv = firstInv("curl https://docs.python.org/3/");
-  const v = classify(inv, "/proj", rulesOf({}));
-  assertEquals(v.kind, "ask");
+Deno.test("classify still asks for unregistered curl after resolveUrl wiring", () => {
+  // curl 未列入 allowlist → ask；固定此基準行為，同時驗證 webFetch 規則
+  // 型別已接通 classify（resolveUrl 注入後仍能編譯與執行）。
+  assertEquals(onlyWith("curl https://docs.python.org/3/", rulesOf({})).kind, "ask");
 });
 ```
-
-（`firstInv` 為 `classify_test.ts` 既有 helper；若名稱不同，沿用該檔既有「由 src 字串取
-第一個 CommandInvocation」的 helper。）
 
 - [ ] **Step 2: Run test to verify current state**
 
 Run: `deno test --allow-env src/engine/classify_test.ts`
 Expected: 新測試 PASS（curl 未註冊本就 ask）——本 Task 的失敗訊號在型別層：Step 3 改
 `RuleContext` 後，`deno task check` 會因 10 個 `ctxOf` 缺欄位而 FAIL，再逐一補齊。
+（本 Task 非典型 TDD 紅綠循環：行為基準測試先綠、型別檢查充當紅燈。）
 
 - [ ] **Step 3: Write the implementation**
 
@@ -1266,10 +1277,13 @@ EOF
 - Modify: `CLAUDE.md`
 - Build: `dist/permission-checker(.exe)`（不入版控）
 
-- [ ] **Step 1: Write the failing e2e tests**
+- [ ] **Step 1: Write the e2e integration tests**
 
-在 `src/engine/classify_test.ts` 檔尾追加（`rulesOf` 已於 Task 4 擴充型別；此處需要一個
-能帶 WebFetch 規則的變體——直接建構 literal）：
+本 Task 為整合驗證階段：規則實作已全部完成，下列 e2e 測試撰寫後應直接通過，
+非 TDD 紅綠循環。在 `src/engine/classify_test.ts` 檔尾追加，沿用該檔**既有**的
+`onlyWith(src, rules)` 與 `only(src)` helper（`only` 不帶 rules，即預設 `EMPTY_RULES`，
+正好驗證「無任何使用者規則時 preapproved 仍放行」）；`rulesOf` 已於 Task 4 擴充型別，
+此處需要一個能帶 WebFetch 規則的變體——直接建構 literal：
 
 ```ts
 function webFetchRulesOf(spec: { allow?: string[]; deny?: string[]; ask?: string[] }): PermissionRules {
@@ -1297,48 +1311,34 @@ function webFetchRulesOf(spec: { allow?: string[]; deny?: string[]; ask?: string
 
 Deno.test("classify e2e: curl allowed domain via WebFetch rules", () => {
   const rules = webFetchRulesOf({ allow: ["WebFetch(domain:api.example.com)"] });
-  assertEquals(
-    classify(firstInv("curl -sL https://api.example.com/v1"), "/proj", rules).kind,
-    "allow",
-  );
-  assertEquals(
-    classify(firstInv("curl -sL https://example.com/"), "/proj", rules).kind,
-    "ask",
-  );
+  assertEquals(onlyWith("curl -sL https://api.example.com/v1", rules).kind, "allow");
+  assertEquals(onlyWith("curl -sL https://example.com/", rules).kind, "ask");
 });
 
 Deno.test("classify e2e: curl preapproved domain with default rules", () => {
-  assertEquals(
-    classify(firstInv("curl -s https://docs.python.org/3/"), "/proj", EMPTY_RULES).kind,
-    "allow",
-  );
+  assertEquals(only("curl -s https://docs.python.org/3/").kind, "allow");
 });
 
 Deno.test("classify e2e: deny vetoes preapproved", () => {
   const rules = webFetchRulesOf({ deny: ["WebFetch(domain:docs.python.org)"] });
-  assertEquals(
-    classify(firstInv("curl -s https://docs.python.org/3/"), "/proj", rules).kind,
-    "ask",
-  );
+  assertEquals(onlyWith("curl -s https://docs.python.org/3/", rules).kind, "ask");
 });
 
 Deno.test("classify e2e: write redirect still asks for allowed curl", () => {
   // 中央寫入重導向規則照常生效
-  assertEquals(
-    classify(firstInv("curl -s https://docs.python.org/3/ > out.html"), "/proj", EMPTY_RULES).kind,
-    "ask",
-  );
+  assertEquals(only("curl -s https://docs.python.org/3/ > out.html").kind, "ask");
 });
 ```
 
-import 區追加 `parseDomainRule`（來源 `../permissions/domain_scope.ts`，與 Task 4 已加的
-`EMPTY_DOMAIN_SCOPE` 合併同一行）；`EMPTY_RULES` 若尚未 import 則自
-`../permissions/settings.ts` 加入。
+import 指示：`parseDomainRule` 來源 `../permissions/domain_scope.ts`——Task 4 已在本檔
+import 同來源的 `EMPTY_DOMAIN_SCOPE`，把 `parseDomainRule` 併入該行即可。`EMPTY_READ_SCOPE`
+本檔已有（`./../permissions/path_scope.ts` 來源的既有 import）。不需要 `EMPTY_RULES`
+（`only` 內部已用 classify 的預設參數）。
 
 - [ ] **Step 2: Run tests to verify they pass**
 
 Run: `deno task check && deno task test`
-Expected: 全部 PASS（Task 6 已完成實作，e2e 應直接綠；若有紅，修復後重跑）
+Expected: 全部 PASS（實作已於前面任務完成，e2e 應直接綠；若有紅，修復後重跑）
 
 - [ ] **Step 3: Build and operational verification**
 
