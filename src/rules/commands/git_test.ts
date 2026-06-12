@@ -17,6 +17,7 @@ function ctxOf(src: string): RuleContext {
     cwd,
     resolvePath: (w) => resolvePath(w, cwd, rootScope("/proj")),
     resolvePathValue: (v) => resolvePathValue(v, cwd, rootScope("/proj")),
+    resolveUrl: () => "not-allowed",
   };
 }
 

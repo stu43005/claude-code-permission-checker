@@ -16,6 +16,7 @@ function ctxOf(src: string, cwd: CwdState = { kind: "known", path: "/proj" }): R
     cwd,
     resolvePath: (w) => resolvePath(w, cwd, rootScope("/proj")),
     resolvePathValue: (v) => resolvePathValue(v, cwd, rootScope("/proj")),
+    resolveUrl: () => "not-allowed",
   };
 }
 

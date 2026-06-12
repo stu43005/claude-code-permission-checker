@@ -6,9 +6,10 @@ import { isReadScoped, normalizeAbsolute, resolvePath, resolvePathValue, type Sc
 import { hasWriteRedirect } from "./redirect.ts";
 import { settingsAllows } from "../permissions/matcher.ts";
 import { EMPTY_RULES, type PermissionRules } from "../permissions/settings.ts";
+import { resolveUrl, type WebFetchRules } from "../permissions/domain_scope.ts";
 
 /** 既有的中央前置規則 + allowlist 規則判定。 */
-function classifyBuiltin(inv: CommandInvocation, scope: ScopeConfig): RuleVerdict {
+function classifyBuiltin(inv: CommandInvocation, scope: ScopeConfig, webFetch: WebFetchRules): RuleVerdict {
   if (inv.name === null) return ask("動態指令名，無法判定");
 
   const rule = lookupRule(inv.name);
@@ -35,6 +36,7 @@ function classifyBuiltin(inv: CommandInvocation, scope: ScopeConfig): RuleVerdic
     cwd: inv.cwd,
     resolvePath: (w) => resolvePath(w, inv.cwd, scope),
     resolvePathValue: (v) => resolvePathValue(v, inv.cwd, scope),
+    resolveUrl: (v) => resolveUrl(v, webFetch),
   });
 }
 
@@ -50,7 +52,7 @@ export function classify(
     deny: rules.readScope.deny,
     ask: rules.readScope.ask,
   };
-  const v = classifyBuiltin(inv, scope);
+  const v = classifyBuiltin(inv, scope, rules.webFetch);
   if (v.kind === "allow") return v;
   if (settingsAllows(inv, rules)) return allow();
   return v;

@@ -1,6 +1,7 @@
 import type { AssignmentPrefix, Redirect, Word } from "../deps.ts";
 import type { CwdState } from "../types.ts";
 import type { PathScope } from "../engine/scope.ts";
+import type { UrlScope } from "../permissions/domain_scope.ts";
 
 /** 由 CommandInvocation 投影建構；name 已確認非 null。 */
 export interface RuleContext {
@@ -13,6 +14,8 @@ export interface RuleContext {
   resolvePath(arg: Word): PathScope;
   /** 對 flag 的路徑值（字串）做範圍檢查。 */
   resolvePathValue(value: string | null): PathScope;
+  /** 對 URL 字串做網域範圍三態判定（內部已綁定 settings 的 WebFetch 規則與 preapproved 清單）。 */
+  resolveUrl(value: string): UrlScope;
 }
 
 export type RuleVerdict =
