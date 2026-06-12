@@ -172,6 +172,23 @@ for (const entry of PREAPPROVED) {
   else PREAPPROVED_PATH_PREFIXES.set(host, [prefix]);
 }
 
+/**
+ * host 是否命中 preapproved（hostname 精確；path 條目需 pathname 等於前綴或在其下）。
+ * host 必須已正規化（lowercase、無尾端 `.`、不含 port）——呼叫端負責，通常由 URL.hostname 滿足；
+ * pathname 應來自 URL.pathname（已經 WHATWG 正規化）。
+ * pathname 含百分號編碼的 `/` `\` `.`（含多重編碼如 %252f）→ 一律不放行（對齊官方 NX_）。
+ */
+export function matchesPreapproved(host: string, pathname: string): boolean {
+  if (PREAPPROVED_HOSTS.has(host)) return true;
+  const prefixes = PREAPPROVED_PATH_PREFIXES.get(host);
+  if (!prefixes) return false;
+  if (/%(25)*(2f|5c|2e)/i.test(pathname)) return false;
+  for (const p of prefixes) {
+    if (pathname === p || pathname.startsWith(p + "/")) return true;
+  }
+  return false;
+}
+
 export type UrlScope = "allowed" | "not-allowed" | "invalid";
 
 /**
@@ -198,21 +215,4 @@ export function resolveUrl(value: string, rules: WebFetchRules): UrlScope {
   } catch {
     return "invalid";
   }
-}
-
-/**
- * host 是否命中 preapproved（hostname 精確；path 條目需 pathname 等於前綴或在其下）。
- * host 必須已正規化（lowercase、無尾端 `.`、不含 port）——呼叫端負責，通常由 URL.hostname 滿足；
- * pathname 應來自 URL.pathname（已經 WHATWG 正規化）。
- * pathname 含百分號編碼的 `/` `\` `.`（含多重編碼如 %252f）→ 一律不放行（對齊官方 NX_）。
- */
-export function matchesPreapproved(host: string, pathname: string): boolean {
-  if (PREAPPROVED_HOSTS.has(host)) return true;
-  const prefixes = PREAPPROVED_PATH_PREFIXES.get(host);
-  if (!prefixes) return false;
-  if (/%(25)*(2f|5c|2e)/i.test(pathname)) return false;
-  for (const p of prefixes) {
-    if (pathname === p || pathname.startsWith(p + "/")) return true;
-  }
-  return false;
 }

@@ -215,3 +215,11 @@ Deno.test("resolveUrl invalid forms", () => {
   assertEquals(resolveUrl("https://api.example.com/[1-9]", r), "invalid");
   assertEquals(resolveUrl("http://[::1]/", r), "invalid");
 });
+
+Deno.test("resolveUrl deny:* wildcard vetoes specific allow", () => {
+  const r = webFetchOf({
+    allow: ["WebFetch(domain:safe.example.com)"],
+    deny: ["WebFetch(domain:*)"],
+  });
+  assertEquals(resolveUrl("https://safe.example.com/", r), "not-allowed");
+});
