@@ -172,6 +172,34 @@ for (const entry of PREAPPROVED) {
   else PREAPPROVED_PATH_PREFIXES.set(host, [prefix]);
 }
 
+export type UrlScope = "allowed" | "not-allowed" | "invalid";
+
+/**
+ * 對單一 URL 字串做網域三態判定：
+ *   invalid    — 解析失敗 / 非 http(s) / 含 userinfo / 含 curl 展開字元 {}[]
+ *   not-allowed — host 命中 deny 或 ask（否決），或未命中任何 allow / preapproved
+ *   allowed    — host 命中 allow，或命中 preapproved（hostname 或 path 前綴）
+ * 判定順序對齊官方 v2.1.162：顯式 deny/ask 優先於 preapproved 自動放行。
+ * `{}[]` 檢查不可省略：shell 層 glob 偵測攔不到引號保護的 "{a,b}"，curl 仍會展開。
+ */
+export function resolveUrl(value: string, rules: WebFetchRules): UrlScope {
+  try {
+    if (/[{}[\]]/.test(value)) return "invalid";
+    const u = new URL(value);
+    if (u.protocol !== "http:" && u.protocol !== "https:") return "invalid";
+    if (u.username !== "" || u.password !== "") return "invalid";
+    const host = u.hostname.replace(/\.+$/, "");
+    if (host.startsWith("[")) return "not-allowed"; // IPv6：規則端無法宣告（防禦層；{}[] 檢查已先攔）
+    if (matchesDomain(host, rules.deny)) return "not-allowed";
+    if (matchesDomain(host, rules.ask)) return "not-allowed";
+    if (matchesDomain(host, rules.allow)) return "allowed";
+    if (matchesPreapproved(host, u.pathname)) return "allowed";
+    return "not-allowed";
+  } catch {
+    return "invalid";
+  }
+}
+
 /**
  * host 是否命中 preapproved（hostname 精確；path 條目需 pathname 等於前綴或在其下）。
  * host 必須已正規化（lowercase、無尾端 `.`、不含 port）——呼叫端負責，通常由 URL.hostname 滿足；

@@ -5,6 +5,8 @@ import {
   matchesDomain,
   matchesPreapproved,
   parseDomainRule,
+  resolveUrl,
+  type WebFetchRules,
 } from "./domain_scope.ts";
 
 Deno.test("parseDomainRule exact host", () => {
@@ -141,4 +143,75 @@ Deno.test("preapproved rejects percent-encoded path tricks", () => {
 Deno.test("preapproved is case-sensitive (host must already be lowercase)", () => {
   assertEquals(matchesPreapproved("DOCS.PYTHON.ORG", "/"), false);
   assertEquals(matchesPreapproved("Github.com", "/anthropics"), false);
+});
+
+function webFetchOf(spec: {
+  allow?: string[];
+  deny?: string[];
+  ask?: string[];
+}): WebFetchRules {
+  return {
+    allow: scopeOf(spec.allow ?? []),
+    deny: scopeOf(spec.deny ?? []),
+    ask: scopeOf(spec.ask ?? []),
+  };
+}
+
+const NO_RULES = webFetchOf({});
+
+Deno.test("resolveUrl allows explicit allow domain", () => {
+  const r = webFetchOf({ allow: ["WebFetch(domain:api.example.com)"] });
+  assertEquals(resolveUrl("https://api.example.com/v1", r), "allowed");
+  assertEquals(resolveUrl("http://api.example.com/", r), "allowed");
+  // 裸域與其他 host 不放行
+  assertEquals(resolveUrl("https://example.com/", r), "not-allowed");
+});
+
+Deno.test("resolveUrl wildcard subdomains", () => {
+  const r = webFetchOf({ allow: ["WebFetch(domain:*.example.com)"] });
+  assertEquals(resolveUrl("https://a.b.example.com/", r), "allowed");
+  assertEquals(resolveUrl("https://example.com/", r), "not-allowed");
+});
+
+Deno.test("resolveUrl preapproved without any rules", () => {
+  assertEquals(resolveUrl("https://docs.python.org/3/", NO_RULES), "allowed");
+  assertEquals(resolveUrl("https://github.com/anthropics/claude-code", NO_RULES), "allowed");
+  assertEquals(resolveUrl("https://github.com/evil/repo", NO_RULES), "not-allowed");
+  assertEquals(resolveUrl("https://unknown.example/", NO_RULES), "not-allowed");
+});
+
+Deno.test("resolveUrl deny and ask veto allow and preapproved", () => {
+  const denied = webFetchOf({
+    allow: ["WebFetch(domain:docs.python.org)"],
+    deny: ["WebFetch(domain:docs.python.org)"],
+  });
+  assertEquals(resolveUrl("https://docs.python.org/3/", denied), "not-allowed");
+  const asked = webFetchOf({ ask: ["WebFetch(domain:docs.python.org)"] });
+  assertEquals(resolveUrl("https://docs.python.org/3/", asked), "not-allowed");
+});
+
+Deno.test("resolveUrl host normalization", () => {
+  const r = webFetchOf({ allow: ["WebFetch(domain:api.example.com)"] });
+  // hostname 大小寫與尾端點（URL parser lowercase；尾端 . 由 resolveUrl 去除）
+  assertEquals(resolveUrl("https://API.Example.COM/x", r), "allowed");
+  assertEquals(resolveUrl("https://api.example.com./x", r), "allowed");
+  // port 忽略（只比 hostname）
+  assertEquals(resolveUrl("https://api.example.com:8443/x", r), "allowed");
+});
+
+Deno.test("resolveUrl invalid forms", () => {
+  const r = webFetchOf({ allow: ["WebFetch(domain:*)"] });
+  // 非 http(s) scheme
+  assertEquals(resolveUrl("file:///etc/passwd", r), "invalid");
+  assertEquals(resolveUrl("ftp://api.example.com/", r), "invalid");
+  // 無 scheme / 解析失敗
+  assertEquals(resolveUrl("api.example.com/v1", r), "invalid");
+  assertEquals(resolveUrl("not a url", r), "invalid");
+  // userinfo 視同憑證
+  assertEquals(resolveUrl("https://user@api.example.com/", r), "invalid");
+  assertEquals(resolveUrl("https://u:p@api.example.com/", r), "invalid");
+  // curl 多重展開字元（即使網域全放行也拒絕；含 IPv6 字面值的 [ ]）
+  assertEquals(resolveUrl("https://api.example.com/{a,b}", r), "invalid");
+  assertEquals(resolveUrl("https://api.example.com/[1-9]", r), "invalid");
+  assertEquals(resolveUrl("http://[::1]/", r), "invalid");
 });
