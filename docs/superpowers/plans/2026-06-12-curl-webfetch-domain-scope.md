@@ -589,16 +589,19 @@ EOF
 **Files:**
 - Modify: `src/permissions/settings.ts`
 - Modify: `src/permissions/settings_test.ts`
-- Modify: `src/permissions/matcher_test.ts:111-116`（`rulesOf`）
-- Modify: `src/engine/classify_test.ts:13-18` 與 `:94-99`、`:120-140`（PermissionRules literal）
-- Modify: `src/engine/evaluate_test.ts:83-88`（`rulesOf`）
+- Modify: `src/permissions/matcher_test.ts:111-117`（`rulesOf` 回傳物件）
+- Modify: `src/engine/classify_test.ts`（`:13-19`、`:94-98`、`:119-129`、`:131-143` 四處
+  PermissionRules literal）
+- Modify: `src/engine/evaluate_test.ts:83-89`（`rulesOf` 回傳物件）
 
 - [ ] **Step 1: Write the failing tests**
 
-在 `src/permissions/settings_test.ts` 檔尾追加（import 區新增獨立一行
-`import { EMPTY_DOMAIN_SCOPE } from "./domain_scope.ts";`——既有的 `EMPTY_READ_SCOPE`
-來自 `./path_scope.ts`，是不同來源，不可合併）。測試沿用該檔既有 helper：
-`fakeReadText`（吃 `Record<string, string>`）、`fakeEnv`、`noHome`、`ROOT`：
+在 `src/permissions/settings_test.ts` 檔尾追加新測試（測試本身以 `.exact.has(...)`/
+`.suffixes`/`.all` 逐欄位斷言，不需 import 額外符號）。另需在 import 區新增獨立一行
+`import { EMPTY_DOMAIN_SCOPE } from "./domain_scope.ts";`——供下方 `EMPTY_NESTED` 常數
+修改使用；與既有來自 `./path_scope.ts` 的 `EMPTY_READ_SCOPE` 是不同來源，不可合併。
+測試沿用該檔既有 helper：`fakeReadText`（吃 `Record<string, string>`）、`fakeEnv`、
+`noHome`、`ROOT`：
 
 ```ts
 Deno.test("loadPermissionRules parses WebFetch domain rules", () => {
