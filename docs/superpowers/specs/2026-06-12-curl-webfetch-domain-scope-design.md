@@ -60,7 +60,10 @@
 | `WebFetch(domain:*)` | `{ kind: "all" }` |
 | 其他（見下） | `null` |
 
-- 正規化：host/suffix 一律 lowercase、去除尾端多餘的 `.`（對齊官方 `PX_`）。
+- 正規化：host/suffix 一律 lowercase、去除尾端多餘的 `.`（對齊官方 `PX_`）。不做
+  IDN/punycode 轉換：Unicode host 原樣保存（lowercase 後）。因 §4 URL 端 hostname 恆為
+  punycode（`xn--`），Unicode 規則自然不相等 → 保守 ask（已知不支援以 Unicode 規則宣告
+  IDN 網域，與 §4 邊界一致）。
 - **忽略（回 `null`）的形式**：`*` 出現在非「整體 `*`」與非「前綴 `*.`」位置（官方 schema
   驗證本就拒絕中段 `*`）；內容含 `://`、`/`、`:`、空字串；非 `WebFetch(domain:...)`
   形狀者。其中「含 `:` 一律忽略」同時涵蓋 port 形式與 IPv6 literal（`domain:[::1]` 因含
@@ -160,6 +163,10 @@ www.kaggle.com → /docs      vercel.com → /docs
 `-L/--location`、`-I/--head`、`-i/--include`、`-G/--get`、`-v/--verbose`、`-4/--ipv4`、
 `-6/--ipv6`、`--compressed`、`-g/--globoff`、`--no-progress-meter`、`--http1.1`、`--http2`。
 
+`-g/--globoff` 列入安全集合僅為相容性（避免 `-g` 本身觸發 ask）；它**不**改變 §4 第 4 步
+的判定——無論是否帶 `-g`，URL 含 `{ } [ ]` 一律 `invalid`。實作不得依 `-g` 是否存在而
+放寬 brace 攔截。
+
 **吃值安全旗標**（值必須為靜態，動態 → ask）：`-m/--max-time`、`--connect-timeout`、
 `--retry`、`--retry-delay`、`--retry-max-time`、`--max-redirs`、`-A/--user-agent`、
 `-e/--referer`、`-H/--header`（特殊語意見 6.2）、`--url`（值視同 URL，走 §4 判定）。
@@ -172,8 +179,14 @@ www.kaggle.com → /docs      vercel.com → /docs
 
 **旗標形式**：必須正確處理短旗標聚合（`-sSL`）與黏值（`-m10`、`-H"Accept: x"`、
 `--max-time=10`）；任何無法可靠拆解的形式 → ask。實作沿用 `rules/flags.ts` 既有機制，
-若既有機制不支援聚合短旗標則於本規則內自行拆解（拆解後每個字母逐一過 allowlist，
-任一字母旗標吃值時其值來源依 curl 語意取剩餘字元或下一參數）。
+若既有機制不支援聚合短旗標則於本規則內自行拆解。
+
+**聚合短旗標拆解演算法**：逐字母掃描（**區分大小寫**——`-I` head 與 `-i` include 為不同
+旗標）：遇無值旗標繼續掃下一字母；遇吃值短旗標（`-m`、`-A`、`-e`、`-H` 等）時，**該旗標
+之後同 token 的剩餘字元**即為其值；若剩餘為空，則**下一個 argv token** 為其值並從位置
+參數候選中排除。一個聚合 token 內最多一個吃值旗標（其後字元全歸該值，掃描即止）。任一
+字母不在 §6.1 已知集合 → 整體 ask。此演算法同時用於旗標 allowlist 檢查與 URL（位置參數）
+抽取——兩者必須對「哪個 token 是值」達成一致，不得各自拆解。
 
 ### 6.2 `-H/--header` 語意
 
@@ -222,6 +235,11 @@ www.kaggle.com → /docs      vercel.com → /docs
   字面值中，與 `resolvePath`/`resolvePathValue` 並列加入
   `resolveUrl: (v) => resolveUrl(v, webFetch)`。`resolveUrl` 內部呼叫 `matchesDomain` 與
   `matchesPreapproved`；preapproved 由 `domain_scope.ts` 模組常數提供，不經參數傳遞。
+  同時將 `classify` 內唯一呼叫處（現 `const v = classifyBuiltin(inv, scope);`）改為
+  `const v = classifyBuiltin(inv, scope, rules.webFetch);`。`classify` 的 `rules` 參數預設
+  為 `EMPTY_RULES`，故 `EMPTY_RULES.webFetch` 必須為
+  `{ allow: EMPTY_DOMAIN_SCOPE, deny: EMPTY_DOMAIN_SCOPE, ask: EMPTY_DOMAIN_SCOPE }`
+  （`emptyRules()` 同步）。
 - **新增 `src/rules/commands/curl.ts`** 並於 `src/rules/allowlist.ts` 註冊。
 - 既有 `settingsAllows` 升級層不動：`Bash(curl ...)` 字串規則照常可升級，與本功能疊加
   （任一路徑判 allow 即 allow）。
@@ -239,8 +257,10 @@ www.kaggle.com → /docs      vercel.com → /docs
     （中段 `*`、含 `/`、含 `:`、空、非 WebFetch）。
   - `matchesDomain`：精確、子網域層數、裸域不被 `*.` 命中、`all`。
   - preapproved：hostname 精確、子網域不放行（`www.python.org` 不因 `docs.python.org` 在列
-    而放行）、path 前綴（`github.com/anthropics/x` 放行、`github.com/evil` 不放行）、
-    百分號編碼拒絕（`%2e`、`%252f` 等）。
+    而放行）、精確條目不得被當作後綴（`requests.readthedocs.io` 在列，但
+    `other.readthedocs.io` 與 `readthedocs.io` 皆 `not-allowed`）、path 前綴
+    （`github.com/anthropics/x` 放行、`github.com/evil` 不放行）、百分號編碼拒絕
+    （`%2e`、`%252f` 等）。
 - `src/rules/commands/curl_test.ts`：旗標 allow/ask 兩面與聚合/黏值形式、`-H` 四種值形式、
   URL 約束（無 scheme、userinfo、`{}[]`、動態、零 URL、多 URL 部分命中）、deny/ask 否決
   allow 與 preapproved。
