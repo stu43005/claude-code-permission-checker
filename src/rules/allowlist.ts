@@ -9,6 +9,7 @@ import { grepRule } from "./commands/grep.ts";
 import { gitRule } from "./commands/git.ts";
 import { denoRule } from "./commands/deno.ts";
 import { ghRule } from "./commands/gh.ts";
+import { curlRule } from "./commands/curl.ts";
 
 const RULES: CommandRule[] = [
   fileReaderRule,
@@ -29,6 +30,7 @@ const RULES: CommandRule[] = [
   gitRule,
   denoRule,
   ghRule,
+  curlRule,
 ];
 
 const INDEX = new Map<string, CommandRule>();

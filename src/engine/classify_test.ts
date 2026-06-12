@@ -147,8 +147,9 @@ Deno.test("cwd under allow root but also ask-listed -> ask (integration)", () =>
   assertEquals(classify(cat, ROOT, rules).kind, "ask");
 });
 
-Deno.test("classify still asks for unregistered curl after resolveUrl wiring", () => {
-  // curl 未列入 allowlist → ask；固定此基準行為，同時驗證 webFetch 規則
-  // 型別已接通 classify（resolveUrl 注入後仍能編譯與執行）。
-  assertEquals(onlyWith("curl https://docs.python.org/3/", rulesOf({})).kind, "ask");
+Deno.test("classify curl preapproved domain allows, non-allowed domain asks, after resolveUrl wiring", () => {
+  // curl 已列入 allowlist（Task 6）；preapproved 網域 + 空 WebFetch 規則 → allow，
+  // 未命中網域 → ask；同時驗證 webFetch 規則型別已接通 classify。
+  assertEquals(onlyWith("curl https://docs.python.org/3/", rulesOf({})).kind, "allow");
+  assertEquals(onlyWith("curl https://unknown.example/", rulesOf({})).kind, "ask");
 });
