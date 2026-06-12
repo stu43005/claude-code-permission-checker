@@ -63,7 +63,7 @@ export function matchesDomain(host: string, scope: DomainScope): boolean {
  *   grep -a -o 'new Set(\[[^]]*docs\.python\.org[^]]*\])' <claude binary>
  * 含 `/` 的條目於載入時推導為 path 前綴（該 host 不入精確 Set）；其餘為 hostname 精確比對。
  */
-const PREAPPROVED: string[] = [
+const PREAPPROVED: readonly string[] = [
   "platform.claude.com",
   "code.claude.com",
   "modelcontextprotocol.io",
@@ -174,6 +174,8 @@ for (const entry of PREAPPROVED) {
 
 /**
  * host 是否命中 preapproved（hostname 精確；path 條目需 pathname 等於前綴或在其下）。
+ * host 必須已正規化（lowercase、無尾端 `.`、不含 port）——呼叫端負責，通常由 URL.hostname 滿足；
+ * pathname 應來自 URL.pathname（已經 WHATWG 正規化）。
  * pathname 含百分號編碼的 `/` `\` `.`（含多重編碼如 %252f）→ 一律不放行（對齊官方 NX_）。
  */
 export function matchesPreapproved(host: string, pathname: string): boolean {

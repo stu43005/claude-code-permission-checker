@@ -137,3 +137,8 @@ Deno.test("preapproved rejects percent-encoded path tricks", () => {
   assertEquals(matchesPreapproved("github.com", "/anthropics/%252f"), false);
   assertEquals(matchesPreapproved("github.com", "/anthropics/%5cx"), false);
 });
+
+Deno.test("preapproved is case-sensitive (host must already be lowercase)", () => {
+  assertEquals(matchesPreapproved("DOCS.PYTHON.ORG", "/"), false);
+  assertEquals(matchesPreapproved("Github.com", "/anthropics"), false);
+});
