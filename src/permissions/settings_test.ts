@@ -24,7 +24,7 @@ const EMPTY_NESTED = {
   webFetch: { allow: EMPTY_DOMAIN_SCOPE, deny: EMPTY_DOMAIN_SCOPE, ask: EMPTY_DOMAIN_SCOPE },
 };
 
-Deno.test("EMPTY_RULES is empty bash + empty readScope", () => {
+Deno.test("EMPTY_RULES is empty bash + readScope + webFetch", () => {
   assertEquals(EMPTY_RULES, EMPTY_NESTED);
 });
 
@@ -253,4 +253,15 @@ Deno.test("loadPermissionRules ignores unsupported WebFetch forms", () => {
   assertEquals(rules.webFetch.allow.exact.size, 0);
   assertEquals(rules.webFetch.allow.suffixes, []);
   assertEquals(rules.webFetch.allow.all, false);
+});
+
+Deno.test("missing/garbage file -> empty webFetch (fail-safe)", () => {
+  const rules = loadPermissionRules(
+    noHome,
+    ROOT,
+    fakeReadText({ "/proj/.claude/settings.json": "not json {{{" }),
+  );
+  assertEquals(rules.webFetch.allow, EMPTY_DOMAIN_SCOPE);
+  assertEquals(rules.webFetch.deny, EMPTY_DOMAIN_SCOPE);
+  assertEquals(rules.webFetch.ask, EMPTY_DOMAIN_SCOPE);
 });
