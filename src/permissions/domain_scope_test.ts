@@ -90,3 +90,14 @@ Deno.test("matchesDomain all", () => {
 Deno.test("matchesDomain empty scope matches nothing", () => {
   assertEquals(matchesDomain("example.com", EMPTY_DOMAIN_SCOPE), false);
 });
+
+Deno.test("matchesDomain is case-sensitive (host must already be lowercase)", () => {
+  const s = scopeOf(["WebFetch(domain:example.com)"]);
+  assertEquals(matchesDomain("EXAMPLE.COM", s), false); // 呼叫端負責先正規化
+});
+
+Deno.test("matchesDomain subdomain of TLD wildcard", () => {
+  const s = scopeOf(["WebFetch(domain:*.com)"]);
+  assertEquals(matchesDomain("example.com", s), true);
+  assertEquals(matchesDomain("com", s), false);
+});
