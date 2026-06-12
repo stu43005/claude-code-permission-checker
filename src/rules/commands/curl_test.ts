@@ -176,3 +176,22 @@ Deno.test("curl deny/ask rules veto", () => {
 Deno.test("rule covers only curl", () => {
   assertEquals(curlRule.names, ["curl"]);
 });
+
+Deno.test("curl `--` option terminator asks (conservative, not in safe set)", () => {
+  assertEquals(curlRule.evaluate(ctxOf("curl -- https://api.example.com/")).kind, "ask");
+});
+
+Deno.test("curl --header long form with @file applies read scope", () => {
+  assertEquals(
+    curlRule.evaluate(ctxOf("curl --header=@headers.txt https://api.example.com/")).kind,
+    "allow", // inline 值、專案內
+  );
+  assertEquals(
+    curlRule.evaluate(ctxOf("curl --header @headers.txt https://api.example.com/")).kind,
+    "allow", // 下一 token 值、專案內
+  );
+  assertEquals(
+    curlRule.evaluate(ctxOf("curl --header=@/etc/headers https://api.example.com/")).kind,
+    "ask", // inline 值、專案外
+  );
+});

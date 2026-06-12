@@ -12,7 +12,7 @@ const SAFE_LONG_NOVAL = new Set([
   "--fail-with-body",
   "--location",
   "--head",
-  "--include",
+  "--include", // legacy alias for --show-headers (-i); read-only
   "--get",
   "--verbose",
   "--ipv4",
@@ -90,7 +90,6 @@ export const curlRule: CommandRule = {
       if (t.startsWith("-") && t !== "-") {
         // 聚合短旗標逐字母掃描（區分大小寫）；吃值字母後同 token 剩餘字元為值，
         // 剩餘為空則下一個 argv token 為值（並從 URL 候選排除）。
-        let handled = false;
         for (let j = 1; j < t.length; j++) {
           const c = t[j];
           if (SAFE_SHORT_NOVAL.has(c)) continue;
@@ -110,12 +109,10 @@ export const curlRule: CommandRule = {
               const verdict = checkHeaderValue(ctx, value);
               if (verdict) return verdict;
             }
-            handled = true;
             break; // 值吃掉剩餘字元，掃描即止
           }
           return ask(`curl：未列入安全集合的旗標 -${c}`);
         }
-        void handled;
         continue;
       }
 
