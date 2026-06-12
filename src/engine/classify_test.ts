@@ -6,6 +6,7 @@ import type { CwdState } from "../types.ts";
 import { parseBashRule } from "../permissions/matcher.ts";
 import type { PermissionRules } from "../permissions/settings.ts";
 import { EMPTY_READ_SCOPE, parsePathRule, type ReadScope } from "../permissions/path_scope.ts";
+import { EMPTY_DOMAIN_SCOPE } from "../permissions/domain_scope.ts";
 
 const ROOT = "/proj";
 const START: CwdState = { kind: "known", path: "/proj" };
@@ -15,6 +16,7 @@ function rulesOf(spec: { allow?: string[]; deny?: string[]; ask?: string[] }): P
   return {
     bash: { allow: conv(spec.allow), deny: conv(spec.deny), ask: conv(spec.ask) },
     readScope: { allow: EMPTY_READ_SCOPE, deny: EMPTY_READ_SCOPE, ask: EMPTY_READ_SCOPE },
+    webFetch: { allow: EMPTY_DOMAIN_SCOPE, deny: EMPTY_DOMAIN_SCOPE, ask: EMPTY_DOMAIN_SCOPE },
   };
 }
 
@@ -94,6 +96,7 @@ function rulesWithRead(readAllow: string[]): PermissionRules {
   return {
     bash: { allow: [], deny: [], ask: [] },
     readScope: { allow, deny: EMPTY_READ_SCOPE, ask: EMPTY_READ_SCOPE },
+    webFetch: { allow: EMPTY_DOMAIN_SCOPE, deny: EMPTY_DOMAIN_SCOPE, ask: EMPTY_DOMAIN_SCOPE },
   };
 }
 
@@ -124,6 +127,7 @@ Deno.test("external path under allow root but also denied -> ask (integration)",
       deny: { roots: ["/srv/pkg/secret"], files: [] },
       ask: EMPTY_READ_SCOPE,
     },
+    webFetch: { allow: EMPTY_DOMAIN_SCOPE, deny: EMPTY_DOMAIN_SCOPE, ask: EMPTY_DOMAIN_SCOPE },
   };
   assertEquals(onlyWith("grep needle /srv/pkg/secret/a", rules).kind, "ask");
 });
@@ -136,6 +140,7 @@ Deno.test("cwd under allow root but also ask-listed -> ask (integration)", () =>
       deny: EMPTY_READ_SCOPE,
       ask: { roots: ["/srv/pkg/secret"], files: [] },
     },
+    webFetch: { allow: EMPTY_DOMAIN_SCOPE, deny: EMPTY_DOMAIN_SCOPE, ask: EMPTY_DOMAIN_SCOPE },
   };
   const invs = walk(parseCommand("cd /srv/pkg/secret && cat a").script, START, ROOT);
   const cat = invs.find((i) => i.name === "cat")!;

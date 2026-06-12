@@ -2,6 +2,7 @@ import { assertEquals } from "@std/assert";
 import type { EnvReader } from "../project.ts";
 import { EMPTY_RULES, loadPermissionRules, type ReadText } from "./settings.ts";
 import { EMPTY_READ_SCOPE } from "./path_scope.ts";
+import { EMPTY_DOMAIN_SCOPE } from "./domain_scope.ts";
 
 const ROOT = "/proj";
 
@@ -20,6 +21,7 @@ const noHome = fakeEnv({});
 const EMPTY_NESTED = {
   bash: { allow: [], deny: [], ask: [] },
   readScope: { allow: EMPTY_READ_SCOPE, deny: EMPTY_READ_SCOPE, ask: EMPTY_READ_SCOPE },
+  webFetch: { allow: EMPTY_DOMAIN_SCOPE, deny: EMPTY_DOMAIN_SCOPE, ask: EMPTY_DOMAIN_SCOPE },
 };
 
 Deno.test("EMPTY_RULES is empty bash + empty readScope", () => {
@@ -201,4 +203,54 @@ Deno.test("missing/garbage file -> empty readScope (fail-safe)", () => {
   assertEquals(rules.readScope.allow, EMPTY_READ_SCOPE);
   assertEquals(rules.readScope.deny, EMPTY_READ_SCOPE);
   assertEquals(rules.readScope.ask, EMPTY_READ_SCOPE);
+});
+
+Deno.test("loadPermissionRules parses WebFetch domain rules", () => {
+  const content = JSON.stringify({
+    permissions: {
+      allow: ["WebFetch(domain:api.example.com)", "WebFetch(domain:*.cdn.example.com)"],
+      deny: ["WebFetch(domain:evil.example.com)"],
+      ask: ["WebFetch(domain:*)"],
+    },
+  });
+  const rules = loadPermissionRules(
+    noHome,
+    ROOT,
+    fakeReadText({ "/proj/.claude/settings.json": content }),
+  );
+  assertEquals(rules.webFetch.allow.exact.has("api.example.com"), true);
+  assertEquals(rules.webFetch.allow.suffixes, ["cdn.example.com"]);
+  assertEquals(rules.webFetch.deny.exact.has("evil.example.com"), true);
+  assertEquals(rules.webFetch.ask.all, true);
+});
+
+Deno.test("loadPermissionRules unions webFetch across sources", () => {
+  const rules = loadPermissionRules(
+    noHome,
+    ROOT,
+    fakeReadText({
+      "/proj/.claude/settings.json": JSON.stringify({
+        permissions: { allow: ["WebFetch(domain:a.example.com)"] },
+      }),
+      "/proj/.claude/settings.local.json": JSON.stringify({
+        permissions: { allow: ["WebFetch(domain:b.example.com)"] },
+      }),
+    }),
+  );
+  assertEquals(rules.webFetch.allow.exact.has("a.example.com"), true);
+  assertEquals(rules.webFetch.allow.exact.has("b.example.com"), true);
+});
+
+Deno.test("loadPermissionRules ignores unsupported WebFetch forms", () => {
+  const content = JSON.stringify({
+    permissions: { allow: ["WebFetch(domain:api-*.example.com)", "WebFetch(domain:x.com:8080)"] },
+  });
+  const rules = loadPermissionRules(
+    noHome,
+    ROOT,
+    fakeReadText({ "/proj/.claude/settings.json": content }),
+  );
+  assertEquals(rules.webFetch.allow.exact.size, 0);
+  assertEquals(rules.webFetch.allow.suffixes, []);
+  assertEquals(rules.webFetch.allow.all, false);
 });

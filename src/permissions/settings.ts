@@ -2,6 +2,13 @@ import type { EnvReader } from "../project.ts";
 import { normalizeAbsolute } from "../engine/scope.ts";
 import { type BashPattern, parseBashRule } from "./matcher.ts";
 import { EMPTY_READ_SCOPE, parsePathRule, type ReadScope } from "./path_scope.ts";
+import {
+  type DomainScope,
+  EMPTY_DOMAIN_SCOPE,
+  emptyDomainScope,
+  parseDomainRule,
+  type WebFetchRules,
+} from "./domain_scope.ts";
 
 /** Bash(...) 規則三分類（對齊 settings permissions 結構）。 */
 export interface BashRules {
@@ -20,11 +27,13 @@ export interface ReadScopeRules {
 export interface PermissionRules {
   bash: BashRules; // 原扁平的 { allow, deny, ask } 移入此層
   readScope: ReadScopeRules;
+  webFetch: WebFetchRules;
 }
 
 export const EMPTY_RULES: PermissionRules = {
   bash: { allow: [], deny: [], ask: [] },
   readScope: { allow: EMPTY_READ_SCOPE, deny: EMPTY_READ_SCOPE, ask: EMPTY_READ_SCOPE },
+  webFetch: { allow: EMPTY_DOMAIN_SCOPE, deny: EMPTY_DOMAIN_SCOPE, ask: EMPTY_DOMAIN_SCOPE },
 };
 
 /** 讀檔器：回傳檔案內容字串；不存在 / 無法讀 → null。注入以利測試。 */
@@ -46,6 +55,11 @@ function emptyRules(): PermissionRules {
       allow: { roots: [], files: [] },
       deny: { roots: [], files: [] },
       ask: { roots: [], files: [] },
+    },
+    webFetch: {
+      allow: emptyDomainScope(),
+      deny: emptyDomainScope(),
+      ask: emptyDomainScope(),
     },
   };
 }
@@ -79,6 +93,25 @@ function parsePathRuleList(value: unknown, home: string | null): ReadScope {
   return out;
 }
 
+function parseDomainRuleList(value: unknown): DomainScope {
+  const out = emptyDomainScope();
+  if (!Array.isArray(value)) return out;
+  for (const el of value) {
+    if (typeof el !== "string") continue;
+    let entry: ReturnType<typeof parseDomainRule>;
+    try {
+      entry = parseDomainRule(el);
+    } catch {
+      entry = null;
+    }
+    if (entry === null) continue;
+    if (entry.kind === "all") out.all = true;
+    else if (entry.kind === "exact") out.exact.add(entry.host);
+    else out.suffixes.push(entry.suffix);
+  }
+  return out;
+}
+
 function parseFile(content: string | null, home: string | null): PermissionRules {
   if (content === null) return emptyRules();
   let parsed: unknown;
@@ -101,6 +134,11 @@ function parseFile(content: string | null, home: string | null): PermissionRules
       allow: parsePathRuleList(p.allow, home),
       deny: parsePathRuleList(p.deny, home),
       ask: parsePathRuleList(p.ask, home),
+    },
+    webFetch: {
+      allow: parseDomainRuleList(p.allow),
+      deny: parseDomainRuleList(p.deny),
+      ask: parseDomainRuleList(p.ask),
     },
   };
 }
@@ -147,6 +185,11 @@ export function loadPermissionRules(
       for (const k of ["allow", "deny", "ask"] as const) {
         merged.readScope[k].roots.push(...rules.readScope[k].roots);
         merged.readScope[k].files.push(...rules.readScope[k].files);
+      }
+      for (const k of ["allow", "deny", "ask"] as const) {
+        for (const h of rules.webFetch[k].exact) merged.webFetch[k].exact.add(h);
+        merged.webFetch[k].suffixes.push(...rules.webFetch[k].suffixes);
+        if (rules.webFetch[k].all) merged.webFetch[k].all = true;
       }
     }
     return merged;

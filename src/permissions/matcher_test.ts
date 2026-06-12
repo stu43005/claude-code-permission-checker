@@ -5,6 +5,7 @@ import type { CwdState } from "../types.ts";
 import { matchesAny, matchesPattern, parseBashRule, reconstructCommand, settingsAllows } from "./matcher.ts";
 import type { PermissionRules } from "./settings.ts";
 import { EMPTY_READ_SCOPE } from "./path_scope.ts";
+import { EMPTY_DOMAIN_SCOPE } from "./domain_scope.ts";
 
 const ROOT = "/proj";
 const START: CwdState = { kind: "known", path: "/proj" };
@@ -113,6 +114,7 @@ function rulesOf(spec: { allow?: string[]; deny?: string[]; ask?: string[] }): P
   return {
     bash: { allow: conv(spec.allow), deny: conv(spec.deny), ask: conv(spec.ask) },
     readScope: { allow: EMPTY_READ_SCOPE, deny: EMPTY_READ_SCOPE, ask: EMPTY_READ_SCOPE },
+    webFetch: { allow: EMPTY_DOMAIN_SCOPE, deny: EMPTY_DOMAIN_SCOPE, ask: EMPTY_DOMAIN_SCOPE },
   };
 }
 
