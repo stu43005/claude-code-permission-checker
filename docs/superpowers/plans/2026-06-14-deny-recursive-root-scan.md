@@ -224,28 +224,24 @@ function scopeWith(
 }
 ```
 
-在 `src/engine/scope_test.ts` 頂部 import 區補（若尚無）：
+在 `src/engine/scope_test.ts` 頂部，把既有 `from "./scope.ts"`（line 4）那行補上 `dangerousRoot, isDangerousRootAbs`，並新增一行 import `CwdState`：
 
 ```ts
-import { parse } from "../deps.ts";
-import type { Command } from "../deps.ts";
-import type { Word } from "../deps.ts";
+import { dangerousRoot, isDangerousRootAbs, isReadScoped, isWithin, normalizeAbsolute, resolvePath, rootScope, type PathScope, type ScopeConfig } from "./scope.ts";
 import type { CwdState } from "../types.ts";
 ```
 
-並在既有 import `from "./scope.ts"` 補上 `dangerousRoot, isDangerousRootAbs`。
+> `parse`/`Command` 已於檔頭 import（line 2-3）；既有 helper `firstArg`（line 6-8，回傳 `Word`）**直接沿用、不要重新宣告**（重複宣告會編譯失敗）。`Word` 型別不需另外 import（`firstArg` 回傳值已是 `Word`，可直接傳入 `dangerousRoot`）。
 
-在檔案末尾追加測試（含取首個 suffix word 的 helper）：
+在檔案末尾追加 `KNOWN` 常數與測試（沿用既有 `firstArg`）：
 
 ```ts
-function firstArg(src: string): Word {
-  const cmd = parse(src).commands[0].command as Command;
-  return cmd.suffix[0];
-}
 const KNOWN: CwdState = { kind: "known", path: "/proj" };
 
 Deno.test("isDangerousRootAbs: 磁碟根 / 家目錄 / 子目錄", () => {
   assertEquals(isDangerousRootAbs("/", null), true);
+  assertEquals(isDangerousRootAbs("C:/", null), true); // 磁碟根偵測跨平台（正則 ^[A-Za-z]:/$）
+  assertEquals(isDangerousRootAbs("D:/", null), true);
   assertEquals(isDangerousRootAbs("/usr", null), false);
   assertEquals(isDangerousRootAbs("/home/me", "/home/me"), true);
   assertEquals(isDangerousRootAbs("/home/me/x", "/home/me"), false);
@@ -274,6 +270,26 @@ Deno.test("dangerousRoot: 靜態絕對等於 home（需 home）", () => {
 
 Deno.test("dangerousRoot: cwd 未知的相對路徑不可確認", () => {
   assertEquals(dangerousRoot(firstArg("find sub"), { kind: "unknown" }, null), false);
+});
+
+Deno.test("dangerousRoot: 磁碟根字面（跨平台）", () => {
+  assertEquals(dangerousRoot(firstArg("find C:/"), KNOWN, null), true);
+});
+
+Deno.test({
+  name: "dangerousRoot: $USERPROFILE 在 Windows 視為家目錄根",
+  ignore: Deno.build.os !== "windows",
+  fn() {
+    assertEquals(dangerousRoot(firstArg("find $USERPROFILE"), KNOWN, null), true);
+  },
+});
+
+Deno.test({
+  name: "dangerousRoot: $USERPROFILE 在非 Windows 不算家目錄根",
+  ignore: Deno.build.os === "windows",
+  fn() {
+    assertEquals(dangerousRoot(firstArg("find $USERPROFILE"), KNOWN, null), false);
+  },
 });
 ```
 
@@ -466,8 +482,14 @@ export function classify(
     deny: rules.readScope.deny,
     ask: rules.readScope.ask,
   };
-  // ...（其餘不變；Task 5 再加 isDangerousRoot 綁定，Task 6 再加 deny 短路）
+  const v = classifyBuiltin(inv, scope);
+  if (v.kind === "allow") return v;
+  if (settingsAllows(inv, rules)) return allow();
+  return v;
+}
 ```
+
+> 本步驟只改 `classify` 簽名與 `home`；`classifyBuiltin` 的 ctx 綁定 `isDangerousRoot` 在後續任務加入、deny 短路也在後續任務加入。此處 `classify` 主體與目前原始碼一致。
 
 `src/engine/evaluate.ts`：`evaluate` 簽名加 `home`，傳給 `classify`：
 
@@ -993,7 +1015,7 @@ git commit -m "feat(rules): deny grep -r / rg recursive root/home scan"
 **Files:**
 - Test: `src/main_test.ts`
 
-- [ ] **Step 1: 寫失敗測試**
+- [ ] **Step 1: 新增 e2e 整合測試**
 
 在 `src/main_test.ts` 末尾追加（沿用既有 `runHook` helper；其 `clearEnv: true` 不帶 HOME，但 `find /`、`find $HOME` 的 deny 不依賴 HOME 值）：
 
@@ -1022,14 +1044,24 @@ Deno.test("e2e: subdir of home -> not deny", async () => {
   const decision = JSON.parse(out).hookSpecificOutput.permissionDecision;
   assertEquals(decision !== "deny", true);
 });
+
+Deno.test("e2e: compound allow + recursive-root -> deny (最弱環節)", async () => {
+  const out = await runHook(
+    { tool_name: "Bash", tool_input: { command: "cat README.md && find / -name x" }, cwd: "/proj" },
+    "/proj",
+  );
+  assertEquals(JSON.parse(out).hookSpecificOutput.permissionDecision, "deny");
+});
 ```
 
-- [ ] **Step 2: 跑測試確認失敗（先確認新案例存在且通過或失敗）**
+> 複合指令 `cat README.md && find / -name x`：經真實 parse→walk→combine，`cat` 葉指令 allow、`find /` 葉指令 deny，`combine` 取 `deny`（驗證 deny 透過整條管線傳播，而非只在 `combine` 單元測試）。
+
+- [ ] **Step 2: 跑 e2e 確認通過（整合驗證，非 red-green）**
 
 Run: `deno test --allow-run --allow-env --allow-read src/main_test.ts`
-Expected: 三個新 e2e 案例 PASS（Task 5–9 完成後管線已支援 deny）。若任一 FAIL，回頭檢視對應指令規則。
+Expected: 四個新 e2e 案例 PASS（Task 5–9 完成後管線已支援 deny；本 Task 純整合驗證，故預期一次通過）。若任一 FAIL，回頭檢視對應指令規則。
 
-> 此 Task 為整合驗證，前置 Task 已實作 deny；e2e 主要確認 hook 輸出真的帶 `permissionDecision: "deny"`、exit 0。
+> 此 Task 為整合驗證，前置 Task 已實作 deny；e2e 主要確認 hook 輸出真的帶 `permissionDecision: "deny"`、exit 0、且 deny 透過複合指令的 combine 傳播。
 
 - [ ] **Step 3: 全套驗證**
 
@@ -1069,7 +1101,25 @@ git commit -m "test(e2e): assert hook returns deny for recursive root/home scan"
 
 3. 「架構（評估管線）」的 `combine.ts` 說明，把「任一 ask → 整體 ask」改為「任一 deny → 整體 deny；否則任一 ask → 整體 ask」。
 
-4. 「hook 決策 vs settings.json 權限的優先序」段落補一句：
+4. 「架構（評估管線）」的 `classify.ts` bullet（描述 `classify(inv, root, rules)` 升級層那句）末尾補：
+
+```
+此外，builtin 回 `deny`（遞迴遍歷磁碟根/家目錄根，由 `scope.ts` 的 `dangerousRoot`/`isDangerousRoot` 述詞偵測，接於 find/tree/ls -R/grep -r/rg 的遞迴閘門）時**先於升級層短路返回**，不經 `settingsAllows`，故 `permissions.allow` 無法解除此 deny。
+```
+
+5. 「架構（評估管線）」的 `scope.ts` bullet（`resolvePath`/`resolvePathValue` 三態那句）末尾補：
+
+```
+另提供 `isDangerousRootAbs`/`dangerousRoot` 危險根偵測（字面 `~`/`~/`、lone `$HOME`/`${HOME}`/`$HOME/`、Windows `$USERPROFILE`、靜態絕對等於磁碟根 `/`、`X:/` 或家目錄），供遞迴指令回 `deny`。
+```
+
+6. 「三條中央前置規則」段落：**不新增中央前置規則**（deny 為規則內判定 + `classify` 短路，非中央前置）。在該段標題下補一句明示此設計決策：
+
+```
+（註：對「遞迴遍歷磁碟根/家目錄根」的 `deny` 不是中央前置規則，而是各遞迴指令規則內以 `isDangerousRoot` 判定、再由 `classify` 對 `deny` 短路；故不在本三條之列。）
+```
+
+7. 「hook 決策 vs settings.json 權限的優先序」段落補一句：
 
 ```
 此外，本檢查器現會對「遞迴遍歷磁碟根/家目錄根的唯讀指令」主動回 `deny`（硬性、不可由 `permissions.allow` 解除）。此 deny 之 `permissionDecisionReason` 會回饋給 agent，故理由文字會解釋禁止原因與可行替代。
