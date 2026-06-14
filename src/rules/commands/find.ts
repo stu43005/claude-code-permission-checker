@@ -17,6 +17,7 @@ export const findRule: CommandRule = {
       if (t !== null && t.startsWith("-")) break;
       starts.push(w);
     }
+    // action flag 偵測優先：即使起始路徑為根，-delete/-exec 等先命中即回 ask（非 deny）
     // 偵測寫檔 / 執行 action
     for (const w of ctx.argv) {
       const t = staticValue(w);
