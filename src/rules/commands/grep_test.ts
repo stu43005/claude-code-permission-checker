@@ -63,3 +63,9 @@ Deno.test("grep 非遞迴碰根 -> 非 deny", () => {
   assertEquals(grepRule.evaluate(ctxOf("grep", "grep x /")).kind, "ask");
   assertEquals(grepRule.evaluate(ctxOf("rg", "rg foo ./src")).kind, "allow");
 });
+
+Deno.test("grep 危險根緊跟 -r（被吃值位置）仍 deny", () => {
+  assertEquals(grepRule.evaluate(ctxOf("grep", "grep foo -r /")).kind, "deny");
+  assertEquals(grepRule.evaluate(ctxOf("grep", "grep x -r ~")).kind, "deny");
+  assertEquals(grepRule.evaluate(ctxOf("grep", "grep foo -r $HOME")).kind, "deny");
+});

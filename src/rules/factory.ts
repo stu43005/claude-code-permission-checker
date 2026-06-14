@@ -66,11 +66,18 @@ export function flagGatedReader(opts: FlagGatedReaderOptions): CommandRule {
       }
       const pathFlagVerdict = checkPathValueFlags(ctx, opts.pathValueFlags ?? []);
       if (pathFlagVerdict) return pathFlagVerdict;
+      // 遞迴遍歷時，危險根可能藏在「被 value-flag 吃掉的 token」位置（例如 grep 的 -r 會把
+      // 其後的根路徑當值吞掉，使其不在 positionals 中），故掃描全部 argv token、不限 positionals，
+      // 避免漏判成 allow（誤放行）。非危險根的 flag/值 token（-r、數字等）自然回 false。
       const isRecursive = opts.recursive?.(ctx.name, ctx.argv) ?? false;
-      for (const arg of positionals(ctx.argv, valueFlags)) {
-        if (isRecursive && ctx.isDangerousRoot(arg)) {
-          return deny(recursiveRootDenyReason(ctx.name, arg.value));
+      if (isRecursive) {
+        for (const w of ctx.argv) {
+          if (ctx.isDangerousRoot(w)) {
+            return deny(recursiveRootDenyReason(ctx.name, w.value));
+          }
         }
+      }
+      for (const arg of positionals(ctx.argv, valueFlags)) {
         const scope = ctx.resolvePath(arg);
         if (scope !== "in-project") {
           return ask(`${ctx.name}：路徑超出專案範圍或無法靜態解析（${arg.value}）`);
