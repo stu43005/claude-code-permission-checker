@@ -45,6 +45,7 @@ export function classify(
   root: string,
   rules: PermissionRules = EMPTY_RULES,
   home: string | null = null,
+  trustedReadRoots: string[] = [],
 ): RuleVerdict {
   const scope: ScopeConfig = {
     root,
@@ -52,7 +53,7 @@ export function classify(
     allow: rules.readScope.allow,
     deny: rules.readScope.deny,
     ask: rules.readScope.ask,
-    trusted: [],
+    trusted: trustedReadRoots,
   };
   const v = classifyBuiltin(inv, scope);
   if (v.kind === "deny") return v; // 硬 deny：不經 settingsAllows 升級層

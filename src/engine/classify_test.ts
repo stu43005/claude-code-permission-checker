@@ -2,6 +2,7 @@ import { assertEquals } from "@std/assert";
 import { parseCommand } from "./parse.ts";
 import { walk } from "./walk.ts";
 import { classify } from "./classify.ts";
+import { evaluate } from "./evaluate.ts";
 import type { CwdState } from "../types.ts";
 import { parseBashRule } from "../permissions/matcher.ts";
 import type { PermissionRules } from "../permissions/settings.ts";
@@ -145,4 +146,56 @@ Deno.test("cwd under allow root but also ask-listed -> ask (integration)", () =>
 Deno.test("classify: deny 不被 permissions.allow 升級", () => {
   const rules = rulesOf({ allow: ["Bash(find *)"] });
   assertEquals(onlyWith("find /", rules).kind, "deny");
+});
+
+const CLAUDE_TRUSTED = "/home/me/.claude/projects/-proj/115826ef-e830-461f-8101-edac56694d2b";
+const TMP_TRUSTED = "/tmp/claude-501/-proj/115826ef-e830-461f-8101-edac56694d2b";
+
+function withTrusted(src: string, trusted: string[], rules?: PermissionRules) {
+  const invs = walk(parseCommand(src).script, START, ROOT);
+  return classify(invs[0], ROOT, rules ?? rulesOf({}), "/home/me", trusted);
+}
+
+Deno.test("trusted ~/.claude 子路徑唯讀指令 → allow", () => {
+  assertEquals(withTrusted(`cat ${CLAUDE_TRUSTED}/tool-results/x.txt`, [CLAUDE_TRUSTED]).kind, "allow");
+});
+
+Deno.test("trusted /tmp 子路徑唯讀指令 → allow", () => {
+  assertEquals(withTrusted(`cat ${TMP_TRUSTED}/tasks/x.output`, [CLAUDE_TRUSTED, TMP_TRUSTED]).kind, "allow");
+});
+
+Deno.test("同專案 memory、他 session、本 session transcript 檔皆不在 trusted → ask", () => {
+  assertEquals(withTrusted("cat /home/me/.claude/projects/-proj/memory/x.md", [CLAUDE_TRUSTED]).kind, "ask");
+  assertEquals(withTrusted("cat /home/me/.claude/projects/-proj/other-sid/tool-results/x", [CLAUDE_TRUSTED]).kind, "ask");
+  // transcript .jsonl 位於 session 子目錄的兄弟位置，不在 trusted 根之下
+  assertEquals(withTrusted(`cat ${CLAUDE_TRUSTED}.jsonl`, [CLAUDE_TRUSTED]).kind, "ask");
+});
+
+Deno.test("trusted 下但命中 user Read() deny、且無 Bash allow → ask", () => {
+  const rules: PermissionRules = {
+    bash: { allow: [], deny: [], ask: [] },
+    readScope: {
+      allow: EMPTY_READ_SCOPE,
+      deny: { roots: [CLAUDE_TRUSTED], files: [] },
+      ask: EMPTY_READ_SCOPE,
+    },
+  };
+  assertEquals(withTrusted(`cat ${CLAUDE_TRUSTED}/tool-results/x.txt`, [CLAUDE_TRUSTED], rules).kind, "ask");
+});
+
+Deno.test("未傳 trustedReadRoots（預設 []）→ 同外部路徑 ask", () => {
+  const invs = walk(parseCommand(`cat ${CLAUDE_TRUSTED}/tool-results/x.txt`).script, START, ROOT);
+  assertEquals(classify(invs[0], ROOT).kind, "ask");
+});
+
+Deno.test("evaluate 把 trustedReadRoots 轉傳給 classify → allow", () => {
+  const out = evaluate(
+    `cat ${CLAUDE_TRUSTED}/tool-results/x.txt`,
+    ROOT,
+    START,
+    rulesOf({}),
+    "/home/me",
+    [CLAUDE_TRUSTED],
+  );
+  assertEquals(out.verdict, "allow");
 });
