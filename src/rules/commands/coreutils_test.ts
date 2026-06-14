@@ -63,3 +63,15 @@ Deno.test("diff out-of-project positional asks", () => {
 Deno.test("diff in-project files allows", () => {
   assertEquals(diffRule.evaluate(ctxOf("diff a.txt b.txt")).kind, "allow");
 });
+
+Deno.test("ls -R 遞迴遍歷根/家目錄 -> deny", () => {
+  assertEquals(fileReaderRule.evaluate(ctxOf("ls -R ~")).kind, "deny");
+  assertEquals(fileReaderRule.evaluate(ctxOf("ls -R /")).kind, "deny");
+  assertEquals(fileReaderRule.evaluate(ctxOf("ls --recursive $HOME")).kind, "deny");
+});
+
+Deno.test("ls 非遞迴碰根 / cat 碰根 -> 非 deny", () => {
+  assertEquals(fileReaderRule.evaluate(ctxOf("ls -l ~")).kind, "allow");
+  assertEquals(fileReaderRule.evaluate(ctxOf("cat /")).kind, "ask");
+  assertEquals(fileReaderRule.evaluate(ctxOf("ls -R ./sub")).kind, "allow");
+});
