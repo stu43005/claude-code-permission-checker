@@ -21,6 +21,7 @@ export const treeRule: CommandRule = flagGatedReader({
   askFlags: [exact("-o"), prefix("-o")],
   valueFlags: [exact("-o", "-L", "-P", "-I")],
   askReason: () => "tree：-o 會把輸出寫入檔案",
+  recursive: () => true,
 });
 
 export const fileCmdRule: CommandRule = flagGatedReader({

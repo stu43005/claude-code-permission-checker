@@ -56,3 +56,14 @@ Deno.test("date allows, asks on -s", () => {
 Deno.test("sort out-of-project file asks", () => {
   assertEquals(v(sortRule, "sort", "sort /etc/passwd"), "ask");
 });
+
+Deno.test("tree 遞迴遍歷根/家目錄 -> deny", () => {
+  assertEquals(treeRule.evaluate(ctxOf("tree", "tree /")).kind, "deny");
+  assertEquals(treeRule.evaluate(ctxOf("tree", "tree ~")).kind, "deny");
+  assertEquals(treeRule.evaluate(ctxOf("tree", "tree $HOME")).kind, "deny");
+});
+
+Deno.test("tree 專案內子目錄 -> allow；-o 寫檔 -> ask", () => {
+  assertEquals(treeRule.evaluate(ctxOf("tree", "tree ./sub")).kind, "allow");
+  assertEquals(treeRule.evaluate(ctxOf("tree", "tree -o out.txt")).kind, "ask");
+});

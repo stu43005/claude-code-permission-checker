@@ -1,8 +1,9 @@
 import type { CommandRule, RuleContext, RuleVerdict } from "./types.ts";
-import { allow, ask } from "./types.ts";
+import { allow, ask, deny, recursiveRootDenyReason } from "./types.ts";
 import { type FlagMatcher, hasAnyFlag, positionals } from "./flags.ts";
 import { type PathScope } from "../engine/scope.ts";
 import { staticValue } from "../engine/word.ts";
+import type { Word } from "../deps.ts";
 
 export interface FlagGatedReaderOptions {
   names: string[];
@@ -14,6 +15,8 @@ export interface FlagGatedReaderOptions {
   pathValueFlags?: string[];
   /** ask 時的說明（含指令名）。 */
   askReason?: (name: string) => string;
+  /** 回 true 表示此次呼叫會遞迴遍歷；遍歷根命中危險根時 deny。 */
+  recursive?: (name: string, argv: Word[]) => boolean;
 }
 
 /**
@@ -63,7 +66,11 @@ export function flagGatedReader(opts: FlagGatedReaderOptions): CommandRule {
       }
       const pathFlagVerdict = checkPathValueFlags(ctx, opts.pathValueFlags ?? []);
       if (pathFlagVerdict) return pathFlagVerdict;
+      const isRecursive = opts.recursive?.(ctx.name, ctx.argv) ?? false;
       for (const arg of positionals(ctx.argv, valueFlags)) {
+        if (isRecursive && ctx.isDangerousRoot(arg)) {
+          return deny(recursiveRootDenyReason(ctx.name, arg.value));
+        }
         const scope = ctx.resolvePath(arg);
         if (scope !== "in-project") {
           return ask(`${ctx.name}：路徑超出專案範圍或無法靜態解析（${arg.value}）`);
