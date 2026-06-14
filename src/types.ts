@@ -1,6 +1,6 @@
 import type { AssignmentPrefix, Redirect, Word } from "./deps.ts";
 
-export type Verdict = "allow" | "ask";
+export type Verdict = "allow" | "ask" | "deny";
 
 /** 指令執行時的有效工作目錄狀態。 */
 export type CwdState =

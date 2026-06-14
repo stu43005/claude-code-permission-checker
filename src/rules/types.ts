@@ -17,7 +17,8 @@ export interface RuleContext {
 
 export type RuleVerdict =
   | { kind: "allow" }
-  | { kind: "ask"; reason: string };
+  | { kind: "ask"; reason: string }
+  | { kind: "deny"; reason: string };
 
 export interface CommandRule {
   /** 此規則涵蓋的指令名（含別名）。 */
@@ -28,3 +29,11 @@ export interface CommandRule {
 /** 便利建構子。 */
 export const allow = (): RuleVerdict => ({ kind: "allow" });
 export const ask = (reason: string): RuleVerdict => ({ kind: "ask", reason });
+export const deny = (reason: string): RuleVerdict => ({ kind: "deny", reason });
+
+/** 產生「遞迴遍歷磁碟根/家目錄根」的 deny 理由（會回饋給 agent，故須解釋原因 + 替代）。 */
+export function recursiveRootDenyReason(name: string, target: string): string {
+  return `已禁止：${name} 會遞迴遍歷磁碟根或家目錄根（${target}）。` +
+    `此操作會掃描跨專案、跨使用者的大量檔案，屬資料外洩 / 偵察的高風險行為。` +
+    `請改為指定專案內的具體子目錄（例如 ./src），而非 / 或 ~。`;
+}
