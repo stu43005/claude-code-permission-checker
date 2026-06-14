@@ -5,6 +5,7 @@ export interface HookInput {
   tool_input?: { command?: string };
   cwd?: string;
   session_id?: string;
+  transcript_path?: string;
 }
 
 export interface HookOutput {
