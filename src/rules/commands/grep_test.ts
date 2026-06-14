@@ -49,3 +49,17 @@ Deno.test("grep --file= out-of-project asks", () => {
 Deno.test("grep -f in-project pattern file allows", () => {
   assertEquals(grepRule.evaluate(ctxOf("grep", "grep -f patterns.txt readme.md")).kind, "allow");
 });
+
+Deno.test("grep -r / rg 遞迴遍歷根/家目錄 -> deny", () => {
+  assertEquals(grepRule.evaluate(ctxOf("grep", "grep -r x /")).kind, "deny");
+  assertEquals(grepRule.evaluate(ctxOf("grep", "grep -R x ~")).kind, "deny");
+  assertEquals(grepRule.evaluate(ctxOf("grep", "grep --recursive x $HOME")).kind, "deny");
+  assertEquals(grepRule.evaluate(ctxOf("grep", "grep -rn x /")).kind, "deny");
+  assertEquals(grepRule.evaluate(ctxOf("rg", "rg x ~")).kind, "deny");
+});
+
+Deno.test("grep 非遞迴碰根 -> 非 deny", () => {
+  assertEquals(grepRule.evaluate(ctxOf("grep", "grep / file")).kind, "ask");
+  assertEquals(grepRule.evaluate(ctxOf("grep", "grep x /")).kind, "ask");
+  assertEquals(grepRule.evaluate(ctxOf("rg", "rg foo ./src")).kind, "allow");
+});
