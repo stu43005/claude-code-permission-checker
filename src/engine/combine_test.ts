@@ -16,3 +16,22 @@ Deno.test("any ask -> ask with first ask reason", () => {
 Deno.test("empty -> allow (no-op)", () => {
   assertEquals(combine([]).verdict, "allow");
 });
+
+Deno.test("combine: 任一 deny -> deny，取首個 deny 理由", () => {
+  assertEquals(
+    combine([
+      { kind: "allow" },
+      { kind: "deny", reason: "d1" },
+      { kind: "ask", reason: "a1" },
+      { kind: "deny", reason: "d2" },
+    ]),
+    { verdict: "deny", reason: "d1" },
+  );
+});
+
+Deno.test("combine: 無 deny 時 ask 蓋過 allow", () => {
+  assertEquals(
+    combine([{ kind: "allow" }, { kind: "ask", reason: "a1" }]).verdict,
+    "ask",
+  );
+});
