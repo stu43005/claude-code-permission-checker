@@ -46,6 +46,7 @@ export function classify(
 ): RuleVerdict {
   const scope: ScopeConfig = {
     root,
+    home: null,
     allow: rules.readScope.allow,
     deny: rules.readScope.deny,
     ask: rules.readScope.ask,
