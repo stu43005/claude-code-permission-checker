@@ -12,143 +12,152 @@
 
 ### 1.1 痛點
 
-Claude Code 在工具輸出過大時，會把完整輸出寫進檔案，路徑形如：
+Claude Code 把「過大的工具/指令輸出」寫到兩處專案根外的目錄，agent 後續常需用 `cat`/`grep` 等
+唯讀指令讀回，但目前一律被判 `ask`，造成每次都要人工確認的摩擦：
 
-```
-~/.claude/projects/<encoded-project-path>/<session-id>/tool-results/<id>.txt
-```
+1. **工具輸出**：`~/.claude/projects/<encoded>/<session-id>/tool-results/<id>.txt`。同一專案目錄
+   `~/.claude/projects/<encoded>/` 下還有各 session 的 transcript（`<session-id>.jsonl`）與 `memory/`。
+2. **背景任務輸出**：`/tmp/claude-<uid>/<encoded>/<session-id>/tasks/<id>.output`（macOS 上 `/tmp` 為
+   `/private/tmp` 的 symlink）。
 
-agent 後續常需要用 `cat`/`grep` 等唯讀指令讀回這些輸出檔。但該目錄位於**使用者家目錄下、專案根外**，
-故目前 `isReadScoped` 判為 out-of-project → 唯讀指令被判 `ask`，每次讀工具輸出都要人工確認，造成摩擦。
+本功能**刻意**把「當前專案」在這兩處的目錄視為延伸唯讀工作區（範圍見 §2.1），允許落在其下的純唯讀
+指令路徑被讀。`<encoded>` 兩處用同一套編碼（§1.2.6）。
 
-同一專案目錄 `~/.claude/projects/<encoded>/` 下還有**歷史 session 的 tool-results、各 session 的 transcript
-（`<session-id>.jsonl`）、`memory/`** 等，皆為當前專案的工作衍生物。本功能**刻意**把整個
-`~/.claude/projects/<encoded>/` 視為當前專案的延伸唯讀工作區（理由見 §2.1 G1），而非僅限當前 session 的
-`tool-results/`。
+### 1.2 已查證的 Claude Code 事實
 
-### 1.2 已查證的 Claude Code 事實（官方文件）
-
-來源：<https://code.claude.com/docs/en/hooks>（信心度：高）。
+來源：官方文件 <https://code.claude.com/docs/en/hooks>（信心度：高）＋本機實證逆向（信心度：中，POSIX/macOS）。
 
 1. **`transcript_path` 是所有 hook 事件共通的必有輸入欄位**（Common Input Fields），於 stdin JSON 提供。
-2. 其值為**絕對路徑**，指向當前 session 的對話檔，格式 `~/.claude/projects/<encoded>/<session-id>.jsonl`，
-   **副檔名為 `.jsonl`**，**檔名（去副檔名）即等於 `session_id` 欄位值**。此「`basename(transcript_path)` ==
-   `<session_id>.jsonl`」之對應關係用於 §4.1 的 session 綁定檢查。
+2. 其值為**絕對路徑**，格式 `~/.claude/projects/<encoded>/<session-id>.jsonl`，**副檔名 `.jsonl`**，
+   **檔名（去副檔名）即等於 `session_id` 欄位值**（用於 §4.1 G5(a)）。
 3. PreToolUse top-level 欄位含：`session_id`、`transcript_path`、`cwd`、`permission_mode`、
-   `hook_event_name`、`effort`、`tool_name`、`tool_input`，以及 subagent 情境下的 `agent_id`/`agent_type`。
+   `hook_event_name`、`effort`、`tool_name`、`tool_input`，subagent 情境另含 `agent_id`/`agent_type`。
 4. 文件未記載 `transcript_path` 會缺失的情況；跨互動式/headless/排程/subagent 皆存在。
-   （注意：subagent 等情境下若 `basename(transcript_path)` 與 `session_id` 不一致，本功能將 fail-safe
-   不放寬——見 §4.1、§6.2，安全方向。）
-5. **`~/.claude/projects/` 是文件化、穩定的存放根**；其下 `<encoded>` 段的編碼方式**官方未公開**。
-   本設計**不解碼** `<encoded>` 段；僅把「推導出的目錄是否落在 `~/.claude/projects/` 之下」當作安全閘
-   （見 §4.1）——耦合的只有穩定的 `~/.claude/projects/` 前綴，不耦合易變的編碼規則。
+5. **`~/.claude/projects/` 是文件化、穩定的存放根**。
+6. **`<encoded>` 段編碼規則官方未公開**；經本機對 8 個真實目錄逆向實證（含 worktree 的 `.claude`→`--claude`）：
+   把專案絕對路徑中**所有非 `[A-Za-z0-9]` 字元逐一換成 `-`、大小寫保留**（例：`/Users/me/Sources/foo-bar`
+   → `-Users-me-Sources-foo-bar`）。基準為**專案路徑**，正常運作等於 `CLAUDE_PROJECT_DIR`（`encode(CLAUDE_PROJECT_DIR)`
+   實測等於實際 encoded 目錄、亦等於當前 session transcript 與 `/tmp/claude-<uid>` 下的 encoded 段）。
+   此編碼**僅用作 fail-safe 綁定**：猜錯/Claude 改版/Windows 寫法不符 → 不匹配 → **不放寬**（退回 `ask`），
+   **絕不誤放行**。實作須再以 research/實證複核（尤其 Windows、含空白/非 ASCII 路徑），但因 fail-safe，
+   複核落差只影響「是否放寬」、不影響安全。
+7. **背景任務輸出 base 為 `/tmp/claude-<uid>`**（macOS 實證；`/tmp`→`/private/tmp` symlink，指令可能用任一形式；
+   `<uid>` 為數值 user id，實測等於 `id -u`，程式以 `Deno.uid()` 取得）。其下結構
+   `claude-<uid>/<encoded>/<session-id>/tasks/...`，與 §1.2.6 同一 `<encoded>`。**此 base 非 `$TMPDIR`**
+   （macOS `$TMPDIR` 為 `/var/folders/...`，與此無關），且**官方未文件化**；本功能同樣以 fail-safe 方式重建
+   （見 §4.1）：base 猜錯/平台不符 → 不匹配 → 不放寬。
 
 ### 1.3 本功能要改的事
 
-把「當前專案的 Claude Code 工具輸出目錄」（`dirname(transcript_path)`，且經 §4.1 雙重安全閘驗證確實是
-當前 session 對應、位於 `<home>/.claude/projects/<encoded>/` 的目錄）納入 `isReadScoped` 的 allow 區域，
-使落在其下的**純唯讀指令路徑**被視為可讀。**只放寬「讀取位置」**，不放寬任何寫入/執行偵測；且此放寬來源
-與「使用者 permission 規則」在型別上分離。
+把「當前專案的 Claude Code 工具輸出目錄」（§1.1 兩處）納入 `isReadScoped` 的 allow 區域，使落在其下的
+**純唯讀指令路徑**被視為可讀。**只放寬「讀取位置」**，不放寬任何寫入/執行偵測；且此放寬來源與「使用者
+permission 規則」在型別上分離。
 
 ## 2. 目標與非目標
 
 ### 2.1 目標
 
-- G1：當前專案的 `~/.claude/projects/<encoded>/` 目錄（含其下 `tool-results/`、各 session 的 transcript
-  `.jsonl`、`memory/` 等**任意深度**子路徑）被視為唯讀可讀；落在其下的 allowlist 唯讀指令路徑判為 in-project。
-  **這是一個刻意的權限擴張**：範圍涵蓋同一專案的**歷史 session 與 memory**，不限當前 session 的 tool-results。
-  理由：(a) 這些全是「當前專案」自身的 Claude 衍生物、皆為使用者本機自有資料；(b) agent 常需跨 session 回看
-  舊輸出/transcript/記憶；(c) 仍受 §2.1 G3/G5 與所有寫入偵測約束、且只放寬唯讀。跨「專案」邊界不放寬（N1）。
+- G1：當前專案於 `~/.claude/projects/<encoded>/` 目錄（含其下 `tool-results/`、各 session 的 transcript
+  `.jsonl`、`memory/` 等**任意深度**子路徑）被視為唯讀可讀。**這是刻意的權限擴張**：涵蓋同一專案的
+  **歷史 session 與 memory**，理由：(a) 皆為「當前專案」自身的 Claude 衍生物、使用者本機自有資料；
+  (b) agent 常需跨 session 回看；(c) 仍受 G3/G5/G6 與所有寫入偵測約束、且只放寬唯讀。跨「專案」不放寬（N1）。
 - G2：放寬來源（hook 自身推導的目錄）與使用者 `rules.readScope` **在資料結構上徹底分離**；`rules` 全程不被 mutate。
 - G3：**trusted 放寬永不覆寫使用者的 Read `deny`/`ask`**。trusted 與 user-allow 同屬 `isReadScoped` 最低的
-  「放寬」層，故 `deny`/`ask` 命中時 `isReadScoped` 一律先回 `false`：被 deny/ask 命中的 trusted 子路徑
-  **被排除於放寬之外**，其判定結果與「未啟用本功能」時**完全相同**（見 §6.1 對既有 Bash-allow 升級層的釐清）。
-- G4：跨平台正確（推導不依賴猜測 `<encoded>` 編碼），且對缺失/不合法輸入 fail-safe 退回現況（`ask`）。
-- G5：**雙重安全閘**（皆 fail-closed，任一不過 → 不放寬）：
-  - **(a) session 綁定**：`basename(normalizeAbsolute(transcript_path))` 必須等於 `<session_id>.jsonl`
-    （`session_id` 為 hook 輸入欄位）。`session_id` 缺失/空白、或不相等 → 不放寬。此檢查把目錄綁回**當前
-    session**（進而當前專案），**不需解碼** `<encoded>`，封住「陳舊/竄改/不匹配的 transcript_path 指向他處」。
-  - **(b) 位置前綴**：推導目錄須**嚴格位於 `<home>/.claude/projects/` 之下且其下至少一個非空段**
-    （即 `<home>/.claude/projects/<encoded>`）。`home` 無法解析、或目錄等於 `~/.claude/projects/` 本身/
-    家目錄/磁碟根/任意較廣父目錄 → 不放寬。
+  「放寬」層，`deny`/`ask` 命中時先回 `false`，結果與「未啟用本功能」時完全相同（見 §6.1）。
+- G4：fail-safe——對缺失/不合法輸入、或任一安全閘不符，一律退回現況（`ask`），絕不誤放行（誤 ask 可接受）。
+- G5：**`~/.claude/projects` 來源的三道 fail-closed 安全閘**（任一不過 → 不放寬此來源，回 `null`）：
+  - **(a) session 綁定**：`basename(normalizeAbsolute(transcript_path))` 必須等於 `<session_id>.jsonl`。
+  - **(b) 位置綁定**：`dir = dirname(...)` 嚴格位於 `<home>/.claude/projects/` 之下且至少一個非空段；`home` 無解 → 不放寬。
+  - **(c) 專案綁定**：`basename(dir)` 必須等於 `encode(root)`（封「自洽但錯專案」的 `<other>/<同一 session_id>.jsonl`）。
+  - (b)+(c) 等價於要求 `dir === normalizeAbsolute(<home>/.claude/projects/encode(root))`（§4.1 以此單一等式表達）。
+- G6：**`/tmp/claude-<uid>` 來源的 task 輸出根**：以 `Deno.uid()` 之 uid + `encode(root)` **重建**
+  `<base>/claude-<uid>/encode(root)`，`base ∈ {/tmp, 並於 macOS 另加 /private/tmp}`，涵蓋當前專案所有 session。
+  此根由 `encode(root)` **建構**（非信任輸入），**天生綁定當前專案**；`uid` 取不到（Windows/權限）→ 不產生此根。
 
 ### 2.2 非目標
 
-- N1：**不放行其他專案**的 `~/.claude/projects/*`。本功能只放行「**當前 session 的** transcript dirname」。
-  跨專案隔離由 G5(a) session 綁定 + G5(b) 位置前綴**雙重 fail-closed** 保障：唯有 `transcript_path` 之 basename
-  與當前 `session_id` 相符、且其 dirname 在 `~/.claude/projects/` 下時才放寬。**殘留信任假設**（明示）：本設計
-  信任「Claude Code 送來的 `transcript_path`/`session_id` 屬於當前 session」——此與既有信任 `cwd`/`tool_input`
-  為同一信任層級；不另以「對 `root` 重新編碼比對」做綁定（那需解碼 `<encoded>`，已於 N4 排除）。
+- N1：**不放行其他專案**。兩來源皆綁定當前 `root`：`~/.claude` 來源由 G5 三閘 fail-closed；`/tmp` 來源由
+  `encode(root)` 建構而天生只指當前專案。**殘留風險（明示）**：
+
+  - (i) **編碼碰撞**：§1.2.6 編碼非單射（`/a/b` 與 `/a-b` 皆 → `-a-b`）。理論上路徑碰撞之他專案可能通過綁定；
+    極窄複合條件、列為已知殘留。
+  - (ii) **平台信任假設**：仍信任「Claude 送來的 `transcript_path`/`session_id`/`CLAUDE_PROJECT_DIR`/`Deno.uid()`
+    屬於當前 session/專案/使用者」——與既有信任 `cwd`/`tool_input` 同一信任層級。
+
 - N2：不放寬任何寫入型重導向、賦值前綴、非唯讀指令偵測（與既有不變量一致）。
 - N3：不改動「遞迴遍歷磁碟根/家目錄根 → deny」之硬性不變量。
-- N4：不**解碼** `<encoded>` 段、不由 `home`+編碼重建目錄。`home`/`session_id` 僅用於 G5 安全閘，**不**參與目錄推導。
-- N5：不對 `transcript_path` 指向的檔案做存在性 I/O 檢查（純詞法推導，與 `scope.ts` 不碰 FS 的設計一致）。
-- N6：**不修改既有的 `settingsAllows` 升級層行為**（`Bash(...)` allow 把 `ask` 升級為 `allow` 的既有語意）。
-  本功能不擴張、也不收窄該層；見 §6.1。
+- N4：**目錄推導/重建只用**：`~/.claude` 來源用 `transcript_path` 的 dirname；`/tmp` 來源用 `uid`+`encode(root)`。
+  `session_id`/`home`/`root`+`encode` 僅作 G5/G6 綁定，`encode(root)` 僅作 fail-safe 比對，不用來在推導路徑上
+  依賴猜測編碼產生「可獨立成立」的結果（`/tmp` 來源的 `encode` 同樣只指當前 root、且其值錯只會 fail-safe 不匹配）。
+- N5：不對推導出的目錄/檔案做存在性 I/O 檢查（純詞法，與 `scope.ts` 不碰 FS 的設計一致）。
+- N6：**不修改既有的 `settingsAllows` 升級層行為**（`Bash(...)` allow 把 `ask` 升級為 `allow`）；見 §6.1。
 
 ## 3. 方案選擇
 
-評估三種注入點方案（詳見決策紀錄），採**方案 1**：
+注入點採**方案 1**：在 `ScopeConfig` 新增獨立欄位 `trusted: string[]`，由 `main.ts` 組裝後以**獨立參數**
+穿過 `evaluate`/`classify`，於 `isReadScoped` 的 allow 層比對。使用者規則與工具推導目錄型別分離。
+（方案 2「併進 readScope.allow 複本」、方案 3「當 always-allowed root」分別因混淆來源、與 G3 衝突而否決。）
 
-- **方案 1（採用）**：在 `ScopeConfig` 新增獨立欄位 `trusted: string[]`，由 `main.ts` 推導後以**獨立參數**
-  穿過 `evaluate`/`classify`，於 `isReadScoped` 的 allow 層比對。語義最清晰，使用者規則與工具推導目錄型別分離。
-- 方案 2（否決）：在 classify 邊界把目錄併進 `readScope.allow` 的複本。雖不 mutate 原物件，但把兩種來源
-  在資料上混為一談，reason/debug 難區分來源，違背「不插入該列表」的精神。
-- 方案 3（否決）：當成與專案根同級的 always-allowed root（root-first、不可 deny 覆蓋）。與 G3 衝突。
-
-推導來源採**僅用 `transcript_path` 的 dirname**（不由 `home`+編碼重建目錄，避免猜測 Claude Code 編碼規則）；
-`session_id` 與 `home` 僅作為 G5 雙重安全閘的比對基準。缺欄位/驗證不過時不放寬（退回 `ask`）。
+`trusted` 由兩來源組成（皆綁定當前 `root`）：`~/.claude/projects/<encode(root)>`（transcript 推導 + G5 三閘）
+與 `/tmp/claude-<uid>/<encode(root)>`（uid+encode 重建，macOS 另含 `/private/tmp` 變體）。任一來源失敗/不符
+僅該來源不貢獻根，另一來源不受影響；皆無 → `trusted = []` → 行為等同現況（`ask`）。
 
 ## 4. 詳細設計
 
 ### 4.1 新模組 `src/claude_dir.ts`（純函式、不碰 FS、不丟例外）
 
 ```ts
-import { isAbsolute, isWithin, normalizeAbsolute, toPosix } from "./engine/scope.ts";
+import { isAbsolute, normalizeAbsolute, toPosix } from "./engine/scope.ts";
 
-/** 已正規化絕對 POSIX 路徑的 basename / dirname。 */
 function posixBasename(absPosix: string): string;
 function posixDirname(absPosix: string): string | null;  // 頂層 "/x" → "/"；無分隔符 → null
 
-/**
- * 由 hook 傳入的 transcript_path 推導「當前專案的 Claude Code 工具輸出目錄」
- * （~/.claude/projects/<encoded>/）。只取 dirname、不解碼 <encoded>。
- * 雙重 fail-closed 安全閘（G5）：
- *   (a) session 綁定：basename(transcript) 必須等於 `${sessionId}.jsonl`。
- *   (b) 位置前綴：dir 須嚴格位於 <home>/.claude/projects/ 之下且其下至少一個非空段。
- * 任一前置不成立（home/sessionId 缺失、transcript 非絕對/非 .jsonl、任一閘不過）→ null。
- * 回傳已 normalizeAbsolute 的絕對 POSIX 目錄。
- */
+/** 專案路徑編碼（§1.2.6）：非 [A-Za-z0-9] 一律換 '-'、大小寫保留。 */
+export function encodeProjectPath(path: string): string;  // toPosix(path).replace(/[^A-Za-z0-9]/g, "-")
+
+/** ~/.claude/projects 來源：三道 fail-closed 安全閘（G5）全過才回目錄，否則 null。 */
 export function claudeProjectOutputDir(
   transcriptPath: string | undefined,
   sessionId: string | undefined,
+  root: string,
   home: string | null,
 ): string | null;
+
+/** /tmp/claude-<uid> 來源（G6）：以 uid + encode(root) 重建 task 輸出根；uid===null → []。 */
+export function claudeTaskOutputRoots(
+  root: string,
+  uid: number | null,
+  includePrivateTmp: boolean,  // main.ts 傳 Deno.build.os === "darwin"
+): string[];
 ```
 
-行為規格（依序，任一步失敗即回 `null`）：
+`claudeProjectOutputDir` 行為（依序，任一失敗回 `null`）：
 
-1. `home === null` → `null`（無從套用 G5(b)）。
-2. `sessionId` 為 `undefined`/空白 → `null`（無從套用 G5(a)）。
+1. `home === null` → `null`。
+2. `sessionId` 為 `undefined`/空白 → `null`。
 3. `transcriptPath` 為 `undefined`/空白 → `null`。
-4. `t = trim(transcriptPath)`；非絕對路徑（`isAbsolute`，含 POSIX `/`、Windows `X:/`、UNC `//`）→ `null`。
+4. `t = trim(transcriptPath)`；非絕對路徑（`isAbsolute`）→ `null`。
 5. `toPosix(t).toLowerCase()` 不以 `.jsonl` 結尾 → `null`。
-6. `abs = normalizeAbsolute(t)`。**G5(a) session 綁定**：若 `posixBasename(abs)` 不等於 `trim(sessionId) + ".jsonl"` → `null`。
+6. `abs = normalizeAbsolute(t)`。**G5(a)**：若 `posixBasename(abs)` 不等於 `trim(sessionId) + ".jsonl"` → `null`。
 7. `dir = posixDirname(abs)`；`dir === null` → `null`。
-8. **G5(b) 位置前綴**：`projectsRoot = normalizeAbsolute(<home>/.claude/projects)`；
-   要求 `isWithin(projectsRoot, dir) === true` **且** `dir !== projectsRoot` → 否則 `null`。
+8. **G5(b)+(c)**：`expected = normalizeAbsolute(<home>/.claude/projects/ + encodeProjectPath(normalizeAbsolute(root)))`；
+   若 `dir !== expected` → `null`。
 9. 回傳 `dir`。
 
-說明：正常情況 `abs = <home>/.claude/projects/<encoded>/<session_id>.jsonl`，basename 命中 session 綁定、
-`dir = <home>/.claude/projects/<encoded>` 恰低 projectsRoot 一段、通過兩閘。攻擊/異常如
-`/Users/alice/.ssh/<session_id>.jsonl`（過 (a) 但 dir 不在 projects 下 → (b) 拒）、
-`~/.claude/projects/<other>/<不同 id>.jsonl`（(a) 拒，封跨專案/陳舊）、
-`~/.claude/projects/<session_id>.jsonl`（dir == projectsRoot → (b) 拒）皆被擋下。
+`claudeTaskOutputRoots` 行為：
+
+1. `uid === null` → `[]`（Windows / `Deno.uid()` 不可用）。
+2. `enc = encodeProjectPath(normalizeAbsolute(root))`。
+3. `bases = includePrivateTmp ? ["/tmp", "/private/tmp"] : ["/tmp"]`。
+4. 回傳 `bases.map((b) => normalizeAbsolute(b + "/claude-" + uid + "/" + enc))`（macOS 兩根、Linux 一根）。
+
+異常案例（皆 fail-safe）：`~/.ssh/<id>.jsonl`、`<other>/<同一 id>.jsonl`、`projects/<id>.jsonl`（少一段）皆
+不過 G5；uid 取不到或 base 平台不符 → `/tmp` 來源無根。
 
 ### 4.2 `engine/scope.ts`
 
-- `ScopeConfig` 介面新增欄位：`trusted: string[]`（正規化絕對 POSIX 目錄根清單）。
-- `rootScope(root)` helper 補 `trusted: []`（向後相容既有測試與不需此功能的呼叫端）。
+- `ScopeConfig` 介面新增欄位 `trusted: string[]`（正規化絕對 POSIX 目錄根清單）。
+- `rootScope(root)` helper 補 `trusted: []`（向後相容）。
 - `isReadScoped(absPosix, scope)` 在現有 `allow` 比對「之後」新增 trusted 比對：
 
   ```
@@ -160,46 +169,45 @@ export function claudeProjectOutputDir(
   return false;
   ```
 
-  優先序維持 `deny > ask > allow`；trusted 與 user-allow 同屬最低的「放寬」層，故 deny/ask 必定先否決（G3）。
+  優先序維持 `deny > ask > allow`；trusted 與 user-allow 同屬最低「放寬」層，deny/ask 必先否決（G3）。
 
 ### 4.3 穿線：`evaluate` / `classify`（新增獨立參數，`rules` 不變）
 
 - `classify(inv, root, rules = EMPTY_RULES, home = null, trustedReadRoots: string[] = [])`：
   組 `ScopeConfig` 時 `trusted: trustedReadRoots`，其餘不變。
 - `evaluate(command, root, initialCwd, rules = EMPTY_RULES, home = null, trustedReadRoots: string[] = [])`：
-  原樣轉傳 `trustedReadRoots` 給每次 `classify` 呼叫。
-- `combine` 不受影響。
-- 兩個新參數皆有預設 `[]`，既有呼叫端（測試）無需改動。
+  原樣轉傳 `trustedReadRoots`。
+- `combine` 不受影響。兩個新參數皆有預設 `[]`，既有呼叫端無需改動。
 
-### 4.4 `hook/types.ts` 與 `main.ts`
+### 4.4 `hook/types.ts`、`main.ts` 與 build 權限
 
 - `HookInput` 介面新增 `transcript_path?: string`（`session_id?` 既有）。
-- `main.ts` 在計算 `decision` 前（`home` 已由既有 `homeDir(Deno.env)` 取得）：
+- `main.ts`（`root`、`home` 既有）組裝 `trustedReadRoots`，`rules` 完全不被 mutate：
 
   ```ts
-  const claudeDir = claudeProjectOutputDir(input.transcript_path, input.session_id, home);
-  const trustedReadRoots = claudeDir === null ? [] : [claudeDir];
-  decision = evaluate(command, root, initialCwd(input.cwd, root), rules, home, trustedReadRoots);
+  const trusted: string[] = [];
+  const cdir = claudeProjectOutputDir(input.transcript_path, input.session_id, root, home);
+  if (cdir !== null) trusted.push(cdir);
+  let uid: number | null = null;
+  try { uid = Deno.uid(); } catch { uid = null; }  // 權限/平台失敗 → null → 不產生 /tmp 根
+  trusted.push(...claudeTaskOutputRoots(root, uid, Deno.build.os === "darwin"));
+  decision = evaluate(command, root, initialCwd(input.cwd, root), rules, home, trusted);
   ```
 
-  `rules`（`loadPermissionRules` 之結果）**完全不被 mutate**。
+- **build/test 權限**：`deno.json` 的 `build` 與 `test` task 需新增 `--allow-sys=uid`（`Deno.uid()` 所需）。
+  `Deno.uid()` 已包 try/catch，未授權亦 fail-safe 回 null（僅失去 `/tmp` 來源、不影響安全與 `~/.claude` 來源）。
 
 ## 5. 資料流
 
-```
-stdin JSON ──parseHookInput──▶ HookInput{ transcript_path?, session_id? }
-                                   │           home = homeDir(env)
-        claudeProjectOutputDir(transcript_path, session_id, home) ──▶ string|null
-                                   │ (G5(a) session 綁定 + G5(b) 位置前綴；filter null)
+```text
+stdin JSON ─▶ HookInput{ transcript_path?, session_id? }   root = CLAUDE_PROJECT_DIR；home = homeDir(env)；uid = Deno.uid()|null
+   ┌─ claudeProjectOutputDir(transcript_path, session_id, root, home) ─▶ string|null   (G5 三閘)
+   └─ claudeTaskOutputRoots(root, uid, os==='darwin')               ─▶ string[]        (G6 重建)
+                                   │ 合併、filter null
                                    ▼
 main.ts: trustedReadRoots: string[]
-                                   │
-        evaluate(…, rules, home, trustedReadRoots)
-                                   │
-        classify(…, rules, home, trustedReadRoots)
-                                   │
+        evaluate(…, rules, home, trustedReadRoots) → classify(…, trustedReadRoots)
         ScopeConfig{ root, home, allow, deny, ask, trusted: trustedReadRoots }
-                                   │
         isReadScoped ── allow 層比對 trusted ──▶ in-project / out-of-project
 ```
 
@@ -211,78 +219,70 @@ main.ts: trustedReadRoots: string[]
 ### 6.1 與既有 Bash-allow 升級層（`settingsAllows`）的關係（重要釐清）
 
 `classify` 在 builtin 判 `ask` 時，會呼叫 `settingsAllows` 嘗試以 `permissions.allow` 的 `Bash(...)` 規則
-升級為 `allow`（既有行為，見 `matcher.ts`）。`settingsAllows` **只比對 `Bash(...)` pattern、不讀 `readScope`**。
-因此一個被使用者 `Read(...)` **deny** 的路徑，其指令在 builtin 判 `ask` 後，**仍可能**被一條匹配的
-`Bash(cmd:*)` allow 規則升級為 `allow`。
+升級為 `allow`（既有行為）。`settingsAllows` **只比對 `Bash(...)` pattern、不讀 `readScope`**。因此被使用者
+`Read(...)` **deny** 的路徑，其指令在 builtin 判 `ask` 後**仍可能**被匹配的 `Bash(cmd:*)` allow 升級。
 
-此性質**與本功能無關、為既有行為**，且本功能**不改變任何被 deny 路徑的判定結果**：
-
-- 對「被 Read deny/ask 命中」的 trusted 子路徑：`isReadScoped` 因 deny/ask 先回 `false` → out-of-project → `ask`，
-  接著是否被 `Bash(...)` allow 升級，**與未啟用 trusted 時完全相同**。trusted 在此情境下不參與、不放行（G3）。
-- 換言之，trusted 只在「**未**被任何 deny/ask 命中」時才把路徑視為 in-project；它**從不**把已被 deny 的路徑改回 allow。
-
-故 G3 的保證精確表述為：**trusted 不覆寫 Read deny/ask**（不是「Read deny 能硬擋一切 Bash 升級」——後者是
-既有 `settingsAllows` 的獨立議題，屬 N6 範圍、不在本功能變更內）。要對某 trusted 子路徑「硬擋」，使用者
-仍須一併在 `Bash(...)` 層 deny（與既有所有外部路徑一致）。
+此性質**與本功能無關、為既有行為**，本功能**不改變任何被 deny 路徑的判定結果**：對被 deny/ask 命中的
+trusted 子路徑，`isReadScoped` 先回 `false` → `ask`，後續是否被 Bash-allow 升級，與未啟用 trusted 時完全相同。
+故 G3 精確表述為：**trusted 不覆寫 Read deny/ask**（「Read deny 硬擋一切 Bash 升級」是既有 `settingsAllows`
+的獨立議題，屬 N6、不在本功能變更內）。要硬擋某 trusted 子路徑，使用者仍須一併在 `Bash(...)` 層 deny。
 
 ### 6.2 Fail-safe 與其他不變量
 
-- **Fail-safe**：`claudeProjectOutputDir` 純字串運算、不丟例外；任何不合法輸入或未過雙重安全閘 → `null`
-  → `trustedReadRoots = []` → `isReadScoped` 行為等同現況（該外部路徑判 `ask`）。subagent/resume 等情境若
-  session 綁定不符亦走此 fail-safe（安全方向，至多失去便利、絕不誤放行）。最外層 `evaluate`/`main` 的
-  try/catch 與 `exit 0` 不變。
+- **Fail-safe**：`claude_dir.ts` 兩函式純字串運算、不丟例外；`Deno.uid()` 於 `main.ts` 包 try/catch。任何
+  不合法輸入、安全閘不過、uid 取不到、編碼/ base 逆向落差（含 Windows/特殊字元）→ 該來源不貢獻根 → 至多
+  `trusted = []` → 行為等同現況（`ask`）。最外層 try/catch 與 `exit 0` 不變。
 - **只放寬讀取位置**：寫入型重導向／賦值前綴／非唯讀指令偵測完全不動。
-- **deny 硬性不變量**：trusted 目錄是 home 的子目錄（且嚴格在 `~/.claude/projects/` 下），永不等於磁碟根/home 根，
-  故 `dangerousRoot` 不會對它成立；對 trusted 目錄的遞迴掃描（如 `grep -r <dir>`）走一般唯讀放行、不觸發 deny
-  （與現有 `find ~/.claude` 不 deny 一致）。`classify` 對 builtin `deny` 的短路、不經升級層之邏輯不變。
-- **跨專案隔離（N1）**：見 §2.2 N1（G5 雙重 fail-closed）。
+- **deny 硬性不變量**：trusted 目錄皆為深層子目錄（`~/.claude/projects/<enc>`、`/tmp/claude-<uid>/<enc>`），
+  永不等於磁碟根/home 根，`dangerousRoot` 不對它成立；對其遞迴掃描走一般唯讀放行、不觸發 deny。`classify`
+  對 builtin `deny` 的短路邏輯不變。
+- **跨專案隔離（N1）**：兩來源皆綁定當前 `root`；已知殘留見 §2.2 N1。
 
 ## 7. 測試計畫
 
 - `src/claude_dir_test.ts`（新）：
-  - 合法：絕對 `.jsonl`、basename == `<session_id>.jsonl`、位於 `<home>/.claude/projects/<encoded>/` → 回 dirname。
-  - 大小寫：`.JSONL` 結尾亦接受（以 `toLowerCase` 比對副檔名）。
-  - 前後空白：transcript 與 sessionId 皆 `trim`。
-  - **G5(a) 負向**：basename 與 `session_id` 不符（不同 id）→ `null`；`session_id` 缺失/空白 → `null`。
-  - **G5(b) 負向**：`<home>/.ssh/<id>.jsonl`（過 (a) 但不在 projects 下）→ `null`；
-    `<home>/.claude/projects/<id>.jsonl`（dir == projectsRoot）→ `null`。
-  - 非 `.jsonl`、相對路徑、空字串、`undefined` transcript → `null`；`home === null` → `null`。
-  - 平台相關斷言以 `Deno.build.os` 區分（Windows `X:/` 寫法另測）。
-- `src/engine/scope_test.ts`（增補）：
-  - `isReadScoped`：trusted root 下路徑回 true；trusted 與 user-allow 並存皆放行。
-  - deny/ask 命中時即使在 trusted 下仍回 false（優先序；對應 G3）。
-  - 專案根內路徑不受 trusted 影響仍 root-first true；`rootScope` 之 `trusted` 為 `[]`。
+  - `encodeProjectPath`：`/Users/me/Sources/foo-bar` → `-Users-me-Sources-foo-bar`；點/空白/worktree（`.claude`→`--claude`）。
+  - `claudeProjectOutputDir` 合法：絕對 `.jsonl`、basename == `<session_id>.jsonl`、`dir == <home>/.claude/projects/encode(root)` → 回 dir。
+  - 大小寫 `.JSONL`；前後空白（transcript、sessionId）皆 `trim`。
+  - **G5(a) 負向**：basename 與 `session_id` 不符 → `null`；`session_id` 缺失/空白 → `null`。
+  - **G5(c) 負向（自洽錯專案）**：`<home>/.claude/projects/<other>/<同一 id>.jsonl`（`<other>` ≠ `encode(root)`）→ `null`。
+  - **G5(b) 負向**：`<home>/.ssh/<id>.jsonl` → `null`；`<home>/.claude/projects/<id>.jsonl`（少一段）→ `null`。
+  - 非 `.jsonl`、相對、空、`undefined` → `null`；`home === null` → `null`。
+  - `claudeTaskOutputRoots`：`uid===null` → `[]`；`includePrivateTmp=true` → `["/tmp/claude-<uid>/<enc>","/private/tmp/claude-<uid>/<enc>"]`；
+    `false` → 單一 `/tmp` 根；根的 basename == `encode(root)`（專案綁定）。
+  - 平台斷言以 `Deno.build.os` 區分（Windows `X:/`、Windows uid/編碼可能 fail-safe-disable，明示）。
+- `src/engine/scope_test.ts`（增補）：trusted root 下回 true；trusted 與 user-allow 並存皆放行；
+  deny/ask 命中時即使在 trusted 下仍 false（G3）；專案根內仍 root-first；`rootScope` 之 `trusted` 為 `[]`。
 - `src/engine/classify_test.ts`（增補）：
-  - 傳入 `trustedReadRoots`，`cat <trusted 下檔案>` → allow。
-  - **G1 刻意擴張回歸**：讀 trusted 下**他 session** 子路徑（`<dir>/<old-session>/tool-results/x`）與 `memory/`
-    檔 → allow（證明歷史 session/memory 為刻意涵蓋）。
-  - **G3 回歸**：trusted 下但命中 user `Read(...)` deny 的路徑、且**無**對應 `Bash(...)` allow → ask。
-  - 未傳 `trustedReadRoots`（預設 `[]`）→ 同路徑 ask（回歸）。
-- `src/main_test.ts`（增補 e2e 子行程；子行程環境須提供 `HOME` 才能過 G5(b)；payload 須含 `session_id`）：
-  - payload 帶合法 `transcript_path`（`$HOME/.claude/projects/<encoded>/<session_id>.jsonl`）+ 對應 `session_id`、
-    讀其 dirname 下 `tool-results` 檔 → allow。
-  - 同指令但不帶 `transcript_path` → ask。
-  - payload 的 `transcript_path` basename 與 `session_id` 不符 → ask（G5(a) 負向）。
-  - `transcript_path` 在 `~/.claude/projects/` 外（如 `$HOME/.ssh/<id>.jsonl`）→ ask（G5(b) 負向）。
+  - 傳入 `trustedReadRoots`，`cat <trusted 下檔案>` → allow（涵蓋 `~/.claude` 與 `/tmp` 兩種根各一）。
+  - **G1 刻意擴張回歸**：讀 `~/.claude` trusted 下他 session 子路徑與 `memory/` 檔 → allow。
+  - **G3 回歸**：trusted 下但命中 user `Read(...)` deny、且無對應 `Bash(...)` allow → ask。
+  - 未傳 `trustedReadRoots`（預設 `[]`）→ 同路徑 ask。
+- `src/main_test.ts`（增補 e2e；子行程須提供 `HOME`、`CLAUDE_PROJECT_DIR`；payload 含 `session_id`；驗 `/tmp`
+  根需 binary 有 `--allow-sys=uid`，否則該案標記為 macOS/權限相依）：
+  - payload 帶合法 `transcript_path` + 相符 `session_id`，讀 `~/.claude` 工具輸出檔 → allow；不帶 → ask；
+    basename 與 `session_id` 不符 → ask（G5(a)）；encoded 段 ≠ `encode(root)` → ask（G5(c)）；在 projects 外 → ask（G5(b)）。
+  - 讀 `/tmp/claude-<uid>/<encode(root)>/<session>/tasks/<id>.output` → allow；讀別專案 `<other>` 下同類路徑 → ask。
 - 既有 341 測試與 `deny` 相關 e2e 全數維持綠燈。
 
 ## 8. Operational verification（實作後必做）
 
-`deno task build` 後餵真實 JSON 給 binary（環境須含 `HOME`/`USERPROFILE` 以過 G5(b)；payload 含 `session_id`），
-至少驗證：
+`deno task build` 後餵真實 JSON 給 binary（環境含 `HOME`/`USERPROFILE`、`CLAUDE_PROJECT_DIR`；payload 含 `session_id`）：
 
-1. 帶合法 `transcript_path` + 相符 `session_id`（在 `~/.claude/projects/<encoded>/`）讀工具輸出檔 → `allow`、`exit 0`。
-2. 不帶 `transcript_path` 同路徑 → `ask`。
-3. `transcript_path` basename 與 `session_id` 不符（指向別專案 `<other>` 目錄）→ `ask`（跨專案/陳舊隔離）。
-4. `transcript_path` 指向 `~/.claude/projects/` 外（如 `~/.ssh/<id>.jsonl`）→ `ask`（位置前綴閘）。
-5. trusted 目錄外、且未被任何 `Read()` allow 宣告的家目錄路徑 → 仍 `ask`（未過度放寬）。
+1. 帶合法 `transcript_path`（`~/.claude/projects/<encode(root)>/<session_id>.jsonl`）讀工具輸出檔 → `allow`、`exit 0`。
+2. 讀 `/private/tmp/claude-<uid>/<encode(root)>/<session>/tasks/<id>.output` 與 `/tmp/...` 兩形式 → `allow`。
+3. `transcript_path` 指向別專案 `<other>` 但 `session_id` 自洽 → `ask`（G5(c)）；讀別專案 `/tmp/.../<other>/...` → `ask`。
+4. `transcript_path` basename 與 `session_id` 不符 → `ask`（G5(a)）；指向 `~/.claude/projects/` 外 → `ask`（G5(b)）。
+5. 不帶 `transcript_path` 且非 `/tmp` 來源的家目錄路徑、未被任何 `Read()` allow 宣告 → 仍 `ask`。
 
 ## 9. 變更檔案清單
 
 - 新增：`src/claude_dir.ts`、`src/claude_dir_test.ts`。
 - 修改：`src/engine/scope.ts`（`ScopeConfig.trusted`、`rootScope`、`isReadScoped`）、
   `src/engine/classify.ts`（新參數 + 組 scope）、`src/engine/evaluate.ts`（新參數轉傳）、
-  `src/hook/types.ts`（`transcript_path?`）、`src/main.ts`（推導並傳入，含 `session_id`、`home`）。
+  `src/hook/types.ts`（`transcript_path?`）、`src/main.ts`（組裝兩來源 trusted、`Deno.uid()` try/catch）、
+  `deno.json`（`build`/`test` task 加 `--allow-sys=uid`）。
 - 測試增補：`src/engine/scope_test.ts`、`src/engine/classify_test.ts`、`src/main_test.ts`。
-- 文件：`CLAUDE.md` 補一節說明此放寬來源、雙重安全閘（session 綁定 + 位置前綴）、刻意的歷史 session/memory
-  擴張、優先序（含 §6.1 與既有 Bash-allow 升級層的關係）與「不混入使用者規則」之設計。
+- 文件：`CLAUDE.md` 補一節說明兩個放寬來源、三道安全閘（session/位置/專案綁定）與 `/tmp` 重建（uid+encode）、
+  逆向編碼/base 為 fail-safe、刻意的歷史 session/memory 擴張、優先序（含 §6.1）、已知殘留（編碼碰撞、平台信任假設）、
+  `--allow-sys=uid` 權限與「不混入使用者規則」之設計。
