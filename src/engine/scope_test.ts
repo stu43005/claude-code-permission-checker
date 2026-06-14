@@ -1,7 +1,8 @@
 import { assertEquals } from "@std/assert";
 import { parse } from "../deps.ts";
 import type { Command } from "../deps.ts";
-import { isReadScoped, isWithin, normalizeAbsolute, resolvePath, rootScope, type PathScope, type ScopeConfig } from "./scope.ts";
+import { dangerousRoot, isDangerousRootAbs, isReadScoped, isWithin, normalizeAbsolute, resolvePath, rootScope, type PathScope, type ScopeConfig } from "./scope.ts";
+import type { CwdState } from "../types.ts";
 
 function firstArg(src: string) {
   return (parse(src).commands[0].command as Command).suffix[0];
@@ -117,6 +118,7 @@ function scopeWith(
 ): ScopeConfig {
   return {
     root: "/proj",
+    home: null,
     allow: { roots: allowRoots, files: allowFiles },
     deny: { roots: denyRoots, files: [] },
     ask: { roots: askRoots, files: [] },
@@ -151,4 +153,60 @@ Deno.test("isReadScoped: allow file exact match only (no recurse)", () => {
   const s = scopeWith([], [], [], ["/srv/f.txt"]);
   assertEquals(isReadScoped("/srv/f.txt", s), true);
   assertEquals(isReadScoped("/srv/f.txt/child", s), false);
+});
+
+const KNOWN: CwdState = { kind: "known", path: "/proj" };
+
+Deno.test("isDangerousRootAbs: 磁碟根 / 家目錄 / 子目錄", () => {
+  assertEquals(isDangerousRootAbs("/", null), true);
+  assertEquals(isDangerousRootAbs("C:/", null), true);
+  assertEquals(isDangerousRootAbs("D:/", null), true);
+  assertEquals(isDangerousRootAbs("/usr", null), false);
+  assertEquals(isDangerousRootAbs("/home/me", "/home/me"), true);
+  assertEquals(isDangerousRootAbs("/home/me/x", "/home/me"), false);
+});
+
+Deno.test("dangerousRoot: tilde 與磁碟根", () => {
+  assertEquals(dangerousRoot(firstArg("find ~"), KNOWN, null), true);
+  assertEquals(dangerousRoot(firstArg("find /"), KNOWN, null), true);
+  assertEquals(dangerousRoot(firstArg("find ~/.claude"), KNOWN, null), false);
+  assertEquals(dangerousRoot(firstArg("find ."), KNOWN, null), false);
+});
+
+Deno.test("dangerousRoot: $HOME 各形式", () => {
+  assertEquals(dangerousRoot(firstArg("find $HOME"), KNOWN, null), true);
+  assertEquals(dangerousRoot(firstArg("find ${HOME}"), KNOWN, null), true);
+  assertEquals(dangerousRoot(firstArg("find $HOME/"), KNOWN, null), true);
+  assertEquals(dangerousRoot(firstArg("find $HOME/foo"), KNOWN, null), false);
+  assertEquals(dangerousRoot(firstArg("find $HOMER"), KNOWN, null), false);
+  assertEquals(dangerousRoot(firstArg("find ${HOME:-/tmp}"), KNOWN, null), false);
+});
+
+Deno.test("dangerousRoot: 靜態絕對等於 home（需 home）", () => {
+  assertEquals(dangerousRoot(firstArg("find /home/me"), KNOWN, "/home/me"), true);
+  assertEquals(dangerousRoot(firstArg("find /home/me"), KNOWN, null), false);
+});
+
+Deno.test("dangerousRoot: cwd 未知的相對路徑不可確認", () => {
+  assertEquals(dangerousRoot(firstArg("find sub"), { kind: "unknown" }, null), false);
+});
+
+Deno.test("dangerousRoot: 磁碟根字面（跨平台）", () => {
+  assertEquals(dangerousRoot(firstArg("find C:/"), KNOWN, null), true);
+});
+
+Deno.test({
+  name: "dangerousRoot: $USERPROFILE 在 Windows 視為家目錄根",
+  ignore: Deno.build.os !== "windows",
+  fn() {
+    assertEquals(dangerousRoot(firstArg("find $USERPROFILE"), KNOWN, null), true);
+  },
+});
+
+Deno.test({
+  name: "dangerousRoot: $USERPROFILE 在非 Windows 不算家目錄根",
+  ignore: Deno.build.os === "windows",
+  fn() {
+    assertEquals(dangerousRoot(firstArg("find $USERPROFILE"), KNOWN, null), false);
+  },
 });
