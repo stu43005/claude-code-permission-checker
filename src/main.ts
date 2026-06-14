@@ -1,15 +1,15 @@
 import { parseHookInput, readStdin, renderDecision } from "./hook/io.ts";
 import { resolveProjectRoot } from "./project.ts";
+import type { EnvReader } from "./project.ts";
 import { evaluate } from "./engine/evaluate.ts";
 import { normalizeAbsolute } from "./engine/scope.ts";
-import { loadPermissionRules } from "./permissions/settings.ts";
+import { loadPermissionRules, resolveHome } from "./permissions/settings.ts";
 import type { CwdState, Decision } from "./types.ts";
 
-/** 讀取家目錄絕對路徑（HOME 優先、否則 USERPROFILE）；未設定回 null。 */
-export function homeDir(env: { get(key: string): string | undefined }): string | null {
-  const h = env.get("HOME") ?? env.get("USERPROFILE");
-  if (!h || h.trim() === "") return null;
-  return normalizeAbsolute(h.trim());
+/** 家目錄絕對路徑（平台感知，重用 settings 的 resolveHome）；未設定回 null。 */
+export function homeDir(env: EnvReader): string | null {
+  const h = resolveHome(env);
+  return h === null ? null : normalizeAbsolute(h);
 }
 
 function initialCwd(cwd: string | undefined, root: string): CwdState {

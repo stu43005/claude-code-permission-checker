@@ -106,7 +106,7 @@ function parseFile(content: string | null, home: string | null): PermissionRules
 }
 
 /** 依平台解析家目錄；皆無 → null。 */
-function resolveHome(env: EnvReader): string | null {
+export function resolveHome(env: EnvReader): string | null {
   const isWindows = Deno.build.os === "windows";
   const primary = isWindows ? env.get("USERPROFILE") : env.get("HOME");
   const fallback = isWindows ? env.get("HOME") : env.get("USERPROFILE");
