@@ -95,3 +95,36 @@ Deno.test("homeDir: HOME 未設時退回 USERPROFILE", () => {
 Deno.test("homeDir: 皆未設 -> null", () => {
   assertEquals(homeDir({ get: () => undefined }), null);
 });
+
+Deno.test("e2e: recursive root scan -> deny", async () => {
+  const out = await runHook(
+    { tool_name: "Bash", tool_input: { command: "find / -type d -name x" }, cwd: "/proj" },
+    "/proj",
+  );
+  assertEquals(JSON.parse(out).hookSpecificOutput.permissionDecision, "deny");
+});
+
+Deno.test("e2e: lone $HOME recursive scan -> deny", async () => {
+  const out = await runHook(
+    { tool_name: "Bash", tool_input: { command: "find $HOME -name x" }, cwd: "/proj" },
+    "/proj",
+  );
+  assertEquals(JSON.parse(out).hookSpecificOutput.permissionDecision, "deny");
+});
+
+Deno.test("e2e: subdir of home -> not deny", async () => {
+  const out = await runHook(
+    { tool_name: "Bash", tool_input: { command: "find ~/.claude -name x" }, cwd: "/proj" },
+    "/proj",
+  );
+  const decision = JSON.parse(out).hookSpecificOutput.permissionDecision;
+  assertEquals(decision !== "deny", true);
+});
+
+Deno.test("e2e: compound allow + recursive-root -> deny (最弱環節)", async () => {
+  const out = await runHook(
+    { tool_name: "Bash", tool_input: { command: "cat README.md && find / -name x" }, cwd: "/proj" },
+    "/proj",
+  );
+  assertEquals(JSON.parse(out).hookSpecificOutput.permissionDecision, "deny");
+});
