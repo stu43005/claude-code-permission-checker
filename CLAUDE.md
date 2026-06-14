@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## 這是什麼
 
 一個 Claude Code `PreToolUse`（matcher: `Bash`）hook：用 Deno 寫、`deno compile` 成單一執行檔。
-解析 Bash 指令，只在「純唯讀且全部落在當前專案內」時回 `allow`，其餘回 `ask`。**僅對「遞迴遍歷磁碟根/家目錄根的唯讀指令」回 `deny`（硬性、不可由 permissions.allow 解除）；其餘維持 allow / ask，永不主動 `deny`。**
+解析 Bash 指令，只在「純唯讀且全部落在當前專案內」時回 `allow`，其餘回 `ask`。**僅對「遞迴遍歷磁碟根/家目錄根的唯讀指令」回 `deny`（硬性、不可由 `permissions.allow` 解除）；其餘（一切非遞迴根掃描）一律維持 `allow` / `ask`、不回 `deny`。**
 從 stdin 收 hook JSON、往 stdout 寫 decision JSON、**永遠 `exit 0`**。
 
 此外，會在 runtime 讀取使用者的 `permissions.allow`：原本會 `ask`、但已被使用者在 settings.json 明確放行
@@ -60,7 +60,7 @@ parse.ts (unbash)  →  walk.ts  →  classify.ts (每指令)  →  combine.ts (
   allowlist → ask；**三條中央前置規則**（見下）→ ask；最後跑該指令的 `CommandRule.evaluate`）；外層
   `classify(inv, root, rules)` 在 builtin 判 `ask` 時，呼叫 `settingsAllows` 嘗試以 `permissions.allow`
   升級為 `allow`（命中 allow 且未被 deny/ask 命中才升級；builtin 已判 `allow` 者原樣返回，不受 rules 影響）。
-  此外，builtin 回 `deny`（遞迴遍歷磁碟根/家目錄根，由 `scope.ts` 的 `dangerousRoot`/`isDangerousRoot` 述詞偵測，接於 find/tree/ls -R/grep -r/rg 的遞迴閘門）時**先於升級層短路返回**，不經 `settingsAllows`，故 `permissions.allow` 無法解除此 deny。
+  此外，builtin 回 `deny`（遞迴遍歷磁碟根/家目錄根，由 `scope.ts` 的 `dangerousRoot` 偵測、經 `RuleContext.isDangerousRoot` 提供給規則，接於 find/tree/ls -R/grep -r/rg 的遞迴閘門）時**先於升級層短路返回**，不經 `settingsAllows`，故 `permissions.allow` 無法解除此 deny。
 - **`scope.ts`** 純詞法路徑解析（不碰檔案系統）。`resolvePath`/`resolvePathValue` 回三態
   `in-project` / `out-of-project` / `dynamic`，後兩者 → ask。
   另提供 `isDangerousRootAbs`/`dangerousRoot` 危險根偵測（字面 `~`/`~/`、lone `$HOME`/`${HOME}`/`$HOME/`、Windows `$USERPROFILE`、靜態絕對等於磁碟根 `/`、`X:/` 或家目錄），供遞迴指令回 `deny`。
@@ -87,7 +87,7 @@ parse.ts (unbash)  →  walk.ts  →  classify.ts (每指令)  →  combine.ts (
 
 - **default-deny**：未明確判定為安全唯讀的一律 ask。新增指令規則時，未涵蓋的形式必須 fallback 到 ask。
 - **deny 僅限「遞迴遍歷恰好等於磁碟根/家目錄根的唯讀指令」**（find/tree/ls -R/grep -r/rg）；其餘維持「永不 `deny`」。verdict 三態優先序 `deny > ask > allow`。**永遠 `exit 0`**；任何例外都 try/catch 成 ask（fail-safe）。
-- deny 為硬性：`classify` 對 builtin `deny` 短路，**不經** `permissions.allow` 升級層（升級層只把 `ask` 變 `allow`，永遠碰不到 `deny`）。deny 漏判（遞迴/根偵測未覆蓋、home env 缺失）只退回 `ask`，絕不誤放行。
+- **deny 為硬性**：`classify` 對 builtin `deny` 短路，**不經** `permissions.allow` 升級層（升級層只把 `ask` 變 `allow`，永遠碰不到 `deny`）。deny 漏判（遞迴/根偵測未覆蓋、home env 缺失）只退回 `ask`，絕不誤放行。
 - **新增/修改規則 = 改 `rules/commands/*.ts` → 在 `allowlist.ts` 註冊 → `deno task build`**。
   hook 每次 Bash 呼叫都重新執行那顆 `.exe`，故 rebuild 後**下一個指令即生效，不需重啟**（重啟只在改
   `~/.claude/settings.json` 時才需要）。
