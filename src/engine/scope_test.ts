@@ -168,6 +168,7 @@ Deno.test("isDangerousRootAbs: 磁碟根 / 家目錄 / 子目錄", () => {
 
 Deno.test("dangerousRoot: tilde 與磁碟根", () => {
   assertEquals(dangerousRoot(firstArg("find ~"), KNOWN, null), true);
+  assertEquals(dangerousRoot(firstArg("find ~/"), KNOWN, null), true);
   assertEquals(dangerousRoot(firstArg("find /"), KNOWN, null), true);
   assertEquals(dangerousRoot(firstArg("find ~/.claude"), KNOWN, null), false);
   assertEquals(dangerousRoot(firstArg("find ."), KNOWN, null), false);

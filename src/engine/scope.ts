@@ -130,8 +130,6 @@ export function resolvePath(arg: Word, cwd: CwdState, scope: ScopeConfig): PathS
   return resolvePathValue(staticValue(arg), cwd, scope);
 }
 
-const HOME_VAR_NAMES = IS_WINDOWS ? ["HOME", "USERPROFILE"] : ["HOME"];
-
 /** 已正規化絕對 POSIX 路徑是否為磁碟根（/、X:/）或恰好等於家目錄。 */
 export function isDangerousRootAbs(absPosix: string, home: string | null): boolean {
   if (absPosix === "/") return true;
@@ -140,6 +138,8 @@ export function isDangerousRootAbs(absPosix: string, home: string | null): boole
   return false;
 }
 
+const HOME_VAR_NAMES = IS_WINDOWS ? ["HOME", "USERPROFILE"] : ["HOME"];
+
 /** Word 是否為「單獨的家目錄變數展開」：$HOME / ${HOME} / $HOME/ / $USERPROFILE(Windows)。 */
 function loneHomeExpansion(word: Word): boolean {
   const parts = word.parts;
@@ -147,18 +147,23 @@ function loneHomeExpansion(word: Word): boolean {
   let head: WordPart;
   if (parts.length === 1) {
     head = parts[0];
-  } else if (parts.length === 2 && parts[1].type === "Literal" && (parts[1] as { value: string }).value === "/") {
-    head = parts[0];
+  } else if (parts.length === 2) {
+    const tail = parts[1];
+    if (tail.type === "Literal" && tail.value === "/") {
+      head = parts[0]; // $HOME/（純結尾斜線 = 家目錄本身）
+    } else {
+      return false;
+    }
   } else {
     return false;
   }
   if (head.type === "SimpleExpansion") {
-    const name = (head as { text: string }).text.startsWith("$") ? (head as { text: string }).text.slice(1) : "";
+    const name = head.text.slice(1); // SimpleExpansionPart.text 形如 "$HOME"，去掉開頭 "$"
     return HOME_VAR_NAMES.includes(name);
   }
   if (head.type === "ParameterExpansion") {
-    const pe = head as { text: string; parameter: string };
-    return pe.text === "${" + pe.parameter + "}" && HOME_VAR_NAMES.includes(pe.parameter);
+    // 純 ${HOME}：任何修飾子（:- / # / ! / index…）都會讓 text ≠ "${<parameter>}"，故以 text 比對排除
+    return head.text === "${" + head.parameter + "}" && HOME_VAR_NAMES.includes(head.parameter);
   }
   return false;
 }
