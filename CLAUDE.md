@@ -182,5 +182,14 @@ parse.ts (unbash)  →  walk.ts  →  classify.ts (每指令)  →  combine.ts (
 永遠 in-project，外部路徑才依 deny → ask → allow 決定（deny/ask 皆否決放寬）。**只放寬讀取位置，
 不放寬任何寫入型重導向／賦值前綴／非唯讀指令偵測**。
 
+本檢查器同樣沿用 `permissions.{allow,deny,ask}` 中的 `WebFetch(domain:...)` 規則 + 內建
+preapproved 文件網域清單（快照自 Claude Code 2.1.173，見 `permissions/domain_scope.ts`），
+放行唯讀形式的 `curl`：旗標全落在安全 allowlist、每個 URL 靜態且帶明確 http(s) scheme、
+host 命中 allow 網域或 preapproved（顯式 deny/ask 規則否決之）才 allow。比對語意對齊官方：
+無萬用字元 = 精確 host（不含子網域）、`*.x` 僅子網域（不含裸域）、`domain:*` 一切；只比
+hostname（忽略 port/path，preapproved 的 5 條 path 前綴條目除外）。寫檔旗標（`-o` 等）、
+非 GET、憑證旗標、無 scheme、userinfo、curl 展開字元 `{}[]`、動態 token 一律 ask；
+`-H @file` 走既有讀取範圍判定。
+
 ⚠️ sandbox 限制：若啟用 `sandbox.filesystem`，專案外路徑會在 OS 層被擋，與本 hook 的 allow 無關；
 此時還需把該目錄加入 sandbox 的 `allowRead` 才能真正讀取。

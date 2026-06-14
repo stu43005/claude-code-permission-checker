@@ -6,7 +6,7 @@ import type { CwdState } from "../types.ts";
 import { parseBashRule } from "../permissions/matcher.ts";
 import type { PermissionRules } from "../permissions/settings.ts";
 import { EMPTY_READ_SCOPE, parsePathRule, type ReadScope } from "../permissions/path_scope.ts";
-import { EMPTY_DOMAIN_SCOPE } from "../permissions/domain_scope.ts";
+import { EMPTY_DOMAIN_SCOPE, parseDomainRule } from "../permissions/domain_scope.ts";
 
 const ROOT = "/proj";
 const START: CwdState = { kind: "known", path: "/proj" };
@@ -147,9 +147,45 @@ Deno.test("cwd under allow root but also ask-listed -> ask (integration)", () =>
   assertEquals(classify(cat, ROOT, rules).kind, "ask");
 });
 
-Deno.test("classify curl preapproved domain allows, non-allowed domain asks, after resolveUrl wiring", () => {
-  // curl 已列入 allowlist（Task 6）；preapproved 網域 + 空 WebFetch 規則 → allow，
-  // 未命中網域 → ask；同時驗證 webFetch 規則型別已接通 classify。
-  assertEquals(onlyWith("curl https://docs.python.org/3/", rulesOf({})).kind, "allow");
-  assertEquals(onlyWith("curl https://unknown.example/", rulesOf({})).kind, "ask");
+function webFetchRulesOf(spec: { allow?: string[]; deny?: string[]; ask?: string[] }): PermissionRules {
+  const scopeOf = (rules: string[]) => {
+    const s = { exact: new Set<string>(), suffixes: [] as string[], all: false };
+    for (const r of rules) {
+      const e = parseDomainRule(r);
+      if (e === null) continue;
+      if (e.kind === "all") s.all = true;
+      else if (e.kind === "exact") s.exact.add(e.host);
+      else s.suffixes.push(e.suffix);
+    }
+    return s;
+  };
+  return {
+    bash: { allow: [], deny: [], ask: [] },
+    readScope: { allow: EMPTY_READ_SCOPE, deny: EMPTY_READ_SCOPE, ask: EMPTY_READ_SCOPE },
+    webFetch: {
+      allow: scopeOf(spec.allow ?? []),
+      deny: scopeOf(spec.deny ?? []),
+      ask: scopeOf(spec.ask ?? []),
+    },
+  };
+}
+
+Deno.test("classify e2e: curl allowed domain via WebFetch rules", () => {
+  const rules = webFetchRulesOf({ allow: ["WebFetch(domain:api.example.com)"] });
+  assertEquals(onlyWith("curl -sL https://api.example.com/v1", rules).kind, "allow");
+  assertEquals(onlyWith("curl -sL https://example.com/", rules).kind, "ask");
+});
+
+Deno.test("classify e2e: curl preapproved domain with default rules", () => {
+  assertEquals(only("curl -s https://docs.python.org/3/").kind, "allow");
+});
+
+Deno.test("classify e2e: deny vetoes preapproved", () => {
+  const rules = webFetchRulesOf({ deny: ["WebFetch(domain:docs.python.org)"] });
+  assertEquals(onlyWith("curl -s https://docs.python.org/3/", rules).kind, "ask");
+});
+
+Deno.test("classify e2e: write redirect still asks for allowed curl", () => {
+  // 中央寫入重導向規則照常生效
+  assertEquals(only("curl -s https://docs.python.org/3/ > out.html").kind, "ask");
 });
