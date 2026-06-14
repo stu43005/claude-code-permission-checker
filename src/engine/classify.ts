@@ -54,6 +54,7 @@ export function classify(
     ask: rules.readScope.ask,
   };
   const v = classifyBuiltin(inv, scope);
+  if (v.kind === "deny") return v; // 硬 deny：不經 settingsAllows 升級層
   if (v.kind === "allow") return v;
   if (settingsAllows(inv, rules)) return allow();
   return v;

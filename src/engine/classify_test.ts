@@ -141,3 +141,8 @@ Deno.test("cwd under allow root but also ask-listed -> ask (integration)", () =>
   const cat = invs.find((i) => i.name === "cat")!;
   assertEquals(classify(cat, ROOT, rules).kind, "ask");
 });
+
+Deno.test("classify: deny 不被 permissions.allow 升級", () => {
+  const rules = rulesOf({ allow: ["Bash(find *)"] });
+  assertEquals(onlyWith("find /", rules).kind, "deny");
+});
