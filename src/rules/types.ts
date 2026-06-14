@@ -13,6 +13,8 @@ export interface RuleContext {
   resolvePath(arg: Word): PathScope;
   /** 對 flag 的路徑值（字串）做範圍檢查。 */
   resolvePathValue(value: string | null): PathScope;
+  /** 此參數是否指向磁碟根 / 家目錄根（用於遞迴指令的 deny 判定）。 */
+  isDangerousRoot(arg: Word): boolean;
 }
 
 export type RuleVerdict =

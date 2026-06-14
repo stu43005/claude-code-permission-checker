@@ -2,7 +2,7 @@ import type { CommandInvocation } from "../types.ts";
 import type { RuleVerdict } from "../rules/types.ts";
 import { allow, ask } from "../rules/types.ts";
 import { lookupRule } from "../rules/allowlist.ts";
-import { isReadScoped, normalizeAbsolute, resolvePath, resolvePathValue, type ScopeConfig } from "./scope.ts";
+import { dangerousRoot, isReadScoped, normalizeAbsolute, resolvePath, resolvePathValue, type ScopeConfig } from "./scope.ts";
 import { hasWriteRedirect } from "./redirect.ts";
 import { settingsAllows } from "../permissions/matcher.ts";
 import { EMPTY_RULES, type PermissionRules } from "../permissions/settings.ts";
@@ -35,6 +35,7 @@ function classifyBuiltin(inv: CommandInvocation, scope: ScopeConfig): RuleVerdic
     cwd: inv.cwd,
     resolvePath: (w) => resolvePath(w, inv.cwd, scope),
     resolvePathValue: (v) => resolvePathValue(v, inv.cwd, scope),
+    isDangerousRoot: (w) => dangerousRoot(w, inv.cwd, scope.home),
   });
 }
 

@@ -3,7 +3,7 @@ import { parse } from "../../deps.ts";
 import type { Command } from "../../deps.ts";
 import { denoRule } from "./deno.ts";
 import type { RuleContext } from "../types.ts";
-import { resolvePath, resolvePathValue, rootScope } from "../../engine/scope.ts";
+import { dangerousRoot, resolvePath, resolvePathValue, rootScope } from "../../engine/scope.ts";
 
 function ctxOf(src: string): RuleContext {
   const cmd = parse(src).commands[0].command as Command;
@@ -16,6 +16,7 @@ function ctxOf(src: string): RuleContext {
     cwd,
     resolvePath: (w) => resolvePath(w, cwd, rootScope("/proj")),
     resolvePathValue: (v) => resolvePathValue(v, cwd, rootScope("/proj")),
+    isDangerousRoot: (w) => dangerousRoot(w, cwd, null),
   };
 }
 
