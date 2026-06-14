@@ -43,10 +43,11 @@ export function classify(
   inv: CommandInvocation,
   root: string,
   rules: PermissionRules = EMPTY_RULES,
+  home: string | null = null,
 ): RuleVerdict {
   const scope: ScopeConfig = {
     root,
-    home: null,
+    home,
     allow: rules.readScope.allow,
     deny: rules.readScope.deny,
     ask: rules.readScope.ask,

@@ -5,6 +5,13 @@ import { normalizeAbsolute } from "./engine/scope.ts";
 import { loadPermissionRules } from "./permissions/settings.ts";
 import type { CwdState, Decision } from "./types.ts";
 
+/** 讀取家目錄絕對路徑（HOME 優先、否則 USERPROFILE）；未設定回 null。 */
+export function homeDir(env: { get(key: string): string | undefined }): string | null {
+  const h = env.get("HOME") ?? env.get("USERPROFILE");
+  if (!h || h.trim() === "") return null;
+  return normalizeAbsolute(h.trim());
+}
+
 function initialCwd(cwd: string | undefined, root: string): CwdState {
   if (cwd && cwd.trim() !== "") return { kind: "known", path: normalizeAbsolute(cwd.trim()) };
   return { kind: "known", path: root };
@@ -40,7 +47,8 @@ async function main(): Promise<void> {
   } else {
     const command = input.tool_input?.command ?? "";
     const rules = loadPermissionRules(Deno.env, root);
-    decision = evaluate(command, root, initialCwd(input.cwd, root), rules);
+    const home = homeDir(Deno.env);
+    decision = evaluate(command, root, initialCwd(input.cwd, root), rules, home);
   }
   console.log(renderDecision(decision));
 }

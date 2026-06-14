@@ -1,4 +1,6 @@
 import { assertEquals } from "@std/assert";
+import { homeDir } from "./main.ts";
+import { normalizeAbsolute } from "./engine/scope.ts";
 
 /** 以子行程執行 main.ts，餵入 hook JSON，回傳 stdout。 */
 async function runHook(payload: unknown, projectDir: string): Promise<string> {
@@ -77,4 +79,19 @@ Deno.test("e2e: command not in settings allow -> ask", async () => {
     SETTINGS_FIXTURE,
   );
   assertEquals(JSON.parse(out).hookSpecificOutput.permissionDecision, "ask");
+});
+
+Deno.test("homeDir: 讀 HOME 並正規化（去結尾斜線）", () => {
+  assertEquals(homeDir({ get: (k: string) => (k === "HOME" ? "/home/me/" : undefined) }), "/home/me");
+});
+
+Deno.test("homeDir: HOME 未設時退回 USERPROFILE", () => {
+  assertEquals(
+    homeDir({ get: (k: string) => (k === "USERPROFILE" ? "/c/Users/me" : undefined) }),
+    normalizeAbsolute("/c/Users/me"),
+  );
+});
+
+Deno.test("homeDir: 皆未設 -> null", () => {
+  assertEquals(homeDir({ get: () => undefined }), null);
 });

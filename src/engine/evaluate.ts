@@ -14,6 +14,7 @@ export function evaluate(
   root: string,
   initialCwd: CwdState,
   rules: PermissionRules = EMPTY_RULES,
+  home: string | null = null,
 ): Decision {
   try {
     const { script, errors } = parseCommand(command);
@@ -24,7 +25,7 @@ export function evaluate(
     if (invocations.length === 0) {
       return { verdict: "allow", reason: "無可執行指令（no-op）" };
     }
-    return combine(invocations.map((inv) => classify(inv, root, rules)));
+    return combine(invocations.map((inv) => classify(inv, root, rules, home)));
   } catch (_err) {
     return { verdict: "ask", reason: "權限檢查器內部錯誤，保守交付人工確認" };
   }
