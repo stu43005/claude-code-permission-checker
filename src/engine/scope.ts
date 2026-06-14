@@ -80,6 +80,8 @@ export interface ScopeConfig {
   allow: ReadScope;
   deny: ReadScope;
   ask: ReadScope;
+  /** hook 自身推導的「當前 session」可信唯讀目錄根（與使用者規則分離；allow 同級）。 */
+  trusted: string[];
 }
 
 /** 由裸 root 字串組成「無外部放寬」的 ScopeConfig；供既有測試與不需外部範圍的呼叫端使用（向後相容）。 */
@@ -90,6 +92,7 @@ export function rootScope(root: string): ScopeConfig {
     allow: { roots: [], files: [] },
     deny: { roots: [], files: [] },
     ask: { roots: [], files: [] },
+    trusted: [],
   };
 }
 
@@ -109,6 +112,7 @@ export function isReadScoped(absPosix: string, scope: ScopeConfig): boolean {
   if (hits(scope.deny, absPosix)) return false;
   if (hits(scope.ask, absPosix)) return false;
   if (hits(scope.allow, absPosix)) return true;
+  if (scope.trusted.some((r) => isWithin(r, absPosix))) return true; // trusted（allow 同級，deny/ask 已先否決）
   return false;
 }
 

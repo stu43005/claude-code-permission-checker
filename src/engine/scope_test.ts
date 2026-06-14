@@ -122,6 +122,7 @@ function scopeWith(
     allow: { roots: allowRoots, files: allowFiles },
     deny: { roots: denyRoots, files: [] },
     ask: { roots: askRoots, files: [] },
+    trusted: [],
   };
 }
 
@@ -210,4 +211,26 @@ Deno.test({
   fn() {
     assertEquals(dangerousRoot(firstArg("find $USERPROFILE"), KNOWN, null), false);
   },
+});
+
+Deno.test("rootScope sets empty trusted", () => {
+  assertEquals(rootScope("/proj").trusted, []);
+});
+
+Deno.test("isReadScoped: trusted root grants read; root-first and deny/ask override", () => {
+  const SID = "/home/me/.claude/projects/-proj/115826ef-e830-461f-8101-edac56694d2b";
+  const scope: ScopeConfig = { ...rootScope("/proj"), trusted: [SID] };
+  // trusted 子路徑可讀
+  assertEquals(isReadScoped(SID + "/tool-results/x.txt", scope), true);
+  assertEquals(isReadScoped(SID, scope), true);
+  // 專案內仍 root-first
+  assertEquals(isReadScoped("/proj/src/a.ts", scope), true);
+  // trusted 外（同專案 memory）仍 false
+  assertEquals(isReadScoped("/home/me/.claude/projects/-proj/memory/x", scope), false);
+  // deny 覆蓋 trusted（deny > allow=trusted）
+  const denied: ScopeConfig = { ...scope, deny: { roots: [SID], files: [] } };
+  assertEquals(isReadScoped(SID + "/x", denied), false);
+  // ask 覆蓋 trusted
+  const asked: ScopeConfig = { ...scope, ask: { roots: [SID], files: [] } };
+  assertEquals(isReadScoped(SID + "/x", asked), false);
 });

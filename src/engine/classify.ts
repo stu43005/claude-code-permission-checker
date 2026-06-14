@@ -52,6 +52,7 @@ export function classify(
     allow: rules.readScope.allow,
     deny: rules.readScope.deny,
     ask: rules.readScope.ask,
+    trusted: [],
   };
   const v = classifyBuiltin(inv, scope);
   if (v.kind === "deny") return v; // 硬 deny：不經 settingsAllows 升級層
