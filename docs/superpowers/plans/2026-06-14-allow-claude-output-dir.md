@@ -753,6 +753,14 @@ Deno.test("e2e: 同專案 memory -> ask（不自動放行）", async () => {
   assertEquals(JSON.parse(out).hookSpecificOutput.permissionDecision, "ask");
 });
 
+Deno.test("e2e: 他 session 子目錄 -> ask", async () => {
+  const out = await runHookWithEnv(
+    e2ePayload(`cat ${E2E_HOME}/.claude/projects/${E2E_E}/deadsess/tool-results/x.txt`),
+    { CLAUDE_PROJECT_DIR: E2E_PROJ, HOME: E2E_HOME },
+  );
+  assertEquals(JSON.parse(out).hookSpecificOutput.permissionDecision, "ask");
+});
+
 Deno.test({
   name: "e2e: 讀當前 session 的 /tmp 任務輸出 -> allow（macOS）",
   ignore: Deno.build.os !== "darwin",
@@ -824,6 +832,8 @@ Run: `deno task check && deno task lint && deno task test`
 Expected: 全綠（既有測試不回歸；新增測試通過）
 
 - [ ] **Step 7: Operational verification（build 後餵真實 JSON）**
+
+> 於 macOS（darwin）執行。第 2a 步 `/private/tmp` 形式為 macOS symlink 專屬；非 darwin 平台 `includePrivateTmp` 為 `false`，第 2a 步會回 `ask`，改以第 2b 步 `/tmp` 形式驗證。
 
 ```bash
 deno task build
