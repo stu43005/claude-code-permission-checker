@@ -191,3 +191,22 @@ parse.ts (unbash)  →  walk.ts  →  classify.ts (每指令)  →  combine.ts (
 此時還需把該目錄加入 sandbox 的 `allowRead` 才能真正讀取。
 
 此外，本檢查器現會對「遞迴遍歷磁碟根/家目錄根的唯讀指令」主動回 `deny`（硬性、不可由 `permissions.allow` 解除）。此 deny 之 `permissionDecisionReason` 會回饋給 agent，故理由文字會解釋禁止原因與可行替代。
+
+此外，本檢查器把「**當前 session** 的 Claude Code 工具/任務輸出子目錄」視為唯讀延伸範圍（見 `claude_dir.ts` 的
+`sessionTrustedReadRoots`）：`~/.claude/projects/<E>/<session_id>/`（內含 `tool-results/`）與
+`/tmp/claude-<uid>/<E>/<session_id>/`（背景任務輸出；macOS 另含 `/private/tmp` symlink 形式）。其中 `E` 取自
+hook 傳入 `transcript_path` 之 dirname 的 basename（**權威編碼段、不重算/不猜 Claude 的編碼規則**），`<uid>` 由
+`Deno.uid()` 取得（需 `--allow-sys=uid`；取不到 → fail-safe 不產生 `/tmp` 根）。
+
+- **以全域唯一 `session_id` 為信任鍵 → 碰撞免疫**：所有 trusted 根皆以 `.../<session_id>/` 結尾，即使兩專案路徑
+  編碼後共用同一 `<E>` 目錄，session 子樹仍唯一屬當前 session。設計**不含任何有損 `encode(root)`**。
+- **兩道 fail-closed 安全閘**：(a) `basename(transcript_path)` 必須等於 `<session_id>.jsonl`（綁定當前 session）；
+  (b) dirname 必須嚴格位於 `<home>/.claude/projects/` 之下且至少一非空段。另在串接前要求 `session_id` 符合
+  `^[A-Za-z0-9_-]+$`（封 `.`/`..`/分隔符的 path-escape）。任一不過 / 缺欄位 → 不放寬（退回 `ask`）。
+- **刻意不自動放行**：`memory/`、歷史 session 子目錄、transcript `.jsonl` 檔本身（無法以唯一 session_id 涵蓋；
+  納入會重新引入跨專案風險）→ 維持 `ask`、非封鎖。
+- 放行來源（`evaluate`/`classify` 的獨立參數 `trustedReadRoots` → `ScopeConfig.trusted`）與**使用者 permission
+  規則型別分離**，`rules` 全程不被 mutate；trusted 與 user-allow 同屬 allow 層，**`deny`/`ask` 仍覆蓋**
+  （`deny > ask > allow`）。**只放寬讀取位置**，不放寬任何寫入型重導向／賦值前綴／非唯讀指令偵測。
+- 殘留信任假設：信任 Claude 送來的 `transcript_path`/`session_id`/`Deno.uid()` 屬於當前 session/使用者
+  （與既有信任 `cwd`/`tool_input` 同一層級）。
