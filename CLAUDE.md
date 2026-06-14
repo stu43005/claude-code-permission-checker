@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## 這是什麼
 
 一個 Claude Code `PreToolUse`（matcher: `Bash`）hook：用 Deno 寫、`deno compile` 成單一執行檔。
-解析 Bash 指令，只在「純唯讀且全部落在當前專案內」時回 `allow`，其餘回 `ask`。**永不回 `deny`**。
+解析 Bash 指令，只在「純唯讀且全部落在當前專案內」時回 `allow`，其餘回 `ask`。**僅對「遞迴遍歷磁碟根/家目錄根的唯讀指令」回 `deny`（硬性、不可由 permissions.allow 解除）；其餘維持 allow / ask，永不主動 `deny`。**
 從 stdin 收 hook JSON、往 stdout 寫 decision JSON、**永遠 `exit 0`**。
 
 此外，會在 runtime 讀取使用者的 `permissions.allow`：原本會 `ask`、但已被使用者在 settings.json 明確放行
@@ -48,7 +48,7 @@ operational verification 會讀取真實的 settings.json（含使用者 `~/.cla
 
 ```
 parse.ts (unbash)  →  walk.ts  →  classify.ts (每指令)  →  combine.ts (最弱環節)
-   解析成 AST        攤平成          中央前置檢查 +            任一 ask → 整體 ask
+   解析成 AST        攤平成          中央前置檢查 +            任一 deny → 整體 deny；否則任一 ask → 整體 ask
    errors → ask     CommandInvocation[]   allowlist rule
 ```
 
@@ -60,8 +60,10 @@ parse.ts (unbash)  →  walk.ts  →  classify.ts (每指令)  →  combine.ts (
   allowlist → ask；**三條中央前置規則**（見下）→ ask；最後跑該指令的 `CommandRule.evaluate`）；外層
   `classify(inv, root, rules)` 在 builtin 判 `ask` 時，呼叫 `settingsAllows` 嘗試以 `permissions.allow`
   升級為 `allow`（命中 allow 且未被 deny/ask 命中才升級；builtin 已判 `allow` 者原樣返回，不受 rules 影響）。
+  此外，builtin 回 `deny`（遞迴遍歷磁碟根/家目錄根，由 `scope.ts` 的 `dangerousRoot`/`isDangerousRoot` 述詞偵測，接於 find/tree/ls -R/grep -r/rg 的遞迴閘門）時**先於升級層短路返回**，不經 `settingsAllows`，故 `permissions.allow` 無法解除此 deny。
 - **`scope.ts`** 純詞法路徑解析（不碰檔案系統）。`resolvePath`/`resolvePathValue` 回三態
   `in-project` / `out-of-project` / `dynamic`，後兩者 → ask。
+  另提供 `isDangerousRootAbs`/`dangerousRoot` 危險根偵測（字面 `~`/`~/`、lone `$HOME`/`${HOME}`/`$HOME/`、Windows `$USERPROFILE`、靜態絕對等於磁碟根 `/`、`X:/` 或家目錄），供遞迴指令回 `deny`。
 - **`rules/`**：`types.ts`（`CommandRule`/`RuleContext`/`RuleVerdict` + `allow()`/`ask()`）、
   `flags.ts`（flag matcher、positionals）、`factory.ts`（`flagGatedReader`）、
   `allowlist.ts`（name → rule 索引，載入時偵測重複 name）、`commands/*.ts`（每類指令一檔）。
@@ -74,6 +76,8 @@ parse.ts (unbash)  →  walk.ts  →  classify.ts (每指令)  →  combine.ts (
 
 ### 三條中央前置規則（在跑個別 rule 之前，於 classify.ts；個別 rule 不需重複處理）
 
+（註：對「遞迴遍歷磁碟根/家目錄根」的 `deny` 不是中央前置規則，而是各遞迴指令規則內以 `isDangerousRoot` 判定、再由 `classify` 對 `deny` 短路；故不在本三條之列。）
+
 1. **cwd 範圍**：`cwd.kind === "known"` 但落在專案根外 → ask。
 2. **寫入型重導向**：`> >> >| &> &>> <>`（及 `>&` 接檔名）→ ask；null 裝置（`/dev/null`、`NUL`）
    與純 fd 複製（`2>&1`、`>&` 接 fd 數字）不算寫入。
@@ -82,7 +86,8 @@ parse.ts (unbash)  →  walk.ts  →  classify.ts (每指令)  →  combine.ts (
 ## 核心不變量（改動時不可違反）
 
 - **default-deny**：未明確判定為安全唯讀的一律 ask。新增指令規則時，未涵蓋的形式必須 fallback 到 ask。
-- **永不 `deny`、永遠 `exit 0`**；任何例外都 try/catch 成 ask（fail-safe，見 `evaluate.ts`/`main.ts`）。
+- **deny 僅限「遞迴遍歷恰好等於磁碟根/家目錄根的唯讀指令」**（find/tree/ls -R/grep -r/rg）；其餘維持「永不 `deny`」。verdict 三態優先序 `deny > ask > allow`。**永遠 `exit 0`**；任何例外都 try/catch 成 ask（fail-safe）。
+- deny 為硬性：`classify` 對 builtin `deny` 短路，**不經** `permissions.allow` 升級層（升級層只把 `ask` 變 `allow`，永遠碰不到 `deny`）。deny 漏判（遞迴/根偵測未覆蓋、home env 缺失）只退回 `ask`，絕不誤放行。
 - **新增/修改規則 = 改 `rules/commands/*.ts` → 在 `allowlist.ts` 註冊 → `deno task build`**。
   hook 每次 Bash 呼叫都重新執行那顆 `.exe`，故 rebuild 後**下一個指令即生效，不需重啟**（重啟只在改
   `~/.claude/settings.json` 時才需要）。
@@ -184,3 +189,5 @@ parse.ts (unbash)  →  walk.ts  →  classify.ts (每指令)  →  combine.ts (
 
 ⚠️ sandbox 限制：若啟用 `sandbox.filesystem`，專案外路徑會在 OS 層被擋，與本 hook 的 allow 無關；
 此時還需把該目錄加入 sandbox 的 `allowRead` 才能真正讀取。
+
+此外，本檢查器現會對「遞迴遍歷磁碟根/家目錄根的唯讀指令」主動回 `deny`（硬性、不可由 `permissions.allow` 解除）。此 deny 之 `permissionDecisionReason` 會回饋給 agent，故理由文字會解釋禁止原因與可行替代。
