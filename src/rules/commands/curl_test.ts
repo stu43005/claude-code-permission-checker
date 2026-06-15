@@ -3,7 +3,7 @@ import { parse } from "../../deps.ts";
 import type { Command } from "../../deps.ts";
 import { curlRule } from "./curl.ts";
 import type { RuleContext } from "../types.ts";
-import { resolvePath, resolvePathValue, rootScope } from "../../engine/scope.ts";
+import { dangerousRoot, resolvePath, resolvePathValue, rootScope } from "../../engine/scope.ts";
 import {
   type DomainScope,
   parseDomainRule,
@@ -42,6 +42,7 @@ function ctxOf(src: string, rules: WebFetchRules = ALLOW_EXAMPLE): RuleContext {
     resolvePath: (w) => resolvePath(w, cwd, rootScope("/proj")),
     resolvePathValue: (v) => resolvePathValue(v, cwd, rootScope("/proj")),
     resolveUrl: (v) => resolveUrl(v, rules),
+    isDangerousRoot: (w) => dangerousRoot(w, cwd, null),
   };
 }
 

@@ -1,7 +1,8 @@
 import { assertEquals } from "@std/assert";
 import { parse } from "../deps.ts";
 import type { Command } from "../deps.ts";
-import { isReadScoped, isWithin, normalizeAbsolute, resolvePath, rootScope, type PathScope, type ScopeConfig } from "./scope.ts";
+import { dangerousRoot, isDangerousRootAbs, isReadScoped, isWithin, normalizeAbsolute, resolvePath, rootScope, type PathScope, type ScopeConfig } from "./scope.ts";
+import type { CwdState } from "../types.ts";
 
 function firstArg(src: string) {
   return (parse(src).commands[0].command as Command).suffix[0];
@@ -117,9 +118,11 @@ function scopeWith(
 ): ScopeConfig {
   return {
     root: "/proj",
+    home: null,
     allow: { roots: allowRoots, files: allowFiles },
     deny: { roots: denyRoots, files: [] },
     ask: { roots: askRoots, files: [] },
+    trusted: [],
   };
 }
 
@@ -151,4 +154,83 @@ Deno.test("isReadScoped: allow file exact match only (no recurse)", () => {
   const s = scopeWith([], [], [], ["/srv/f.txt"]);
   assertEquals(isReadScoped("/srv/f.txt", s), true);
   assertEquals(isReadScoped("/srv/f.txt/child", s), false);
+});
+
+const KNOWN: CwdState = { kind: "known", path: "/proj" };
+
+Deno.test("isDangerousRootAbs: 磁碟根 / 家目錄 / 子目錄", () => {
+  assertEquals(isDangerousRootAbs("/", null), true);
+  assertEquals(isDangerousRootAbs("C:/", null), true);
+  assertEquals(isDangerousRootAbs("D:/", null), true);
+  assertEquals(isDangerousRootAbs("/usr", null), false);
+  assertEquals(isDangerousRootAbs("/home/me", "/home/me"), true);
+  assertEquals(isDangerousRootAbs("/home/me/x", "/home/me"), false);
+});
+
+Deno.test("dangerousRoot: tilde 與磁碟根", () => {
+  assertEquals(dangerousRoot(firstArg("find ~"), KNOWN, null), true);
+  assertEquals(dangerousRoot(firstArg("find ~/"), KNOWN, null), true);
+  assertEquals(dangerousRoot(firstArg("find /"), KNOWN, null), true);
+  assertEquals(dangerousRoot(firstArg("find ~/.claude"), KNOWN, null), false);
+  assertEquals(dangerousRoot(firstArg("find ."), KNOWN, null), false);
+});
+
+Deno.test("dangerousRoot: $HOME 各形式", () => {
+  assertEquals(dangerousRoot(firstArg("find $HOME"), KNOWN, null), true);
+  assertEquals(dangerousRoot(firstArg("find ${HOME}"), KNOWN, null), true);
+  assertEquals(dangerousRoot(firstArg("find $HOME/"), KNOWN, null), true);
+  assertEquals(dangerousRoot(firstArg("find $HOME/foo"), KNOWN, null), false);
+  assertEquals(dangerousRoot(firstArg("find $HOMER"), KNOWN, null), false);
+  assertEquals(dangerousRoot(firstArg("find ${HOME:-/tmp}"), KNOWN, null), false);
+});
+
+Deno.test("dangerousRoot: 靜態絕對等於 home（需 home）", () => {
+  assertEquals(dangerousRoot(firstArg("find /home/me"), KNOWN, "/home/me"), true);
+  assertEquals(dangerousRoot(firstArg("find /home/me"), KNOWN, null), false);
+});
+
+Deno.test("dangerousRoot: cwd 未知的相對路徑不可確認", () => {
+  assertEquals(dangerousRoot(firstArg("find sub"), { kind: "unknown" }, null), false);
+});
+
+Deno.test("dangerousRoot: 磁碟根字面（跨平台）", () => {
+  assertEquals(dangerousRoot(firstArg("find C:/"), KNOWN, null), true);
+});
+
+Deno.test({
+  name: "dangerousRoot: $USERPROFILE 在 Windows 視為家目錄根",
+  ignore: Deno.build.os !== "windows",
+  fn() {
+    assertEquals(dangerousRoot(firstArg("find $USERPROFILE"), KNOWN, null), true);
+  },
+});
+
+Deno.test({
+  name: "dangerousRoot: $USERPROFILE 在非 Windows 不算家目錄根",
+  ignore: Deno.build.os === "windows",
+  fn() {
+    assertEquals(dangerousRoot(firstArg("find $USERPROFILE"), KNOWN, null), false);
+  },
+});
+
+Deno.test("rootScope sets empty trusted", () => {
+  assertEquals(rootScope("/proj").trusted, []);
+});
+
+Deno.test("isReadScoped: trusted root grants read; root-first and deny/ask override", () => {
+  const SID = "/home/me/.claude/projects/-proj/115826ef-e830-461f-8101-edac56694d2b";
+  const scope: ScopeConfig = { ...rootScope("/proj"), trusted: [SID] };
+  // trusted 子路徑可讀
+  assertEquals(isReadScoped(SID + "/tool-results/x.txt", scope), true);
+  assertEquals(isReadScoped(SID, scope), true);
+  // 專案內仍 root-first
+  assertEquals(isReadScoped("/proj/src/a.ts", scope), true);
+  // trusted 外（同專案 memory）仍 false
+  assertEquals(isReadScoped("/home/me/.claude/projects/-proj/memory/x", scope), false);
+  // deny 覆蓋 trusted（deny > allow=trusted）
+  const denied: ScopeConfig = { ...scope, deny: { roots: [SID], files: [] } };
+  assertEquals(isReadScoped(SID + "/x", denied), false);
+  // ask 覆蓋 trusted
+  const asked: ScopeConfig = { ...scope, ask: { roots: [SID], files: [] } };
+  assertEquals(isReadScoped(SID + "/x", asked), false);
 });

@@ -1,9 +1,17 @@
 import { parseHookInput, readStdin, renderDecision } from "./hook/io.ts";
 import { resolveProjectRoot } from "./project.ts";
+import type { EnvReader } from "./project.ts";
 import { evaluate } from "./engine/evaluate.ts";
 import { normalizeAbsolute } from "./engine/scope.ts";
-import { loadPermissionRules } from "./permissions/settings.ts";
+import { loadPermissionRules, resolveHome } from "./permissions/settings.ts";
 import type { CwdState, Decision } from "./types.ts";
+import { sessionTrustedReadRoots } from "./claude_dir.ts";
+
+/** 家目錄絕對路徑（平台感知，重用 settings 的 resolveHome）；未設定回 null。 */
+export function homeDir(env: EnvReader): string | null {
+  const h = resolveHome(env);
+  return h === null ? null : normalizeAbsolute(h);
+}
 
 function initialCwd(cwd: string | undefined, root: string): CwdState {
   if (cwd && cwd.trim() !== "") return { kind: "known", path: normalizeAbsolute(cwd.trim()) };
@@ -40,7 +48,21 @@ async function main(): Promise<void> {
   } else {
     const command = input.tool_input?.command ?? "";
     const rules = loadPermissionRules(Deno.env, root);
-    decision = evaluate(command, root, initialCwd(input.cwd, root), rules);
+    const home = homeDir(Deno.env);
+    let uid: number | null = null;
+    try {
+      uid = Deno.uid();
+    } catch {
+      uid = null; // 權限（--allow-sys=uid）/平台不支援 → 不產生 /tmp 根（fail-safe）
+    }
+    const trusted = sessionTrustedReadRoots(
+      input.transcript_path,
+      input.session_id,
+      home,
+      uid,
+      Deno.build.os === "darwin",
+    );
+    decision = evaluate(command, root, initialCwd(input.cwd, root), rules, home, trusted);
   }
   console.log(renderDecision(decision));
 }

@@ -1,6 +1,7 @@
 import type { CommandRule } from "../types.ts";
 import { allow } from "../types.ts";
 import { flagGatedReader } from "../factory.ts";
+import { exact, hasAnyFlag } from "../flags.ts";
 
 /**
  * 會把非 flag 參數當作要讀取 / 解析的路徑，需做範圍檢查（spec line 218 要求整份
@@ -14,6 +15,7 @@ export const fileReaderRule: CommandRule = flagGatedReader({
     "basename", "dirname", "realpath", "readlink",
   ],
   // 這些指令無「會寫檔」的 flag（已於 spec 查證）；故 askFlags 留空。
+  recursive: (n, a) => n === "ls" && hasAnyFlag(a, [exact("-R", "--recursive")]),
 });
 
 /** diff：位置參數做範圍檢查，且 --from-file / --to-file 路徑值也需範圍檢查。 */

@@ -1,5 +1,5 @@
 import type { CommandRule, RuleContext, RuleVerdict } from "../types.ts";
-import { allow, ask } from "../types.ts";
+import { allow, ask, deny, recursiveRootDenyReason } from "../types.ts";
 import { staticValue } from "../../engine/word.ts";
 
 const ACTION_FLAGS = new Set<string>([
@@ -17,11 +17,18 @@ export const findRule: CommandRule = {
       if (t !== null && t.startsWith("-")) break;
       starts.push(w);
     }
+    // action flag 偵測優先：即使起始路徑為根，-delete/-exec 等先命中即回 ask（非 deny）
     // 偵測寫檔 / 執行 action
     for (const w of ctx.argv) {
       const t = staticValue(w);
       if (t !== null && ACTION_FLAGS.has(t)) {
         return ask(`find：${t} 會寫檔或執行外部指令`);
+      }
+    }
+    // 遞迴遍歷磁碟根 / 家目錄根（find 預設遞迴）→ deny
+    for (const s of starts) {
+      if (ctx.isDangerousRoot(s)) {
+        return deny(recursiveRootDenyReason("find", s.value));
       }
     }
     for (const s of starts) {

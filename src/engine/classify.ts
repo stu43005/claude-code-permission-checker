@@ -2,7 +2,7 @@ import type { CommandInvocation } from "../types.ts";
 import type { RuleVerdict } from "../rules/types.ts";
 import { allow, ask } from "../rules/types.ts";
 import { lookupRule } from "../rules/allowlist.ts";
-import { isReadScoped, normalizeAbsolute, resolvePath, resolvePathValue, type ScopeConfig } from "./scope.ts";
+import { dangerousRoot, isReadScoped, normalizeAbsolute, resolvePath, resolvePathValue, type ScopeConfig } from "./scope.ts";
 import { hasWriteRedirect } from "./redirect.ts";
 import { settingsAllows } from "../permissions/matcher.ts";
 import { EMPTY_RULES, type PermissionRules } from "../permissions/settings.ts";
@@ -37,6 +37,7 @@ function classifyBuiltin(inv: CommandInvocation, scope: ScopeConfig, webFetch: W
     resolvePath: (w) => resolvePath(w, inv.cwd, scope),
     resolvePathValue: (v) => resolvePathValue(v, inv.cwd, scope),
     resolveUrl: (v) => resolveUrl(v, webFetch),
+    isDangerousRoot: (w) => dangerousRoot(w, inv.cwd, scope.home),
   });
 }
 
@@ -45,14 +46,19 @@ export function classify(
   inv: CommandInvocation,
   root: string,
   rules: PermissionRules = EMPTY_RULES,
+  home: string | null = null,
+  trustedReadRoots: string[] = [],
 ): RuleVerdict {
   const scope: ScopeConfig = {
     root,
+    home,
     allow: rules.readScope.allow,
     deny: rules.readScope.deny,
     ask: rules.readScope.ask,
+    trusted: trustedReadRoots,
   };
   const v = classifyBuiltin(inv, scope, rules.webFetch);
+  if (v.kind === "deny") return v; // 硬 deny：不經 settingsAllows 升級層
   if (v.kind === "allow") return v;
   if (settingsAllows(inv, rules)) return allow();
   return v;

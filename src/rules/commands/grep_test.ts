@@ -3,7 +3,7 @@ import { parse } from "../../deps.ts";
 import type { Command } from "../../deps.ts";
 import { grepRule } from "./grep.ts";
 import type { RuleContext } from "../types.ts";
-import { resolvePath, resolvePathValue, rootScope } from "../../engine/scope.ts";
+import { dangerousRoot, resolvePath, resolvePathValue, rootScope } from "../../engine/scope.ts";
 
 function ctxOf(name: string, src: string): RuleContext {
   const cmd = parse(src).commands[0].command as Command;
@@ -17,6 +17,7 @@ function ctxOf(name: string, src: string): RuleContext {
     resolvePath: (w) => resolvePath(w, cwd, rootScope("/proj")),
     resolvePathValue: (v) => resolvePathValue(v, cwd, rootScope("/proj")),
     resolveUrl: () => "not-allowed",
+    isDangerousRoot: (w) => dangerousRoot(w, cwd, null),
   };
 }
 
@@ -48,4 +49,24 @@ Deno.test("grep --file= out-of-project asks", () => {
 
 Deno.test("grep -f in-project pattern file allows", () => {
   assertEquals(grepRule.evaluate(ctxOf("grep", "grep -f patterns.txt readme.md")).kind, "allow");
+});
+
+Deno.test("grep -r / rg 遞迴遍歷根/家目錄 -> deny", () => {
+  assertEquals(grepRule.evaluate(ctxOf("grep", "grep -r x /")).kind, "deny");
+  assertEquals(grepRule.evaluate(ctxOf("grep", "grep -R x ~")).kind, "deny");
+  assertEquals(grepRule.evaluate(ctxOf("grep", "grep --recursive x $HOME")).kind, "deny");
+  assertEquals(grepRule.evaluate(ctxOf("grep", "grep -rn x /")).kind, "deny");
+  assertEquals(grepRule.evaluate(ctxOf("rg", "rg x ~")).kind, "deny");
+});
+
+Deno.test("grep 非遞迴碰根 -> 非 deny", () => {
+  assertEquals(grepRule.evaluate(ctxOf("grep", "grep / file")).kind, "ask");
+  assertEquals(grepRule.evaluate(ctxOf("grep", "grep x /")).kind, "ask");
+  assertEquals(grepRule.evaluate(ctxOf("rg", "rg foo ./src")).kind, "allow");
+});
+
+Deno.test("grep 危險根緊跟 -r（被吃值位置）仍 deny", () => {
+  assertEquals(grepRule.evaluate(ctxOf("grep", "grep foo -r /")).kind, "deny");
+  assertEquals(grepRule.evaluate(ctxOf("grep", "grep x -r ~")).kind, "deny");
+  assertEquals(grepRule.evaluate(ctxOf("grep", "grep foo -r $HOME")).kind, "deny");
 });

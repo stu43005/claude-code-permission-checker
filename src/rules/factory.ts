@@ -1,8 +1,9 @@
 import type { CommandRule, RuleContext, RuleVerdict } from "./types.ts";
-import { allow, ask } from "./types.ts";
+import { allow, ask, deny, recursiveRootDenyReason } from "./types.ts";
 import { type FlagMatcher, hasAnyFlag, positionals } from "./flags.ts";
 import { type PathScope } from "../engine/scope.ts";
 import { staticValue } from "../engine/word.ts";
+import type { Word } from "../deps.ts";
 
 export interface FlagGatedReaderOptions {
   names: string[];
@@ -14,6 +15,8 @@ export interface FlagGatedReaderOptions {
   pathValueFlags?: string[];
   /** ask 時的說明（含指令名）。 */
   askReason?: (name: string) => string;
+  /** 回 true 表示此次呼叫會遞迴遍歷；遍歷根命中危險根時 deny。 */
+  recursive?: (name: string, argv: Word[]) => boolean;
 }
 
 /**
@@ -63,6 +66,17 @@ export function flagGatedReader(opts: FlagGatedReaderOptions): CommandRule {
       }
       const pathFlagVerdict = checkPathValueFlags(ctx, opts.pathValueFlags ?? []);
       if (pathFlagVerdict) return pathFlagVerdict;
+      // 遞迴遍歷時，危險根可能藏在「被 value-flag 吃掉的 token」位置（例如 grep 的 -r 會把
+      // 其後的根路徑當值吞掉，使其不在 positionals 中），故掃描全部 argv token、不限 positionals，
+      // 避免漏判成 allow（誤放行）。非危險根的 flag/值 token（-r、數字等）自然回 false。
+      const isRecursive = opts.recursive?.(ctx.name, ctx.argv) ?? false;
+      if (isRecursive) {
+        for (const w of ctx.argv) {
+          if (ctx.isDangerousRoot(w)) {
+            return deny(recursiveRootDenyReason(ctx.name, w.value));
+          }
+        }
+      }
       for (const arg of positionals(ctx.argv, valueFlags)) {
         const scope = ctx.resolvePath(arg);
         if (scope !== "in-project") {

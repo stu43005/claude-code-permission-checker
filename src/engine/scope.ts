@@ -1,4 +1,4 @@
-import type { Word } from "../deps.ts";
+import type { Word, WordPart } from "../deps.ts";
 import { staticValue } from "./word.ts";
 import type { CwdState } from "../types.ts";
 import type { ReadScope } from "../permissions/path_scope.ts";
@@ -76,18 +76,23 @@ export function isWithin(root: string, target: string): boolean {
 /** 範圍設定：專案根 + 外部唯讀範圍三分類（allow/deny/ask，與 settings 對齊）。 */
 export interface ScopeConfig {
   root: string;
+  home: string | null;
   allow: ReadScope;
   deny: ReadScope;
   ask: ReadScope;
+  /** hook 自身推導的「當前 session」可信唯讀目錄根（與使用者規則分離；allow 同級）。 */
+  trusted: string[];
 }
 
 /** 由裸 root 字串組成「無外部放寬」的 ScopeConfig；供既有測試與不需外部範圍的呼叫端使用（向後相容）。 */
 export function rootScope(root: string): ScopeConfig {
   return {
     root,
+    home: null,
     allow: { roots: [], files: [] },
     deny: { roots: [], files: [] },
     ask: { roots: [], files: [] },
+    trusted: [],
   };
 }
 
@@ -107,6 +112,7 @@ export function isReadScoped(absPosix: string, scope: ScopeConfig): boolean {
   if (hits(scope.deny, absPosix)) return false;
   if (hits(scope.ask, absPosix)) return false;
   if (hits(scope.allow, absPosix)) return true;
+  if (scope.trusted.some((r) => isWithin(r, absPosix))) return true; // trusted（allow 同級，deny/ask 已先否決）
   return false;
 }
 
@@ -126,4 +132,64 @@ export function resolvePathValue(value: string | null, cwd: CwdState, scope: Sco
 /** 解析單一參數對專案根的範圍（三態）。 */
 export function resolvePath(arg: Word, cwd: CwdState, scope: ScopeConfig): PathScope {
   return resolvePathValue(staticValue(arg), cwd, scope);
+}
+
+/** 已正規化絕對 POSIX 路徑是否為磁碟根（/、X:/）或恰好等於家目錄。 */
+export function isDangerousRootAbs(absPosix: string, home: string | null): boolean {
+  if (absPosix === "/") return true;
+  if (/^[A-Za-z]:\/$/.test(absPosix)) return true;
+  if (home !== null && absPosix === normalizeAbsolute(home)) return true;
+  return false;
+}
+
+const HOME_VAR_NAMES = IS_WINDOWS ? ["HOME", "USERPROFILE"] : ["HOME"];
+
+/** Word 是否為「單獨的家目錄變數展開」：$HOME / ${HOME} / $HOME/ / $USERPROFILE(Windows)。 */
+function loneHomeExpansion(word: Word): boolean {
+  const parts = word.parts;
+  if (!parts || parts.length === 0) return false;
+  let head: WordPart;
+  if (parts.length === 1) {
+    head = parts[0];
+  } else if (parts.length === 2) {
+    const tail = parts[1];
+    if (tail.type === "Literal" && tail.value === "/") {
+      head = parts[0]; // $HOME/（純結尾斜線 = 家目錄本身）
+    } else {
+      return false;
+    }
+  } else {
+    return false;
+  }
+  if (head.type === "SimpleExpansion") {
+    const name = head.text.slice(1); // SimpleExpansionPart.text 形如 "$HOME"，去掉開頭 "$"
+    return HOME_VAR_NAMES.includes(name);
+  }
+  if (head.type === "ParameterExpansion") {
+    // 純 ${HOME}：任何修飾子（:- / # / ! / index…）都會讓 text ≠ "${<parameter>}"，故以 text 比對排除
+    return head.text === "${" + head.parameter + "}" && HOME_VAR_NAMES.includes(head.parameter);
+  }
+  return false;
+}
+
+/**
+ * Word 是否指向磁碟根 / 家目錄根：
+ *   1) lone home expansion（$HOME/${HOME}/$HOME/、Windows $USERPROFILE）
+ *   2) 字面 ~ 或 ~/
+ *   3) 靜態絕對/相對解析後 isDangerousRootAbs
+ *   其餘（動態、cwd 未知的相對路徑、子目錄）→ false
+ */
+export function dangerousRoot(arg: Word, cwd: CwdState, home: string | null): boolean {
+  if (loneHomeExpansion(arg)) return true;
+  const v = staticValue(arg);
+  if (v === null) return false;
+  if (v === "~" || v === "~/") return true;
+  let abs: string;
+  if (isAbsolute(v)) {
+    abs = normalizeAbsolute(v);
+  } else {
+    if (cwd.kind === "unknown") return false;
+    abs = resolveAgainst(cwd.path, v);
+  }
+  return isDangerousRootAbs(abs, home);
 }

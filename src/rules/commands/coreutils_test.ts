@@ -3,7 +3,7 @@ import { parse } from "../../deps.ts";
 import type { Command } from "../../deps.ts";
 import { cdRule, diffRule, fileReaderRule, pureUtilRule } from "./coreutils.ts";
 import type { RuleContext } from "../types.ts";
-import { resolvePath, resolvePathValue, rootScope } from "../../engine/scope.ts";
+import { dangerousRoot, resolvePath, resolvePathValue, rootScope } from "../../engine/scope.ts";
 import type { CwdState } from "../../types.ts";
 
 function ctxOf(src: string, cwd: CwdState = { kind: "known", path: "/proj" }): RuleContext {
@@ -17,6 +17,7 @@ function ctxOf(src: string, cwd: CwdState = { kind: "known", path: "/proj" }): R
     resolvePath: (w) => resolvePath(w, cwd, rootScope("/proj")),
     resolvePathValue: (v) => resolvePathValue(v, cwd, rootScope("/proj")),
     resolveUrl: () => "not-allowed",
+    isDangerousRoot: (w) => dangerousRoot(w, cwd, null),
   };
 }
 
@@ -62,4 +63,16 @@ Deno.test("diff out-of-project positional asks", () => {
 
 Deno.test("diff in-project files allows", () => {
   assertEquals(diffRule.evaluate(ctxOf("diff a.txt b.txt")).kind, "allow");
+});
+
+Deno.test("ls -R 遞迴遍歷根/家目錄 -> deny", () => {
+  assertEquals(fileReaderRule.evaluate(ctxOf("ls -R ~")).kind, "deny");
+  assertEquals(fileReaderRule.evaluate(ctxOf("ls -R /")).kind, "deny");
+  assertEquals(fileReaderRule.evaluate(ctxOf("ls --recursive $HOME")).kind, "deny");
+});
+
+Deno.test("ls 非遞迴碰根 / cat 碰根 -> 非 deny", () => {
+  assertEquals(fileReaderRule.evaluate(ctxOf("ls -l ~")).kind, "allow");
+  assertEquals(fileReaderRule.evaluate(ctxOf("cat /")).kind, "ask");
+  assertEquals(fileReaderRule.evaluate(ctxOf("ls -R ./sub")).kind, "allow");
 });
