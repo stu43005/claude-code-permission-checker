@@ -4,7 +4,7 @@
 
 **Goal:** 讓本 PreToolUse(Bash) hook 把當前 session 的 Claude Code 背景任務輸出目錄（Windows `os.tmpdir()\claude\…` 無 uid、POSIX `…/claude-<uid>/…`）與工具輸出目錄納入 trusted 唯讀根，並對齊 Claude 真實的 `CLAUDE_CODE_TMPDIR`/`CLAUDE_CONFIG_DIR` env 覆寫。
 
-**Architecture:** 推導邏輯集中在純函式 `sessionTrustedReadRoots`（不碰 FS/env），平台/env 讀取留在 `main.ts` I/O 邊界。新增 `resolveClaudeConfigDir(env, home)` 於 `claude_dir.ts`（依 domain），`settings.ts` 借它定位使用者 settings。tmp 來源為 `CLAUDE_CODE_TMPDIR ?? os.tmpdir()` 與 POSIX `/tmp`+darwin `/private/tmp` 的去重聯集。信任邊界純詞法、不做 FS/symlink/UNC 檢查（規格 §6.1 刻意決策）。
+**Architecture:** 推導邏輯集中在純函式 `sessionTrustedReadRoots`（不碰 FS/env），平台/env 讀取留在 `main.ts` I/O 邊界。新增 `resolveClaudeConfigDir(env, home)` 於 `claude_dir.ts`（依 domain），`settings.ts` 借它定位使用者 settings。tmp 來源為 `CLAUDE_CODE_TMPDIR ?? os.tmpdir()` 與 POSIX `/tmp`+darwin `/private/tmp` 的去重聯集。信任邊界純詞法、不做 FS/symlink/UNC 檢查（刻意決策：純詞法信任模型）。
 
 **Tech Stack:** Deno 2.8.2、TypeScript、`node:path/posix`（basename/dirname）、`node:os`（tmpdir）、`@std/assert`、`deno compile`。
 
