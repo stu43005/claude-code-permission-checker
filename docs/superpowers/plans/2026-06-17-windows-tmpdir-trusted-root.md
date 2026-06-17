@@ -280,11 +280,11 @@ export function sessionTrustedReadRoots(
   if (!toPosix(trimmedTranscript).endsWith(".jsonl")) return []; // 大小寫敏感
 
   const absoluteTranscript = normalizeAbsolute(trimmedTranscript);
-  if (basename(absoluteTranscript) !== trimmedSessionId + ".jsonl") return []; // G5(a)
+  if (basename(absoluteTranscript) !== trimmedSessionId + ".jsonl") return []; // transcript 檔名須等於 <session_id>.jsonl
 
   const encodedProjectDir = dirname(absoluteTranscript); // <configDir>/projects/<E>
   const projectsRoot = normalizeAbsolute(claudeConfigDir + "/projects");
-  if (!isWithin(projectsRoot, encodedProjectDir) || encodedProjectDir === projectsRoot) return []; // G5(b)
+  if (!isWithin(projectsRoot, encodedProjectDir) || encodedProjectDir === projectsRoot) return []; // transcript 須在 <configDir>/projects/<E> 之下且非該根本身
 
   const encodedSegment = basename(encodedProjectDir); // <E>（權威編碼段，非重算）
   const trustedRoots: string[] = [normalizeAbsolute(encodedProjectDir + "/" + trimmedSessionId)];
@@ -402,8 +402,6 @@ EOF
 - [ ] **Step 1: 增補失敗測試（settings_test.ts 末尾追加）**
 
 ```ts
-import { resolveClaudeConfigDir } from "../claude_dir.ts";
-
 Deno.test("CLAUDE_CONFIG_DIR 設定時，使用者 settings 改讀 <configDir>/settings.json", () => {
   const requested: string[] = [];
   const reader: ReadText = (path) => {
@@ -546,25 +544,31 @@ EOF
 
 - [ ] **Step 1: 追加 e2e 測試**
 
-在 `src/main_test.ts` 末尾追加（沿用既有 `runHookWithEnv`/`e2ePayload`/`E2E_*` 常數，並新增 `node:os` import 於檔頂）：
-
-於檔案頂部 import 區新增：
-
-```ts
-import { tmpdir } from "node:os";
-```
-
-於檔案末尾追加：
+在 `src/main_test.ts` 末尾追加（沿用既有 `runHookWithEnv`/`e2ePayload`/`E2E_*` 常數與既有的 `normalizeAbsolute` import；**不需** `node:os`——tmp base 用正斜線字串或經 `normalizeAbsolute` 的 `TEMP`，避免 Windows 反斜線在 Bash 被當跳脫）：
 
 ```ts
 Deno.test("e2e: CLAUDE_CODE_TMPDIR 任務輸出 -> allow（跨平台）", async () => {
-  const tmpBase = `${tmpdir()}/cc-pc-e2e-tmp`; // 顯式覆寫 → 子行程 osTmpBase 確定
+  const tmpBase = `${E2E_HOME}/tmp-override`; // 顯式覆寫（正斜線、跨平台安全）→ 子行程 osTmpBase 確定
   const claudeDir = Deno.build.os === "windows" ? "claude" : `claude-${Deno.uid()}`;
   const out = await runHookWithEnv(
     e2ePayload(`cat ${tmpBase}/${claudeDir}/${E2E_E}/${E2E_SID}/tasks/x.output`),
     { CLAUDE_PROJECT_DIR: E2E_PROJ, HOME: E2E_HOME, CLAUDE_CODE_TMPDIR: tmpBase },
   );
   assertEquals(JSON.parse(out).hookSpecificOutput.permissionDecision, "allow");
+});
+
+Deno.test({
+  name: "e2e: Windows 預設 os.tmpdir() 背景輸出 -> allow（不帶 CLAUDE_CODE_TMPDIR）",
+  ignore: Deno.build.os !== "windows",
+  async fn() {
+    const tempDir = "C:/Users/Public/cc-pc-e2e-temp"; // 作為 TEMP 傳入；子行程 os.tmpdir() 取此值
+    const base = normalizeAbsolute(tempDir); // 轉正斜線，避免 Bash 反斜線跳脫
+    const out = await runHookWithEnv(
+      e2ePayload(`cat ${base}/claude/${E2E_E}/${E2E_SID}/tasks/x.output`),
+      { CLAUDE_PROJECT_DIR: E2E_PROJ, HOME: E2E_HOME, TEMP: tempDir },
+    );
+    assertEquals(JSON.parse(out).hookSpecificOutput.permissionDecision, "allow");
+  },
 });
 
 Deno.test("e2e: CLAUDE_CONFIG_DIR 下 tool-results -> allow（跨平台）", async () => {
@@ -591,14 +595,24 @@ Deno.test("e2e: 不帶 CLAUDE_CONFIG_DIR 時，自訂 configDir 路徑 -> ask（
   );
   assertEquals(JSON.parse(out).hookSpecificOutput.permissionDecision, "ask");
 });
+
+Deno.test("e2e: 讀 transcript .jsonl 本身 -> ask（不自動放行）", async () => {
+  const out = await runHookWithEnv(
+    e2ePayload(`cat ${E2E_TRANSCRIPT}`),
+    { CLAUDE_PROJECT_DIR: E2E_PROJ, HOME: E2E_HOME },
+  );
+  assertEquals(JSON.parse(out).hookSpecificOutput.permissionDecision, "ask");
+});
 ```
 
-> 註：`Deno.uid()` 於 Windows 回 `null`；上面 `claude-${Deno.uid()}` 僅在非 Windows 分支取值（三元已先判 `windows`），故 Windows 走 `claude`、不呼叫 uid 字面。
+> 註：`Deno.uid()` 於 Windows 回 `null`；`claude-${Deno.uid()}` 僅在非 Windows 分支取值（三元已先判 `windows`）。
+> 既有 N4 e2e（`memory/`、他 session 子目錄）維持綠燈，新增涵蓋 transcript `.jsonl` 本身；Windows 預設
+> os.tmpdir() 案以 `TEMP` 餵入使子行程 `os.tmpdir()` 確定、驗證 `CLAUDE_CODE_TMPDIR ?? tmpdir()` 的 fallback 分支。
 
 - [ ] **Step 2: 跑 e2e 測試**
 
 Run: `deno test --allow-run --allow-env --allow-read --allow-sys=uid src/main_test.ts`
-Expected: PASS（新 3 案綠；既有 e2e 全綠）。
+Expected: PASS（新增 e2e 全綠；Windows 預設 os.tmpdir() 案僅於 Windows 執行、其餘平台被 `ignore` 跳過；既有 e2e 含 N4 維持綠燈）。
 
 - [ ] **Step 3: Commit**
 
@@ -644,34 +658,63 @@ echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"cat $CFG/projects/$E
   | USERPROFILE="$H" CLAUDE_PROJECT_DIR="D:/x/proj" ./dist/permission-checker.exe
 # 期望 allow
 
-# (b) CLAUDE_CONFIG_DIR 自訂下 tool-results -> allow
+# (b) 預設 os.tmpdir()（不帶 CLAUDE_CODE_TMPDIR）背景輸出 -> allow（起因 bug 之預設路徑）
+TMPD="$(node -e 'process.stdout.write(require("os").tmpdir())' | tr '\\' '/')"
+echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"tail -5 $TMPD/claude/$E/$SID/tasks/a.output\"},\"cwd\":\"D:/x/proj\",\"session_id\":\"$SID\",\"transcript_path\":\"$T\"}" \
+  | USERPROFILE="$H" CLAUDE_PROJECT_DIR="D:/x/proj" ./dist/permission-checker.exe
+# 期望 allow
+
+# (c) CLAUDE_CONFIG_DIR 自訂下 tool-results -> allow
 CFG2="D:/cc-cfg"; T2="$CFG2/projects/$E/$SID.jsonl"
 echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"cat $CFG2/projects/$E/$SID/tool-results/x.txt\"},\"cwd\":\"D:/x/proj\",\"session_id\":\"$SID\",\"transcript_path\":\"$T2\"}" \
   | USERPROFILE="$H" CLAUDE_PROJECT_DIR="D:/x/proj" CLAUDE_CONFIG_DIR="$CFG2" ./dist/permission-checker.exe
 # 期望 allow
 
-# (c) basename 與 session_id 不符 -> ask（G5(a)）
+# (d) <CLAUDE_CONFIG_DIR>/settings.json 的 permissions 確被讀入並影響判定：
+#     放一條 allow 規則，餵一個 allowlist 外（builtin 會 ask）的指令 -> 應升級為 allow
+mkdir -p "$CFG2"
+echo '{"permissions":{"allow":["Bash(npm run build:*)"]}}' > "$CFG2/settings.json"
+echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"npm run build\"},\"cwd\":\"D:/x/proj\",\"session_id\":\"$SID\",\"transcript_path\":\"$T2\"}" \
+  | USERPROFILE="$H" CLAUDE_PROJECT_DIR="D:/x/proj" CLAUDE_CONFIG_DIR="$CFG2" ./dist/permission-checker.exe
+# 期望 allow（理由命中 permissions.allow；證明自訂 config 的 settings.json 被讀入）
+
+# (e) transcript 檔名與 session_id 不符 -> ask
 echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"cat $CFG/projects/$E/$SID/tool-results/x.txt\"},\"cwd\":\"D:/x/proj\",\"session_id\":\"$SID\",\"transcript_path\":\"$CFG/projects/$E/deadbeef.jsonl\"}" \
   | USERPROFILE="$H" CLAUDE_PROJECT_DIR="D:/x/proj" ./dist/permission-checker.exe
 # 期望 ask
 
-# (d) 同專案 memory -> ask（N4）
+# (f) transcript 在 <configDir>/projects 之外 -> ask（位置綁定）
+echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"cat $H/.ssh/$SID/secret\"},\"cwd\":\"D:/x/proj\",\"session_id\":\"$SID\",\"transcript_path\":\"$H/.ssh/$SID.jsonl\"}" \
+  | USERPROFILE="$H" CLAUDE_PROJECT_DIR="D:/x/proj" ./dist/permission-checker.exe
+# 期望 ask
+
+# (g) 同專案 memory -> ask（不自動放行）
 echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"cat $CFG/projects/$E/memory/n.md\"},\"cwd\":\"D:/x/proj\",\"session_id\":\"$SID\",\"transcript_path\":\"$T\"}" \
   | USERPROFILE="$H" CLAUDE_PROJECT_DIR="D:/x/proj" ./dist/permission-checker.exe
 # 期望 ask
+
+# (h) 他 session 子目錄 -> ask（不自動放行）
+echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"cat $CFG/projects/$E/deadsess/tool-results/x.txt\"},\"cwd\":\"D:/x/proj\",\"session_id\":\"$SID\",\"transcript_path\":\"$T\"}" \
+  | USERPROFILE="$H" CLAUDE_PROJECT_DIR="D:/x/proj" ./dist/permission-checker.exe
+# 期望 ask
 ```
-Expected: (a)(b) `allow`；(c)(d) `ask`。任一不符即回 Task 1/2 修正。
+Expected: (a)(b)(c)(d) `allow`；(e)(f)(g)(h) `ask`。任一不符即回 Task 1/2 修正。
 
 - [ ] **Step 4: 更新 `CLAUDE.md`**
 
-在 `CLAUDE.md` 描述 trusted read roots 的段落（提及 `claude_dir.ts` 的 `sessionTrustedReadRoots`、`/tmp/claude-<uid>` 的那一節）更新為反映：tmp base = `CLAUDE_CODE_TMPDIR ?? os.tmpdir()` 跨 OS 去重聯集（POSIX 補 `/tmp`、darwin 補 `/private/tmp`、Windows 用 `claude` 無 uid）；trusted projects 根與 `settings.ts` 使用者 settings 位置改用 `CLAUDE_CONFIG_DIR ?? <home>/.claude`；`resolveClaudeConfigDir` 置於 `claude_dir.ts`；改用 `node:path/posix`；build task 新增 `--allow-env` 鍵；信任邊界純詞法、不碰 FS（§6.1 刻意決策，env 重導向使用者自負）。具體新增一段：
+在 `CLAUDE.md` 描述 trusted read roots 的段落（提及 `claude_dir.ts` 的 `sessionTrustedReadRoots`、`/tmp/claude-<uid>` 的那一節）更新，反映新行為。下面整段為**要寫進 `CLAUDE.md` 的最終文字**——不得含對 spec/plan 的章節引用（如「§…」「見規格」），須自述：
 
 ```markdown
-此外，trusted read root 對齊 Claude Code 真實行為：背景任務輸出 base 取 `CLAUDE_CODE_TMPDIR ?? os.tmpdir()`
-（跨 OS 去重聯集，另補 POSIX `/tmp`、darwin `/private/tmp`；Windows 目錄名為 `claude`、無 uid），工具輸出與
-使用者 settings 的根取 `CLAUDE_CONFIG_DIR ?? <home>/.claude`（`resolveClaudeConfigDir` 於 `claude_dir.ts`）。
-信任邊界純詞法、不碰 FS（不做 symlink/junction/UNC 檢查）；`TEMP`/`CLAUDE_CODE_TMPDIR`/`CLAUDE_CONFIG_DIR`
-重導向為使用者自負的設定風險。binary 之 `--allow-env` 已含 `CLAUDE_CONFIG_DIR,CLAUDE_CODE_TMPDIR,TMPDIR,TMP,TEMP,SystemRoot,windir`。
+trusted read root 對齊 Claude Code 真實行為（依反編譯 2.1.179 之 `MI()`/`QYz()`/`Mq` 取證）：
+- **背景任務輸出 base** 取 `CLAUDE_CODE_TMPDIR ?? os.tmpdir()`，與 POSIX 硬寫 `/tmp`、darwin `/private/tmp` 做
+  **去重聯集**；tmp 子目錄名在 **Windows 為 `claude`（無 uid）**、其他平台為 `claude-<uid>`。
+- **工具輸出**（`tool-results/`）與**使用者 `settings.json`** 的根取 `CLAUDE_CONFIG_DIR ?? <home>/.claude`；
+  `resolveClaudeConfigDir(env, home)` 置於 `claude_dir.ts`（`settings.ts` 借用以定位使用者 settings）。
+- 路徑切割改用 `node:path/posix` 的 `basename`/`dirname`。
+- 信任邊界**純詞法、不碰檔案系統**（不做 symlink/junction/UNC/共享目錄檢查）；以全域唯一 `session_id` 為信任鍵；
+  `transcript_path`/`session_id` 與行程 env（`CLAUDE_CONFIG_DIR`/`CLAUDE_CODE_TMPDIR`/`os.tmpdir()`）同源於當前
+  session。使用者把 `TEMP`/`CLAUDE_CODE_TMPDIR`/`CLAUDE_CONFIG_DIR` 重導向到非私有/共享位置，屬使用者自負的設定風險。
+- binary 之 `--allow-env` 已含 `CLAUDE_CONFIG_DIR,CLAUDE_CODE_TMPDIR,TMPDIR,TMP,TEMP,SystemRoot,windir`（另 `--allow-sys=uid`）。
 ```
 
 - [ ] **Step 5: 最終全綠驗證**
@@ -695,6 +738,6 @@ EOF
 ## 完成準則
 
 - `deno task check`、`deno task lint`、`deno task test` 全綠。
-- Operational verification：Windows 背景任務輸出 `allow`、tool-results `allow`、`CLAUDE_CONFIG_DIR` 自訂 `allow`、G5(a)/N4 否決 `ask`。
+- Operational verification：Windows 背景任務輸出（預設 os.tmpdir() 與 `CLAUDE_CODE_TMPDIR` 兩形）`allow`、tool-results `allow`、`CLAUDE_CONFIG_DIR` 自訂 `allow` 且其 `settings.json` 規則生效；transcript 檔名/位置綁定不符與 N4 路徑 `ask`。
 - 既有 trusted/deny e2e 全數維持綠燈。
 - `CLAUDE.md` 已反映新行為。
