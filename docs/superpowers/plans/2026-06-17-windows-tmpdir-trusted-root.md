@@ -10,6 +10,10 @@
 
 **規格來源：** [docs/superpowers/specs/2026-06-17-windows-tmpdir-trusted-root-design.md](../specs/2026-06-17-windows-tmpdir-trusted-root-design.md)（commit 39376a6）
 
+> **執行環境註**：本計畫所有 `git commit -F - <<'EOF' … EOF` 區塊，以及 `tail`/`grep`/`mkdir`/`echo`/`node -e`/`tr`
+> 等指令，一律於 **Git-Bash（Bash tool、POSIX 風格）** 執行（依本專案 CLAUDE.md），**勿在 PowerShell 跑 here-doc**。
+> `deno task …`（check/lint/test/build）於 Git-Bash 或 PowerShell 皆可。
+
 ---
 
 ## 檔案結構
@@ -658,11 +662,11 @@ echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"cat $CFG/projects/$E
   | USERPROFILE="$H" CLAUDE_PROJECT_DIR="D:/x/proj" ./dist/permission-checker.exe
 # 期望 allow
 
-# (b) 預設 os.tmpdir()（不帶 CLAUDE_CODE_TMPDIR）背景輸出 -> allow（起因 bug 之預設路徑）
+# (b) 預設 os.tmpdir()（不帶 CLAUDE_CODE_TMPDIR）+ 起因管線形 -> allow（起因 bug 之預設路徑與管線）
 TMPD="$(node -e 'process.stdout.write(require("os").tmpdir())' | tr '\\' '/')"
-echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"tail -5 $TMPD/claude/$E/$SID/tasks/a.output\"},\"cwd\":\"D:/x/proj\",\"session_id\":\"$SID\",\"transcript_path\":\"$T\"}" \
+echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"tail -5 $TMPD/claude/$E/$SID/tasks/a.output | grep -v codex | grep -v Deprecation\"},\"cwd\":\"D:/x/proj\",\"session_id\":\"$SID\",\"transcript_path\":\"$T\"}" \
   | USERPROFILE="$H" CLAUDE_PROJECT_DIR="D:/x/proj" ./dist/permission-checker.exe
-# 期望 allow
+# 期望 allow（tail 路徑在 trusted 根；兩個 grep 讀 stdin 無路徑可檢）
 
 # (c) CLAUDE_CONFIG_DIR 自訂下 tool-results -> allow
 CFG2="D:/cc-cfg"; T2="$CFG2/projects/$E/$SID.jsonl"
