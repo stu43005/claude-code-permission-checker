@@ -8,7 +8,7 @@
     "test": "deno test --allow-run --allow-env --allow-read --allow-sys=uid",
     "check": "deno check src/**/*.ts",
     "lint": "deno lint",
-    "build": "deno compile --allow-read --allow-env=CLAUDE_PROJECT_DIR,HOME,USERPROFILE --allow-sys=uid --output dist/permission-checker src/main.ts"
+    "build": "deno compile --allow-read --allow-env=CLAUDE_PROJECT_DIR,HOME,USERPROFILE,CLAUDE_CONFIG_DIR,CLAUDE_CODE_TMPDIR,TMPDIR,TMP,TEMP,SystemRoot,windir --allow-sys=uid --output dist/permission-checker src/main.ts"
   },
   "lint": { "rules": { "tags": ["recommended"] } }
 }
