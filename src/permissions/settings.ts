@@ -1,5 +1,6 @@
 import type { EnvReader } from "../project.ts";
 import { normalizeAbsolute } from "../engine/scope.ts";
+import { resolveClaudeConfigDir } from "../claude_dir.ts";
 import { type BashPattern, parseBashRule } from "./matcher.ts";
 import { EMPTY_READ_SCOPE, parsePathRule, type ReadScope } from "./path_scope.ts";
 import {
@@ -167,9 +168,10 @@ export function loadPermissionRules(
       `${root}/.claude/settings.json`,
       `${root}/.claude/settings.local.json`,
     ];
-    const home = resolveHome(env);
-    if (home !== null) {
-      paths.push(normalizeAbsolute(`${home}/.claude/settings.json`));
+    const home = resolveHome(env); // 供 parsePathRule 的 ~ 展開、並傳給 resolveClaudeConfigDir
+    const configDir = resolveClaudeConfigDir(env, home);
+    if (configDir !== null) {
+      paths.push(normalizeAbsolute(`${configDir}/settings.json`));
     }
     const merged = emptyRules();
     for (const path of paths) {

@@ -265,3 +265,41 @@ Deno.test("missing/garbage file -> empty webFetch (fail-safe)", () => {
   assertEquals(rules.webFetch.deny, EMPTY_DOMAIN_SCOPE);
   assertEquals(rules.webFetch.ask, EMPTY_DOMAIN_SCOPE);
 });
+
+Deno.test("CLAUDE_CONFIG_DIR 設定時，使用者 settings 改讀 <configDir>/settings.json", () => {
+  const requested: string[] = [];
+  const reader: ReadText = (path) => {
+    requested.push(path);
+    return null;
+  };
+  loadPermissionRules(
+    fakeEnv({ HOME: "/home/u", CLAUDE_CONFIG_DIR: "/opt/cc" }),
+    ROOT,
+    reader,
+  );
+  assertEquals(requested, [
+    "/proj/.claude/settings.json",
+    "/proj/.claude/settings.local.json",
+    "/opt/cc/settings.json",
+  ]);
+});
+
+Deno.test("CLAUDE_CONFIG_DIR 未設時，使用者 settings 仍讀 <home>/.claude/settings.json（相容）", () => {
+  const requested: string[] = [];
+  const reader: ReadText = (path) => {
+    requested.push(path);
+    return null;
+  };
+  loadPermissionRules(fakeEnv({ HOME: "/home/u" }), ROOT, reader);
+  assertEquals(requested[2], "/home/u/.claude/settings.json");
+});
+
+// resolveClaudeConfigDir 的單元測在 claude_dir_test.ts；此處僅驗 loadPermissionRules 整合
+Deno.test("loadPermissionRules 讀入自訂 configDir 的 permissions 規則", () => {
+  const rules = loadPermissionRules(
+    fakeEnv({ HOME: "/home/u", CLAUDE_CONFIG_DIR: "/opt/cc" }),
+    ROOT,
+    fakeReadText({ "/opt/cc/settings.json": JSON.stringify({ permissions: { allow: ["Bash(z:*)"] } }) }),
+  );
+  assertEquals(rules.bash.allow, [{ kind: "prefix-boundary", prefix: "z" }]);
+});
