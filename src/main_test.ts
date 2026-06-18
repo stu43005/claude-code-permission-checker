@@ -231,3 +231,60 @@ Deno.test({
     assertEquals(JSON.parse(out).hookSpecificOutput.permissionDecision, "allow");
   },
 });
+
+Deno.test("e2e: CLAUDE_CODE_TMPDIR 任務輸出 -> allow（跨平台）", async () => {
+  const tmpBase = `${E2E_HOME}/tmp-override`; // 顯式覆寫（正斜線、跨平台安全）→ 子行程 osTmpBase 確定
+  const claudeDir = Deno.build.os === "windows" ? "claude" : `claude-${Deno.uid()}`;
+  const out = await runHookWithEnv(
+    e2ePayload(`cat ${tmpBase}/${claudeDir}/${E2E_E}/${E2E_SID}/tasks/x.output`),
+    { CLAUDE_PROJECT_DIR: E2E_PROJ, HOME: E2E_HOME, CLAUDE_CODE_TMPDIR: tmpBase },
+  );
+  assertEquals(JSON.parse(out).hookSpecificOutput.permissionDecision, "allow");
+});
+
+Deno.test({
+  name: "e2e: Windows 預設 os.tmpdir() 背景輸出 -> allow（不帶 CLAUDE_CODE_TMPDIR）",
+  ignore: Deno.build.os !== "windows",
+  async fn() {
+    const tempDir = "C:/Users/Public/cc-pc-e2e-temp"; // 作為 TEMP 傳入；子行程 os.tmpdir() 取此值
+    const base = normalizeAbsolute(tempDir); // 轉正斜線，避免 Bash 反斜線跳脫
+    const out = await runHookWithEnv(
+      e2ePayload(`cat ${base}/claude/${E2E_E}/${E2E_SID}/tasks/x.output`),
+      { CLAUDE_PROJECT_DIR: E2E_PROJ, HOME: E2E_HOME, TEMP: tempDir },
+    );
+    assertEquals(JSON.parse(out).hookSpecificOutput.permissionDecision, "allow");
+  },
+});
+
+Deno.test("e2e: CLAUDE_CONFIG_DIR 下 tool-results -> allow（跨平台）", async () => {
+  const cfg = "/tmp/cc-pc-e2e-cfg";
+  const transcript = `${cfg}/projects/${E2E_E}/${E2E_SID}.jsonl`;
+  const out = await runHookWithEnv(
+    {
+      tool_name: "Bash",
+      tool_input: { command: `cat ${cfg}/projects/${E2E_E}/${E2E_SID}/tool-results/x.txt` },
+      cwd: E2E_PROJ,
+      session_id: E2E_SID,
+      transcript_path: transcript,
+    },
+    { CLAUDE_PROJECT_DIR: E2E_PROJ, HOME: E2E_HOME, CLAUDE_CONFIG_DIR: cfg },
+  );
+  assertEquals(JSON.parse(out).hookSpecificOutput.permissionDecision, "allow");
+});
+
+Deno.test("e2e: 不帶 CLAUDE_CONFIG_DIR 時，自訂 configDir 路徑 -> ask（相容性回歸）", async () => {
+  const cfg = "/tmp/cc-pc-e2e-cfg";
+  const out = await runHookWithEnv(
+    e2ePayload(`cat ${cfg}/projects/${E2E_E}/${E2E_SID}/tool-results/x.txt`),
+    { CLAUDE_PROJECT_DIR: E2E_PROJ, HOME: E2E_HOME },
+  );
+  assertEquals(JSON.parse(out).hookSpecificOutput.permissionDecision, "ask");
+});
+
+Deno.test("e2e: 讀 transcript .jsonl 本身 -> ask（不自動放行）", async () => {
+  const out = await runHookWithEnv(
+    e2ePayload(`cat ${E2E_TRANSCRIPT}`),
+    { CLAUDE_PROJECT_DIR: E2E_PROJ, HOME: E2E_HOME },
+  );
+  assertEquals(JSON.parse(out).hookSpecificOutput.permissionDecision, "ask");
+});
