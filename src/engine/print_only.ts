@@ -80,8 +80,13 @@ function isPrintfPrintOnly(inv: CommandInvocation): boolean {
   return true;
 }
 
-/** format 是否含「會做格式化轉換」的轉換符（排除 %s / %b 純字串、字面 %%）。 */
+/**
+ * format 是否含「會做格式化轉換」的轉換符（排除 %s / %b 純字串、字面 %%）。
+ * 涵蓋：數值/字元轉換（含 length modifier 如 %ld/%lld/%hd）、Bash 的 %q（shell 引用）、
+ * %n（寫入）、以及 %(...)T（strftime 日期）。
+ */
 function hasFormatterConversion(fmt: string): boolean {
   const stripped = fmt.replace(/%%/g, "");
-  return /%[-+ 0#]*[0-9.*]*[diouxXeEfFgGaACc]/.test(stripped);
+  return /%[-+ 0#']*[0-9*]*(\.[0-9*]*)?(hh|h|ll|l|L|j|z|t)?[diouxXeEfFgGaAcCqn]/.test(stripped) ||
+    /%\([^)]*\)T/.test(stripped);
 }

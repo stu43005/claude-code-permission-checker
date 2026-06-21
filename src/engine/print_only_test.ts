@@ -99,3 +99,13 @@ Deno.test("printf 動態/替換型第一引數 → 保守視為非 print（與 e
   // 故 printf 的命令替換包裝**不**比照 echo 硬 deny，而是非 print 形態 → 落 classify（ask）。
   assertEquals(isPrintOnlyForm(invs('printf "$(echo fake)"')[0]), false);
 });
+
+Deno.test("printf carve-out 涵蓋 length modifier / %q / %n / strftime（避免誤 deny）", () => {
+  assertEquals(isPrintOnlyForm(invs('printf "%ld\\n" 42')[0]), false);   // long 數值 → carve-out
+  assertEquals(isPrintOnlyForm(invs('printf "%lld" 42')[0]), false);     // long long
+  assertEquals(isPrintOnlyForm(invs('printf "%hd" 42')[0]), false);      // short
+  assertEquals(isPrintOnlyForm(invs('printf "%q\\n" foo')[0]), false);   // bash shell-quote
+  assertEquals(isPrintOnlyForm(invs('printf "%(%Y-%m-%d)T"')[0]), false); // strftime 日期
+  assertEquals(isPrintOnlyForm(invs('printf "%s\\n" "結論"')[0]), true);  // %s 純字串 → 仍 print（回歸）
+  assertEquals(isPrintOnlyForm(invs('printf "%b" "x"')[0]), true);        // %b 純字串 → 仍 print（回歸）
+});
