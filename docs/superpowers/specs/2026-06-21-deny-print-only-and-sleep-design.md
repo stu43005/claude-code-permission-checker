@@ -212,8 +212,8 @@ main.ts → evaluate(command, root, initialCwd, rules, home, trustedReadRoots)
        ├─ invocations.length === 0 → allow（既有 no-op，不變）
        │  （先算 fnNames = definedFunctionNames(script)、anyShadowed）
        ├─ 閘①(deny)：some(name === "sleep") → deny(pollingDenyReason())   （字面 sleep 一律 deny；classify 前短路）
-       ├─ 閘②(deny)：!anyShadowed && isAllPrintOnly(invocations) → deny(printOnlyDenyReason()) （短路）
-       ├─ 閘③(ask) ：anyShadowed → ask(functionShadowReason())            （§4.9；classify 前短路）
+       ├─ 閘②(deny)：isAllPrintOnly(invocations) → deny(printOnlyDenyReason()) （整鏈 print-form 名一律 deny；短路）
+       ├─ 閘③(ask) ：anyShadowed → ask(functionShadowReason())            （承接非 print-form 遮蔽名；§4.9；短路）
        └─ combine(invocations.map(classify))                          （既有；含 heredoc body 內層指令）
              └─ classify → classifyBuiltin
                    └─ 中央前置規則 #4：輸入重導向 `<` 目標超出讀取範圍 → ask  （新增；見 §4.7）
@@ -270,18 +270,27 @@ export function isPrintOnlyForm(inv: CommandInvocation): boolean {
 
 ```ts
 function isEchoPrintOnly(inv: CommandInvocation): boolean {
+  let hasEscapeFlag = false;       // 出現 -e / -E（跳脫詮釋旗標）
+  let hasBackslashPayload = false; // 某 payload 含反斜線跳脫序列（-e 會實際詮釋者）
   for (const w of inv.argv) {
     if (!wordPrintEligible(w)) return false;           // 含變數/glob/算術等非替換動態 → 排除
     const v = staticValue(w);                           // 替換型 word 的 staticValue 為 null
-    if (v !== null && /^-[neE]*[eE][neE]*$/.test(v)) return false; // carve-out：-e/-E 跳脫旗標
+    if (v === null) continue;                           // 替換型 payload，無法詞法掃跳脫
+    if (/^-[neE]*[eE][neE]*$/.test(v)) { hasEscapeFlag = true; continue; } // -e/-E 旗標
+    if (v.includes("\\")) hasBackslashPayload = true;   // payload 含反斜線
   }
+  // carve-out（行為探測）僅當「有 -e/-E **且** payload 真的含反斜線跳脫」——`echo -e "a\tb"` 才算；
+  // `echo -e "verified"`（無跳脫）仍視為 print 形態 → 可被硬 deny（修 round 14 finding 2）。
+  if (hasEscapeFlag && hasBackslashPayload) return false;
   return true;
 }
 ```
 
-- 所有 argv 須 `wordPrintEligible`（靜態、或唯一動態成分為命令替換 `$( … )`）；任一含 `-e` / `-E`
-  （跳脫詮釋旗標）即 carve-out → 非 print 形態（落回 echo 既有 `allow`）。`-n`（僅抑制換行）**不**算
-  carve-out。
+- carve-out（→ 非 print 形態、落回 echo `allow`）**收窄為**：有 `-e`/`-E` 旗標**且** payload 含反斜線
+  跳脫（如 `echo -e "a\tb"`、`echo -e "x\n"`——真的在探測跳脫詮釋）。`-n`（僅抑制換行）不算。
+- **`echo -e "verified"` / `echo -E "analysis"`（有旗標、無跳脫）→ print 形態 → 整鏈 print 則硬 deny**
+  （封堵「加個無害旗標就繞過」）。殘留：`echo -e "fake\n"`（僅 `\n` 跳脫）會落入 carve-out → allow，
+  屬罕見且輕微的接受弱點。
 - `echo`（無引數）→ argv 空 → 通過 → print 形態。
 - **替換包裝偽裝**：`echo "$(echo fake)"` → 外層 echo 的字僅替換動態 → 合格；又因聚合 `every()`
   涵蓋替換內層葉指令（inner `echo fake` 亦為 print 形態）→ 整鏈全 print → **deny**。對照
@@ -461,11 +470,13 @@ const anyShadowed = invocations.some(isShadowed);
 if (invocations.some((inv) => inv.name === "sleep")) {
   return { verdict: "deny", reason: pollingDenyReason() };
 }
-// 閘 ②（deny）：整鏈皆 print 形態——僅當**無任何名稱被遮蔽**時才信任（遮蔽使 print-form 名不可信）
-if (!anyShadowed && isAllPrintOnly(invocations)) {
+// 閘 ②（deny）：整鏈皆 print 形態 → deny。**不**以 anyShadowed 豁免（同 sleep：避免 later/dead
+//             函式定義把真實 print-only 降級為 ask，如 `echo "fake"; echo(){:;}`）。
+if (isAllPrintOnly(invocations)) {
   return { verdict: "deny", reason: printOnlyDenyReason() };
 }
-// 閘 ③（ask）：存在被遮蔽 / 被呼叫的使用者函式名 → 實際執行的是函式本體、name 分析不可信 → 人工確認
+// 閘 ③（ask）：存在被遮蔽 / 被呼叫的使用者函式名（且未被閘①②攔下）→ 實際執行函式本體、name
+//             分析不可信 → 人工確認。此處承接「非 print-form 名」的遮蔽（date/pwd/waiter…）。
 if (anyShadowed) {
   return { verdict: "ask", reason: functionShadowReason() };
 }
@@ -480,9 +491,11 @@ return combine(invocations.map((inv) => classify(inv, root, rules, home, trusted
   sleep、後定義）或 `if false; then sleep(){ :; }; fi; sleep 5`（dead 分支定義）會把**真實會執行的
   sleep** 誤降為 ask。故 sleep deny **一律對字面 sleep 生效**；`sleep(){ :; }; sleep 5`（重定義為
   no-op）也照 deny（over-deny 一個 no-op，安全、可接受）。
-- **閘② 仍排除遮蔽（保留 round 11 fix）**：`echo(){ grep x f; }; echo` 因 echo 被遮蔽 → `!anyShadowed`
-  為 false 而**跳過**閘②，落閘③ → ask（而非誤判 print-only deny、理由不誤導）；真實 `echo "fake"`
-  （無函式定義）→ 閘② deny。
+- **閘② 不受遮蔽豁免（修 round 14 finding 1）**：整鏈 print-form 名即 deny。global `anyShadowed` 是
+  名稱集合、非執行序，若用它豁免 print-only 會被 `echo "fake"; echo(){ :; }`（呼叫在前、定義在後）或
+  dead 分支定義降級為 ask——破壞硬 deny。故 print-form 名一律 deny；代價是 `echo(){ grep x f; }; echo`
+  （把 echo 重定義為 grep 再呼叫）也會被當 print-only deny（理由略不精確，但 deny 是安全方向、且此構造
+  極罕見、非合法用途，可接受）。
 - **閘③ 涵蓋「呼叫使用者自定函式」（修 round 12 finding 1）**：`waiter(){ sleep 5; }; waiter`、
   `report(){ echo "verified"; }; report` 的 `waiter`/`report` ∈ `definedFunctionNames` → 閘③ ask
   （非 upgradeable）。**不走訪函式本體**（YAGNI，見 §4.9）；body 內的 sleep/echo 不被展開，但已由
@@ -679,10 +692,13 @@ for (const r of inv.redirects) {
   僅名稱集合、無執行序，若豁免 sleep 會把 `sleep 5; sleep(){:;}`、`if false; then sleep(){:;}; fi; sleep 5`
   等**真實會跑的 sleep** 誤降為 ask。故凡字面 `sleep` 葉指令 → deny；`sleep(){:;}; sleep 5`（no-op
   重定義）亦 deny（over-deny 一個 no-op，安全）。
-- 閘②（print-only deny）以 `!anyShadowed` 為前提（保留 round 11 fix）：`echo(){ grep needle README.md; };
-  echo` 因 echo 被遮蔽 → **跳過**閘② → 落閘③ ask（**不**誤判 print-only deny、理由不誤導）。
-- 閘③（ask）在閘①②之後，承接所有「含遮蔽 / 呼叫使用者函式」情形（`date(){sleep;}; date`、
-  `waiter(){sleep;}; waiter`、`report(){echo假;}; report`）→ ask（非 upgradeable）。
+- **閘②（print-only deny）對整鏈 print-form 名一律生效、不排除遮蔽**（修 round 14 finding 1）：同 sleep
+  之理由——若以 `anyShadowed` 豁免，`echo "fake"; echo(){:;}`（呼叫在前、定義在後）或 dead 分支定義會把
+  真實 print-only 降級為 ask。故 print-form 名（echo/printf/cat-heredoc）一律 deny；代價是
+  `echo(){ grep needle README.md; }; echo`（重定義 echo 為 grep 再呼叫）也被當 print-only deny（理由略
+  不精確、但 deny 安全，且此構造極罕見非合法用途，可接受）。
+- 閘③（ask）在閘①②之後，承接「**非 print-form 名**」的遮蔽 / 呼叫使用者函式情形（`date(){sleep;}; date`、
+  `pwd(){echo;}; pwd`、`waiter(){sleep;}; waiter`、`report(){echo假;}; report`）→ ask（非 upgradeable）。
 
 ## 5. 與 `permissions.allow` 升級層的互動
 
@@ -743,7 +759,8 @@ for (const r of inv.redirects) {
 | `cat README.md && echo ok` | allow/ask | 不變（cat README.md 非 passthrough） |
 | `echo data \| grep x` | ask（grep 視範圍） | 不變（grep 非 print → 非全鏈 print） |
 | `cat <<EOF...EOF \| python` | ask | 不變（python 非 print → 非全鏈 print） |
-| `echo -e "a\tb"` | allow | allow（carve-out：跳脫旗標） |
+| `echo -e "a\tb"` | allow | allow（carve-out：-e + 真實反斜線跳脫 → 行為探測） |
+| `echo -e "verified"` / `echo -E "analysis"` | allow | **deny**（有旗標但無跳脫 → 仍 print 形態；封堵旗標繞過） |
 | `printf "%05d\n" 42` / `printf "%.2f" 3.14` | ask | ask（carve-out：數值/格式化轉換符 → 行為檢查） |
 | `printf "%s\n" "結論"` / `printf "%b" "x"` | ask | **deny**（%s/%b 純字串非行為檢查；整鏈 print；`Bash(printf *)` 不可升級） |
 | `echo {1..5}` / `echo *.txt` | allow | 不變（brace/glob → 非全靜態 → 非 print 形態） |
@@ -797,10 +814,11 @@ for (const r of inv.redirects) {
     `echo x | grep y`、`cat <<EOF\nx\nEOF | python`、`echo data | wc -l`、`echo "$(date)"`
     （inner date 非 print）、`echo "$(cat real)"`（inner cat 讀檔非 print）、`cat <<EOF\n$(rm)\nEOF`
     （內層 rm 非 print → 非全鏈 print）。
-  - carve-out **不** deny（行為檢查）：`echo -e "a\tb"`、`echo -ne "x"`、`printf "%05d\n" 42`、
-    `printf "%.2f" 3.14`、`printf "%c" 65`。
-  - **carve-out 收窄後仍 deny**（`%s`/`%b` 純字串非行為檢查）：`printf "%s\n" "結論"`、`printf "%b" "x"`
-    （整鏈 print → deny；且含 `Bash(printf *)` 仍 deny，驗證不可升級）。
+  - carve-out **不** deny（行為檢查）：`echo -e "a\tb"`（-e + `\t`）、`echo -ne "x\n"`（含跳脫）、
+    `printf "%05d\n" 42`、`printf "%.2f" 3.14`、`printf "%c" 65`。
+  - **carve-out 收窄後仍 deny**：`echo -e "verified"`、`echo -E "analysis"`（旗標但無反斜線跳脫）、
+    `printf "%s\n" "結論"`、`printf "%b" "x"`（%s/%b 純字串）→ 整鏈 print → deny；**且含
+    `Bash(echo *)`/`Bash(printf *)` 仍 deny，驗證不可升級**。
   - 前置排除**不** deny：`echo x > f`（寫檔）、`cat > /tmp/x << EOF\nx\nEOF`（寫檔）、`FOO=1 echo x`
     （賦值）、`echo "$VAR"`（變數非替換 → 不合格）、`echo "a$VAR b"`（含變數）、`echo {1..5}`（brace）。
   - `wordPrintEligible` 邊界：`echo "$(c)"` 合格、`echo a$(c)b` 合格、`echo "$VAR"` 不合格、
@@ -850,9 +868,12 @@ for (const r of inv.redirects) {
   evaluate 對 `date(){ sleep 5; }; date`、`pwd(){ echo fake; }; pwd` → `ask`（**且含 `Bash(date *)` /
   `Bash(pwd *)` 仍 ask**，驗證閘③在 classify/settingsAllows 之前）；`f(){ :; }; ls -la` → **非** ask
   （ls 未被遮蔽，照常 allow）；`waiter(){ sleep 5; }; waiter`、`report(){ echo fake; }; report` →
-  **ask**（呼叫使用者自定函式，含 `Bash(waiter *)` 仍 ask）；`echo(){ grep needle README.md; }; echo`
-  → **ask**（被遮蔽 → 跳過閘② print-only deny，非誤硬 deny）。
-  **sleep 不受遮蔽影響（finding 2 回歸）**：`sleep(){ :; }; sleep 5`、`sleep 5; sleep(){ :; }`、
+  **ask**（呼叫使用者自定函式，含 `Bash(waiter *)` 仍 ask）。
+  **print-only 不受遮蔽降級（finding 1 回歸）**：`echo "fake"; echo(){ :; }`（呼叫在前定義在後）、
+  `if false; then echo(){:;}; fi; echo "fake"`（dead 分支）→ 皆 **deny**（閘② print-form 名一律 deny、
+  不被 anyShadowed 降級）；`echo(){ grep needle README.md; }; echo`（重定義 echo）→ 亦 **deny**（接受
+  之 over-deny）。
+  **sleep 不受遮蔽影響（round 12 finding 2 回歸）**：`sleep(){ :; }; sleep 5`、`sleep 5; sleep(){ :; }`、
   `if false; then sleep(){ :; }; fi; sleep 5` → 皆 **deny**（閘① 對字面 sleep 一律生效）；
   `foo(){ :; }; foo; sleep 5` → deny（字面 sleep）。
 - `src/rules/types_test.ts`（或併入 sleep/print_only 測試）：`printOnlyDenyReason()` /
