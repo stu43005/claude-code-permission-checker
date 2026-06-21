@@ -19,12 +19,12 @@ const DYNAMIC_PART_TYPES = new Set<string>([
 const GLOB_CHARS = /[*?[]/;
 
 /** 雙引號內的 part：glob 字元被引號保護不展開，僅展開類 part 才算動態。 */
-function nestedPartIsDynamic(part: WordPart): boolean {
+export function nestedPartIsDynamic(part: WordPart): boolean {
   return DYNAMIC_PART_TYPES.has(part.type);
 }
 
 /** 頂層 part：展開類 → 動態；未加引號的 Literal 含 glob 字元 → 動態。 */
-function topPartIsDynamic(part: WordPart): boolean {
+export function topPartIsDynamic(part: WordPart): boolean {
   if (DYNAMIC_PART_TYPES.has(part.type)) return true;
   if (part.type === "Literal") return GLOB_CHARS.test(part.value); // 未加引號字面值
   // 雙引號 / locale 字串：內部 glob 不展開，只看展開類 part
