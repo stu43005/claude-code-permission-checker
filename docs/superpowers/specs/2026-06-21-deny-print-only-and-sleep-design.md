@@ -199,6 +199,7 @@ main.ts → evaluate(command, root, initialCwd, rules, home, trustedReadRoots)
        ├─ invocations.length === 0 → allow（既有 no-op，不變）
        ├─ 硬 deny 閘①：some(inv.name === "sleep") → deny(pollingDenyReason())  （新增；classify 前短路）
        ├─ 硬 deny 閘②：isAllPrintOnly(invocations) → deny(printOnlyDenyReason()) （新增；classify 前短路）
+       ├─ 閘③：函式遮蔽（呼叫名 ∈ definedFunctionNames）→ ask(functionShadowReason()) （新增；§4.9）
        └─ combine(invocations.map(classify))                          （既有；含 heredoc body 內層指令）
              └─ classify → classifyBuiltin
                    └─ 中央前置規則 #4：輸入重導向 `<` 目標超出讀取範圍 → ask  （新增；見 §4.7）
@@ -428,11 +429,18 @@ if (invocations.some((inv) => inv.name === "sleep")) {
 if (isAllPrintOnly(invocations)) {
   return { verdict: "deny", reason: printOnlyDenyReason() };
 }
+// 閘 ③：函式遮蔽——若有同腳本函式定義「遮蔽」了某個被呼叫的指令名，name 分析不可信 → ask（見 §4.9）
+const fnNames = definedFunctionNames(script);
+if (fnNames.size > 0 && invocations.some((inv) => inv.name !== null && fnNames.has(inv.name))) {
+  return { verdict: "ask", reason: functionShadowReason() };
+}
 return combine(invocations.map((inv) => classify(inv, root, rules, home, trustedReadRoots)));
 ```
 
-- **兩閘皆在 `classify` 之前返回 → 不經任何中央前置規則、不經 `settingsAllows` → 真正硬性、
-  `permissions.allow` 無法解除**。
+- **三閘皆在 `classify` 之前返回 → 不經任何中央前置規則、不經 `settingsAllows` → 真正硬性（deny）/
+  不可被 `permissions.allow` 升級（閘③的 ask）**。閘①②為 deny、閘③為 ask（deny 先於 ask，故真實裸
+  sleep / 整鏈 print 仍優先硬 deny；閘③只攔「外觀為 allowlist 指令、實際被函式遮蔽」者，把 allow
+  降為 ask）。
 - **sleep 改為 evaluate 層掃描（取代原 per-command rule）的關鍵原因**：per-command rule 在
   `classifyBuiltin` 中**排在中央前置規則之後**，故 `FOO=1 sleep 5`（賦值前綴）、`sleep 5 > out`
   （寫入重導向）等會**先**被中央規則判 `ask`、根本到不了 sleep rule，且該 ask 還會被
@@ -470,9 +478,18 @@ export function pollingDenyReason(): string {
     `會自動以 task-notification 重新喚醒你，不需主動等待。若需排程下次喚醒，請改用 ScheduleWakeup，` +
     `不要用 Bash sleep 輪詢。`;
 }
+
+/** 函式遮蔽 allowlist 指令名的 ask 理由（回饋給 agent）。 */
+export function functionShadowReason(): string {
+  return `需確認：此指令在同一字串內定義了 shell 函式並覆寫（遮蔽）了一個指令名再呼叫，實際執行的是` +
+    `函式本體、而非該指令本身——權限檢查無法靜態得知函式本體做什麼。請改為直接執行真正的指令（不要` +
+    `用同名函式覆寫），或拆成多次呼叫以便逐一檢查。`;
+}
 ```
 
-- **反例（禁止）**：`deny("sleep 被禁止")`、`deny("print-only")`——只描述、未解釋、未給替代。
+- **deny 理由三要素**（被禁止的事 / 為何禁止 / 替代）；**反例（禁止）**：`deny("sleep 被禁止")`、
+  `deny("print-only")`——只描述、未解釋、未給替代。`functionShadowReason` 為 **ask** 理由（給使用者），
+  同樣需說明原因與替代。
 
 ### 4.6 walk.ts：列舉 heredoc `body` 內的命令替換（正確封堵 heredoc 盲點）
 
@@ -583,6 +600,34 @@ for (const r of inv.redirects) {
   區隔——sleep 在唯讀情境無正當用途，tail -f 有。此 ask **可被** `Bash(tail *)` 升級（使用者自負）。
 - `tail`（無 `-f`）→ 維持唯讀 allow（同原 fileReaderRule 行為）。
 
+### 4.9 函式遮蔽偵測（`src/engine/walk.ts` + `evaluate.ts`）→ ask
+
+**動機（堵函式覆寫繞道）**：Bash 可在同一指令字串內**定義函式覆寫 allowlist 指令名**再呼叫，例：
+`date(){ sleep 5; }; date`、`pwd(){ echo "fake verification"; }; pwd`。`walk.ts` 既有 `case
+"Function"` **忽略函式本體**，故只看到後續 `date`/`pwd` 葉指令（allowlist → 可能 allow），而真正執行的
+本體（sleep / echo 假）被隱藏——使 sleep / print-only 硬 deny 與「name 即執行碼」假設失效。
+
+**設計（保守，不走訪函式本體）**：
+
+1. `walk.ts` 既有遍歷會經過 `Function` 節點；新增**收集函式定義名**的能力——提供
+   `definedFunctionNames(script): Set<string>`（遞迴掃描 AST 所有 `Function` 節點、取其 `name`；
+   涵蓋巢狀於 brace group / subshell / if / for 等之內的定義）。
+2. `evaluate` 閘③：若 `definedFunctionNames(script)` 非空、**且**任一 invocation 的 `name` 落在該集合
+   （= 被同腳本函式遮蔽）→ 回 **ask**（`functionShadowReason()`），在 classify 之前返回（不被
+   `permissions.allow` 升級——`date(){ sleep 5; }; date` 即使有 `Bash(date *)` 仍 ask）。
+
+**為何 ask（而非 deny 或走訪本體）**：函式本體內容對 name 分析不可知（可能良性、可能 sleep/危險）；
+保守降為 ask（人工確認）即可關閉「靜默 allow」漏洞，符合「誤 ask 可接受、誤 allow 不可接受」。走訪
+函式本體（內聯展開 + 遞迴上限）較精確但複雜，本功能不採（YAGNI；漏走訪只退回 ask、不誤放行）。
+
+**精確度**：只在「**被呼叫的 name 確實被函式定義遮蔽**」時 ask，避免過度誤判：
+- `date(){ sleep 5; }; date` → date ∈ 定義集 → **ask**。
+- `pwd(){ echo fake; }; pwd` → pwd ∈ 定義集 → **ask**（原 allow）。
+- `f(){ :; }; ls -la` → 呼叫的 `ls` 不在定義集 `{f}`（f 未被呼叫）→ **不**受閘③影響，`ls` 照常判定。
+- 順序保守：只要某 name 在腳本中**既被定義為函式又被呼叫**即 ask（不細究定義/呼叫先後，安全方向）。
+- 與 deny 閘的關係：deny（裸 sleep / 整鏈 print）先於閘③；若 `sleep(){ :; }; sleep 5`（把 sleep
+  覆寫成 no-op）仍因閘① `name==="sleep"` → deny（over-deny 一個 no-op，安全、可接受）。
+
 ## 5. 與 `permissions.allow` 升級層的互動
 
 - **整鏈 print-only deny** 在 `evaluate` 層、`classify` 之前返回，根本不進入 `settingsAllows`：
@@ -669,6 +714,9 @@ for (const r of inv.redirects) {
 | `cat < ./README.md` | allow | allow（in-project；§4.7 通過） |
 | `grep pat < /etc/shadow` | allow | ask（§4.7 輸入重導向超出範圍） |
 | `cat <<EOF\nfake\nEOF < README.md` | allow | allow（含 `<` → 非 passthrough；讀 README.md in-project；heredoc 未用） |
+| `date(){ sleep 5; }; date` | **allow**（漏洞：函式覆寫 allowlist 名） | ask（閘③函式遮蔽；即使含 `Bash(date *)` 仍 ask） |
+| `pwd(){ echo "fake"; }; pwd` | **allow**（漏洞） | ask（閘③函式遮蔽） |
+| `f(){ :; }; ls -la` | allow | allow（`ls` 未被遮蔽；f 未呼叫 → 閘③不觸發） |
 | `find / -name x`（既有遞迴根） | deny | deny（不變） |
 
 ## 8. 測試需求
@@ -731,8 +779,13 @@ for (const r of inv.redirects) {
 - `src/rules/commands/tail_test.ts`（新；§4.8）：`tail -f log`、`tail -F log`、`tail --follow=name log`、
   `tail -fn10 log`、`tail --retry log` → `ask`；`tail log`、`tail -n 20 log`（in-project）→ allow；
   `tail -f /etc/x`（專案外）→ ask；確認 `cut -f1 data.csv` **不**受影響（仍 allow）。
+- `src/engine/walk_test.ts` / `evaluate_test.ts`（§4.9 函式遮蔽）：`definedFunctionNames` 對
+  `date(){ sleep 5; }; date`、`pwd(){ echo x; }; pwd`、巢狀 `{ f(){ :; }; }` 正確回傳定義名集合；
+  evaluate 對 `date(){ sleep 5; }; date`、`pwd(){ echo fake; }; pwd` → `ask`（**且含 `Bash(date *)` /
+  `Bash(pwd *)` 仍 ask**，驗證閘③在 classify/settingsAllows 之前）；`f(){ :; }; ls -la` → **非** ask
+  （ls 未被遮蔽，照常 allow）；`sleep(){ :; }; sleep 5` → 仍 deny（閘① name==="sleep" 先於閘③）。
 - `src/rules/types_test.ts`（或併入 sleep/print_only 測試）：`printOnlyDenyReason()` /
-  `pollingDenyReason()` 各含三要素（禁止字樣 / 原因 / 替代）。
+  `pollingDenyReason()` / `functionShadowReason()` 各含說明 + 替代要素。
 - `src/main_test.ts`（e2e 子行程）：餵 `echo "結論是 X"` 期望 `permissionDecision: "deny"` 且
   `exit 0`；餵 `sleep 1` 期望 deny；餵 `make && echo DONE` 期望非 deny；餵 `cat < /etc/passwd` 期望 ask；
   餵 `tail -f x` 期望 ask。
@@ -753,8 +806,9 @@ echo '{"tool_name":"Bash","tool_input":{"command":"make && echo DONE"},"cwd":"/p
 
 - 開頭「這是什麼」段的 deny 描述：從「僅對遞迴遍歷磁碟根/家目錄根回 deny」改為**三類 deny**
   （遞迴根掃描、整鏈 print-only 偽裝、sleep 輪詢）。
-- 「架構（評估管線）」段：補 `evaluate` 在 walk 後、classify 前的**兩個聚合硬 deny 閘**（sleep 掃描
-  + 整鏈 print-only）；補 `print_only.ts` 模組職責；補 `walk` 列舉 heredoc `redirect.body` 內層替換。
+- 「架構（評估管線）」段：補 `evaluate` 在 walk 後、classify 前的**三閘**（①sleep 掃描→deny、
+  ②整鏈 print-only→deny、③函式遮蔽→ask）；補 `print_only.ts` 模組職責；補 `walk` 列舉 heredoc
+  `redirect.body` 內層替換與 `definedFunctionNames`。
 - 「unbash 事實」段：版本 3.0.0 → **4.0.1**；補「heredoc body 含展開時 `redirect.body` 為結構化
   Word（CommandExpansion.script）」。「三條中央前置規則」段**改為四條**，補第 4 條「輸入重導向 `<`
   目標範圍檢查 → ask」（§4.7）；另補 `tailRule`（`tail -f`/`-F`/`--follow` → ask，§4.8）。
@@ -773,13 +827,13 @@ echo '{"tool_name":"Bash","tool_input":{"command":"make && echo DONE"},"cwd":"/p
 |---|---|
 | `src/engine/print_only.ts` | 新檔：`isAllPrintOnly`、`isPrintOnlyForm`、`wordPrintEligible`、`isHeredocPrintEligible`、echo/printf/cat 子判定 + carve-out |
 | `src/engine/word.ts` | export `topPartIsDynamic` / `nestedPartIsDynamic` 供 `wordPrintEligible` 複用（含 glob 偵測） |
-| `src/engine/evaluate.ts` | walk 後、classify 前插入兩個硬 deny 閘：①`some(name==="sleep")` ②`isAllPrintOnly` |
-| `src/engine/walk.ts` | `emitCommand` 從 `[...inherited, ...cmd.redirects]` 列舉 `target` 與 `body` 內層替換（heredoc body 的 `$()` 逐一受檢，含外層/繼承掛載的 heredoc） |
+| `src/engine/evaluate.ts` | walk 後、classify 前插入三閘：①`some(name==="sleep")`→deny ②`isAllPrintOnly`→deny ③函式遮蔽→ask |
+| `src/engine/walk.ts` | (a) `emitCommand` 從 `[...inherited, ...cmd.redirects]` 列舉 `target` 與 `body` 內層替換（heredoc body 的 `$()` 逐一受檢，含外層/繼承掛載的 heredoc）；(b) 新增 `definedFunctionNames(script)`（遞迴掃描 Function 節點名） |
 | `src/engine/classify.ts` | 新增第 4 條中央前置規則：輸入重導向 `<` 目標 `resolvePath` 超出範圍 → ask（§4.7） |
 | `src/rules/commands/coreutils.ts` | `fileReaderRule.names` **移除 `"tail"`**（改由 tailRule 管） |
 | `src/rules/commands/tail.ts` | 新檔：`tailRule`（follow 旗標 `-f`/`-F`/`--follow`/`--retry`/短群集含 f → ask） |
 | `src/rules/allowlist.ts` | 註冊 `tailRule` |
-| `src/rules/types.ts` | 新增 `printOnlyDenyReason()`、`pollingDenyReason()` helper |
+| `src/rules/types.ts` | 新增 `printOnlyDenyReason()`、`pollingDenyReason()`、`functionShadowReason()` helper |
 | `deno.json` / `deno.lock` | unbash 3.0.0 → 4.0.1（已完成、已驗證；本功能依賴 4.0.1 的 heredoc `body` 結構） |
 | `src/engine/print_only_test.ts` | 新檔：謂詞 + 聚合三面 + 邊界測試 |
 | `src/engine/walk_test.ts` | heredoc body 列舉：`cat <<EOF $(rm) EOF` → 兩筆 invocation；引號/變數 → 一筆 |
