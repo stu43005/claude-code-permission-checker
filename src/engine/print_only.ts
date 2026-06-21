@@ -95,7 +95,7 @@ function hasFormatterConversion(fmt: string): boolean {
 }
 
 function isCatPassthrough(inv: CommandInvocation): boolean {
-  if (hasFileOperand(inv.argv)) return false;                 // 有檔案操作元 → 讀真實檔
+  if (hasFileOperand(inv.name, inv.argv)) return false;        // 有檔案操作元 → 讀真實檔
   // 依 Bash 重導向順序決定 fd0 來源：影響 fd0 的輸入重導向中**最後一個勝**。
   const fd0Inputs = inv.redirects.filter((r) =>
     (r.operator === "<" || r.operator === "<<" || r.operator === "<<-" ||
@@ -110,14 +110,20 @@ function isCatPassthrough(inv: CommandInvocation): boolean {
   return isHeredocPrintEligible(effective);
 }
 
-/** argv 是否含檔案操作元：考慮 POSIX `--`（其後一律為操作元）。 */
-function hasFileOperand(argv: Word[]): boolean {
+/**
+ * argv 是否含檔案操作元：考慮 POSIX `--`（其後一律為操作元）。
+ * tac 的 `-s` / `--separator` 會吃下一個 token 當分隔符值（cat 的 `-s` 是無值旗標，
+ * 故僅對 tac 跳過該值），避免把分隔符值誤判為檔名而漏掉 print-only 的 deny。
+ */
+function hasFileOperand(name: string | null, argv: Word[]): boolean {
+  const skipsValue = name === "tac";
   let afterDoubleDash = false;
-  for (const w of argv) {
-    const v = staticValue(w);
+  for (let i = 0; i < argv.length; i++) {
+    const v = staticValue(argv[i]);
     if (!afterDoubleDash && v === "--") { afterDoubleDash = true; continue; }
     if (afterDoubleDash) return true;                          // `--` 之後任何 token = 檔名
     if (v === null || !v.startsWith("-")) return true;         // 動態或非旗標 → 視為檔名
+    if (skipsValue && (v === "-s" || v === "--separator")) i++; // 跳過分隔符值 token
   }
   return false;
 }

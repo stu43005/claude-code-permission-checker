@@ -136,3 +136,12 @@ Deno.test("cat fd0 重導向順序（最後者勝）+ -- 操作元", () => {
   // -- 後 -fixture 為檔名操作元 → 讀真實檔 → 非 passthrough
   assertEquals(isAllPrintOnly(invs("cat -- -fixture <<EOF\nx\nEOF")), false);
 });
+
+Deno.test("tac -s/--separator 吃值不誤判為檔案操作元；cat -s 不吃值（, 為檔名）", () => {
+  assertEquals(isAllPrintOnly(invs("tac -s , <<EOF\nfake\nEOF")), true);       // 分隔符值 → passthrough → print
+  assertEquals(isAllPrintOnly(invs("tac --separator , <<EOF\nx\nEOF")), true);
+  assertEquals(isAllPrintOnly(invs("tac --separator=, <<EOF\nx\nEOF")), true); // 黏寫 → 旗標
+  assertEquals(isAllPrintOnly(invs("tac -s, <<EOF\nx\nEOF")), true);           // 黏寫短旗標
+  assertEquals(isAllPrintOnly(invs("cat -s , <<EOF\nx\nEOF")), false);         // cat -s 無值 → , 為檔名
+  assertEquals(isAllPrintOnly(invs("tac file <<EOF\nx\nEOF")), false);         // 真實檔名 → 非 passthrough
+});
