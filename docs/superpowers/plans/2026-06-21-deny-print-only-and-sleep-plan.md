@@ -36,15 +36,15 @@ Commands (from `deno.json`): `deno task test` (full), `deno task check`, `deno t
 
 - [ ] **Step 1: Write the failing tests**
 
-Append to `src/rules/types_test.ts`:
+`src/rules/types_test.ts` already exists and already imports `assertStringIncludes`. Extend its existing `import { deny, recursiveRootDenyReason } from "./types.ts";` line to also import the new helpers:
 
 ```ts
-import {
-  functionShadowReason,
-  pollingDenyReason,
-  printOnlyDenyReason,
-} from "./types.ts";
+import { deny, functionShadowReason, pollingDenyReason, printOnlyDenyReason, recursiveRootDenyReason } from "./types.ts";
+```
 
+Then append these tests to the file:
+
+```ts
 Deno.test("printOnlyDenyReason 含禁止字樣 + 替代建議", () => {
   const r = printOnlyDenyReason();
   assertStringIncludes(r, "已禁止");
@@ -63,12 +63,6 @@ Deno.test("functionShadowReason 含需確認 + 替代", () => {
   assertStringIncludes(r, "需確認");
   assertStringIncludes(r, "函式");
 });
-```
-
-Ensure the test file imports `assertStringIncludes`. At the top of `src/rules/types_test.ts`, the existing import is `import { assertEquals } from "@std/assert";` — change it to:
-
-```ts
-import { assertEquals, assertStringIncludes } from "@std/assert";
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -277,10 +271,21 @@ Deno.test("isAllPrintOnly 聚合", () => {
   assertEquals(isAllPrintOnly(invs('(echo fake)')), true);                // subshell 攤平
   assertEquals(isAllPrintOnly(invs('{ echo a; echo b; }')), true);
   assertEquals(isAllPrintOnly(invs('echo "$(echo fake)"')), true);        // 替換包裝
+  assertEquals(isAllPrintOnly(invs('echo "pre $(echo x)"')), true);       // 字面+替換 → 仍 print
   assertEquals(isAllPrintOnly(invs('make && echo DONE')), false);         // make 非 print
   assertEquals(isAllPrintOnly(invs('echo "$(date)"')), false);            // inner date 非 print
+  assertEquals(isAllPrintOnly(invs('echo "$(cat real)"')), false);        // inner cat 讀檔非 print
   assertEquals(isAllPrintOnly(invs('echo x | grep y')), false);           // grep 非 print
+  assertEquals(isAllPrintOnly(invs('echo data | wc -l')), false);         // wc 非 print
   assertEquals(isAllPrintOnly([]), false);                                // 空 → false
+});
+
+Deno.test("print-only 邊界：%b 純字串 / -ne 跳脫 / 數值轉換 / process subst", () => {
+  assertEquals(isPrintOnlyForm(invs('printf "%b" "x"')[0]), true);        // %b 純字串 → print
+  assertEquals(isPrintOnlyForm(invs('echo -ne "x\\n"')[0]), false);       // -ne + 反斜線 → carve-out
+  assertEquals(isPrintOnlyForm(invs('printf "%.2f" 3.14')[0]), false);    // 數值格式 → carve-out
+  assertEquals(isPrintOnlyForm(invs('printf -v x "%s" y')[0]), false);    // -v 賦值 → 非 print
+  assertEquals(isPrintOnlyForm(invs('echo <(cmd)')[0]), false);           // process subst → 非合格
 });
 ```
 
@@ -372,11 +377,91 @@ git commit -m "feat(print-only): add isPrintOnlyForm (echo/printf) + isAllPrintO
 
 ---
 
-### Task 4: `cat`/`tac` heredoc passthrough + fd-0 order (`src/engine/print_only.ts`)
+### Task 4: Walk enumerates heredoc `body` substitutions (`src/engine/walk.ts`)
+
+**Files:**
+- Modify: `src/engine/walk.ts` (the `emitCommand` `words` collection)
+- Test: `src/engine/walk_test.ts` (**already exists — append**)
+
+- [ ] **Step 1: Write the failing tests**
+
+`src/engine/walk_test.ts` already exists with `import { assertEquals }`, `import { parseCommand }`, `import { walk } from "./walk.ts"`, `import type { CwdState }`, plus helpers `const ROOT = "/proj"`, `const START`, and `function names(src)`. **Append** these tests (reuse the existing `names` helper — do NOT re-import or redefine it):
+
+```ts
+Deno.test("walk 列舉 heredoc body 內的命令替換", () => {
+  assertEquals(names("cat <<EOF\n$(rm -rf x)\nEOF"), ["cat", "rm"]);
+  assertEquals(names("cat <<EOF\n$HOME\nEOF"), ["cat"]);          // 純變數 → 無內層指令
+  assertEquals(names("cat <<'EOF'\n$(rm)\nEOF"), ["cat"]);        // 引號 → body 不解析
+});
+
+Deno.test("walk 列舉繼承（外層掛載）heredoc body / here-string 替換", () => {
+  assertEquals(names("{ cat; } <<EOF\n$(rm)\nEOF").includes("rm"), true);
+  assertEquals(names("( cat ) <<EOF\n$(rm)\nEOF").includes("rm"), true);
+  assertEquals(names("while read; do cat; done <<EOF\n$(rm)\nEOF").includes("rm"), true);
+  assertEquals(names('{ cat; } <<<"$(rm)"').includes("rm"), true); // 繼承 here-string target
+});
+
+Deno.test("walk here-string target 替換仍被列舉（回歸）", () => {
+  assertEquals(names('cat <<<"$(rm)"').includes("rm"), true);
+});
+```
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+Run: `deno test --allow-env src/engine/walk_test.ts`
+Expected: FAIL — `cat <<EOF\n$(rm -rf x)\nEOF` returns `["cat"]` (body `rm` not enumerated).
+
+- [ ] **Step 3: Enumerate `target` + `body` from inherited + own redirects**
+
+In `src/engine/walk.ts`, the `emitCommand` function currently builds `words` like this:
+
+```ts
+  const words: Word[] = [
+    ...(cmd.name ? [cmd.name] : []),
+    ...cmd.suffix,
+    ...cmd.prefix.flatMap((a) => (a.value ? [a.value] : [])),
+    ...cmd.redirects.flatMap((r) => (r.target ? [r.target] : [])),
+  ];
+  for (const w of words) enumerateInnerScripts(w, cwd, out);
+```
+
+Replace it with (adds inherited redirects + `body`):
+
+```ts
+  const allRedirects = [...inherited, ...cmd.redirects]; // 與 invocation.redirects 同源
+  const words: Word[] = [
+    ...(cmd.name ? [cmd.name] : []),
+    ...cmd.suffix,
+    ...cmd.prefix.flatMap((a) => (a.value ? [a.value] : [])),
+    ...allRedirects.flatMap((r) => (r.target ? [r.target] : [])),
+    ...allRedirects.flatMap((r) => (r.body ? [r.body] : [])), // heredoc body 內的替換
+  ];
+  for (const w of words) enumerateInnerScripts(w, cwd, out);
+```
+
+> `emitCommand` already receives `inherited` as a parameter (used for `redirects: [...inherited, ...cmd.redirects]`). No signature change needed.
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+Run: `deno test --allow-env src/engine/walk_test.ts`
+Expected: PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/engine/walk.ts src/engine/walk_test.ts
+git commit -m "feat(walk): enumerate heredoc body command substitutions (own + inherited)"
+```
+
+---
+
+### Task 5: `cat`/`tac` heredoc passthrough + fd-0 order (`src/engine/print_only.ts`)
 
 **Files:**
 - Modify: `src/engine/print_only.ts`
 - Test: `src/engine/print_only_test.ts`
+
+> Depends on Task 4 (walk body enumeration), which is now implemented before this task — so the `cat <<EOF\n$(rm x)\nEOF` chain produces `[cat, rm]` and the assertions below pass without ordering caveats.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -388,11 +473,14 @@ Deno.test("cat heredoc passthrough → print；含真實指令/變數 → 非全
   assertEquals(isAllPrintOnly(invs("cat <<'EOF'\n$x\nEOF")), true);      // 引號分隔符 → 靜態
   assertEquals(isAllPrintOnly(invs('cat <<<"x"')), true);                // here-string
   assertEquals(isAllPrintOnly(invs("cat <<EOF\n$(echo 假)\nEOF")), true); // body 僅替換 + inner echo
+  assertEquals(isAllPrintOnly(invs('cat <<<"$(echo 假)"')), true);        // here-string 替換包裝
   assertEquals(isAllPrintOnly(invs("cat <<EOF\n$(rm x)\nEOF")), false);   // inner rm 非 print
   assertEquals(isAllPrintOnly(invs("cat <<EOF\n$HOME\nEOF")), false);     // body 變數 → cat 非 print
   assertEquals(isAllPrintOnly(invs('cat <<<"$VAR"')), false);             // here-string 變數
   assertEquals(isAllPrintOnly(invs("cat file")), false);                  // 無 heredoc
   assertEquals(isAllPrintOnly(invs("cat -n <<EOF\nx\nEOF")), true);       // 僅旗標、有 heredoc
+  assertEquals(isAllPrintOnly(invs("cat f && echo ok")), false);          // cat 讀真檔 → 非全鏈 print
+  assertEquals(isAllPrintOnly(invs("cat <<EOF\nx\nEOF | python")), false); // python 非 print
 });
 
 Deno.test("cat fd0 重導向順序（最後者勝）+ -- 操作元", () => {
@@ -468,109 +556,16 @@ function isHeredocPrintEligible(r: Redirect): boolean {
 }
 ```
 
-> This step depends on Task 5's `walk.ts` change to surface heredoc-body inner commands (so `cat <<EOF\n$(rm x)\nEOF` produces `[cat, rm]`). If Task 5 is not yet implemented, the `cat <<EOF\n$(rm x)\nEOF` assertion (`false`) still holds because `cat` IS print-eligible but `isAllPrintOnly` needs the `rm` leaf to be non-print — and without Task 5 there is no `rm` leaf, so the chain would be `[cat]` → `true`, failing the test. **Implement Task 5 before this test passes**, or run Tasks 4 and 5 together. To keep TDD honest, run Task 5 first, then return to Task 4 Step 4.
-
-- [ ] **Step 4: Run tests to verify they pass** (after Task 5 is in place)
+- [ ] **Step 4: Run tests to verify they pass**
 
 Run: `deno test --allow-env src/engine/print_only_test.ts`
-Expected: PASS.
+Expected: PASS (Task 4's walk body enumeration is already in place, so `cat <<EOF\n$(rm x)\nEOF` yields `[cat, rm]`).
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add src/engine/print_only.ts src/engine/print_only_test.ts
 git commit -m "feat(print-only): cat/tac heredoc passthrough with fd-0 order + -- operands"
-```
-
----
-
-### Task 5: Walk enumerates heredoc `body` substitutions (`src/engine/walk.ts`)
-
-**Files:**
-- Modify: `src/engine/walk.ts:139-155` (the `emitCommand` `words` collection)
-- Test: `src/engine/walk_test.ts`
-
-- [ ] **Step 1: Write the failing tests**
-
-Create `src/engine/walk_test.ts`:
-
-```ts
-import { assertEquals } from "@std/assert";
-import { parseCommand } from "./parse.ts";
-import { walk } from "./walk.ts";
-import type { CwdState } from "../types.ts";
-
-const START: CwdState = { kind: "known", path: "/proj" };
-function names(src: string) {
-  return walk(parseCommand(src).script, START, "/proj").map((i) => i.name);
-}
-
-Deno.test("walk 列舉 heredoc body 內的命令替換", () => {
-  assertEquals(names("cat <<EOF\n$(rm -rf x)\nEOF"), ["cat", "rm"]);
-  assertEquals(names("cat <<EOF\n$HOME\nEOF"), ["cat"]);          // 純變數 → 無內層指令
-  assertEquals(names("cat <<'EOF'\n$(rm)\nEOF"), ["cat"]);        // 引號 → body 不解析
-});
-
-Deno.test("walk 列舉繼承（外層掛載）heredoc body 替換", () => {
-  assertEquals(names("{ cat; } <<EOF\n$(rm)\nEOF").includes("rm"), true);
-  assertEquals(names("( cat ) <<EOF\n$(rm)\nEOF").includes("rm"), true);
-  assertEquals(names("while read; do cat; done <<EOF\n$(rm)\nEOF").includes("rm"), true);
-});
-
-Deno.test("walk here-string target 替換仍被列舉（回歸）", () => {
-  assertEquals(names('cat <<<"$(rm)"').includes("rm"), true);
-});
-```
-
-- [ ] **Step 2: Run tests to verify they fail**
-
-Run: `deno test --allow-env src/engine/walk_test.ts`
-Expected: FAIL — `cat <<EOF\n$(rm -rf x)\nEOF` returns `["cat"]` (body `rm` not enumerated).
-
-- [ ] **Step 3: Enumerate `target` + `body` from inherited + own redirects**
-
-In `src/engine/walk.ts`, the `emitCommand` function currently builds `words` like this:
-
-```ts
-  const words: Word[] = [
-    ...(cmd.name ? [cmd.name] : []),
-    ...cmd.suffix,
-    ...cmd.prefix.flatMap((a) => (a.value ? [a.value] : [])),
-    ...cmd.redirects.flatMap((r) => (r.target ? [r.target] : [])),
-  ];
-  for (const w of words) enumerateInnerScripts(w, cwd, out);
-```
-
-Replace it with (adds inherited redirects + `body`):
-
-```ts
-  const allRedirects = [...inherited, ...cmd.redirects]; // 與 invocation.redirects 同源
-  const words: Word[] = [
-    ...(cmd.name ? [cmd.name] : []),
-    ...cmd.suffix,
-    ...cmd.prefix.flatMap((a) => (a.value ? [a.value] : [])),
-    ...allRedirects.flatMap((r) => (r.target ? [r.target] : [])),
-    ...allRedirects.flatMap((r) => (r.body ? [r.body] : [])), // heredoc body 內的替換
-  ];
-  for (const w of words) enumerateInnerScripts(w, cwd, out);
-```
-
-> `emitCommand` already receives `inherited` as a parameter (used for `redirects: [...inherited, ...cmd.redirects]`). No signature change needed.
-
-- [ ] **Step 4: Run tests to verify they pass**
-
-Run: `deno test --allow-env src/engine/walk_test.ts`
-Expected: PASS.
-
-Then re-run Task 4's tests now that body enumeration exists:
-Run: `deno test --allow-env src/engine/print_only_test.ts`
-Expected: PASS.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add src/engine/walk.ts src/engine/walk_test.ts
-git commit -m "feat(walk): enumerate heredoc body command substitutions (own + inherited)"
 ```
 
 ---
@@ -599,6 +594,11 @@ Deno.test("definedFunctionNames 收集函式定義名（含巢狀）", () => {
   assertEquals(fns("if true; then g(){ :; }; fi"), ["g"]);
   assertEquals(fns("echo hi"), []);
 });
+
+Deno.test("definedFunctionNames 涵蓋命令替換內的函式定義", () => {
+  // walk 會列舉 $() 內層的 date 呼叫；定義名也須被收集，閘③ 才能攔成 ask
+  assertEquals(fns('echo "$(date(){ rm x; }; date)"'), ["date"]);
+});
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -608,10 +608,10 @@ Expected: FAIL — `definedFunctionNames` not exported.
 
 - [ ] **Step 3: Add `definedFunctionNames`**
 
-In `src/engine/walk.ts`, ensure `Script` and `Node` are imported (the file already imports `Node`, `Script`, `Statement` from `../deps.ts`; if `Script` is missing add it). Then append:
+In `src/engine/walk.ts`, ensure `Script`, `Node`, `Word`, `WordPart` are imported from `../deps.ts` (the file already imports `Command`, `Node`, `Redirect`, `Script`, `Statement`, `Word`, `WordPart`; confirm all are present). Then append:
 
 ```ts
-/** 遞迴掃描 AST 收集所有函式定義名（靜態名；動態名忽略）。供 evaluate 閘③偵測函式遮蔽。 */
+/** 遞迴掃描 AST 收集所有函式定義名（靜態名；動態名忽略），含命令替換內層腳本。供 evaluate 閘③偵測函式遮蔽。 */
 export function definedFunctionNames(script: Script): Set<string> {
   const out = new Set<string>();
   for (const s of script.commands) collectFns(s.command, out);
@@ -624,6 +624,19 @@ function collectFns(node: Node, out: Set<string>): void {
       const n = staticValue(node.name);
       if (n !== null) out.add(n);
       collectFns(node.body, out); // 巢狀定義
+      return;
+    }
+    case "Command": {
+      // 函式可定義於命令替換內（如 echo "$(f(){ … }; f)"）；walk 會列舉其內層呼叫，
+      // 故此處亦須掃 Word 內的 $( … ) / <( … ) 腳本，收集其中的函式定義名。
+      const words: Word[] = [
+        ...(node.name ? [node.name] : []),
+        ...node.suffix,
+        ...node.prefix.flatMap((a) => (a.value ? [a.value] : [])),
+        ...node.redirects.flatMap((r) => (r.target ? [r.target] : [])),
+        ...node.redirects.flatMap((r) => (r.body ? [r.body] : [])),
+      ];
+      for (const w of words) collectFnsInWord(w, out);
       return;
     }
     case "AndOr":
@@ -661,13 +674,27 @@ function collectFns(node: Node, out: Set<string>): void {
       collectFns(node.command, out);
       return;
     default:
-      // Command / TestCommand / ArithmeticCommand / Coproc：無相關內層函式定義
+      // TestCommand / ArithmeticCommand / Coproc：無相關內層函式定義
       return;
+  }
+}
+
+/** 掃描 Word 內的 CommandExpansion / ProcessSubstitution 腳本，遞迴收集函式定義名。 */
+function collectFnsInWord(word: Word, out: Set<string>): void {
+  if (!word.parts) return;
+  for (const part of word.parts) collectFnsInPart(part, out);
+}
+
+function collectFnsInPart(part: WordPart, out: Set<string>): void {
+  if ((part.type === "CommandExpansion" || part.type === "ProcessSubstitution") && part.script) {
+    for (const s of part.script.commands) collectFns(s.command, out);
+  } else if (part.type === "DoubleQuoted" || part.type === "LocaleString") {
+    for (const child of part.parts) collectFnsInPart(child, out);
   }
 }
 ```
 
-> `node.name` on a `Function` node is a `Word` (unbash 4.0.1), so use `staticValue(node.name)`. `staticValue` is already imported in `walk.ts`.
+> `node.name` on a `Function` node is a `Word` (unbash 4.0.1), so use `staticValue(node.name)`. `staticValue` is already imported in `walk.ts`. `collectFnsInWord`/`collectFnsInPart` mirror the existing `enumerateInnerScripts`/`walkPart` so the shadow set stays consistent with what `walk()` actually emits as invocations.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -691,30 +718,13 @@ git commit -m "feat(walk): add definedFunctionNames for function-shadow detectio
 
 - [ ] **Step 1: Write the failing tests**
 
-Create `src/engine/evaluate_test.ts`:
+`src/engine/evaluate_test.ts` already exists and already defines `const ROOT = "/proj"`, `const AT_ROOT`, a `rulesOf(...)` helper, and imports `assertEquals`, `evaluate`, `parseBashRule`, `PermissionRules`. **Append** the following — reuse those existing identifiers (do NOT re-import or redefine `ROOT` / `AT_ROOT` / `rulesOf`). Add one small local `vd` helper and the tests:
 
 ```ts
-import { assertEquals } from "@std/assert";
-import { evaluate } from "./evaluate.ts";
-import { EMPTY_RULES, type PermissionRules } from "../permissions/settings.ts";
-import { parseBashRule } from "../permissions/matcher.ts";
-import { EMPTY_READ_SCOPE } from "../permissions/path_scope.ts";
-import { EMPTY_DOMAIN_SCOPE } from "../permissions/domain_scope.ts";
-import type { CwdState } from "../types.ts";
-
-const ROOT = "/proj";
-const START: CwdState = { kind: "known", path: "/proj" };
-
-function rulesOf(spec: { allow?: string[]; deny?: string[]; ask?: string[] }): PermissionRules {
-  const conv = (xs?: string[]) => (xs ?? []).map((s) => parseBashRule(s)!).filter(Boolean);
-  return {
-    bash: { allow: conv(spec.allow), deny: conv(spec.deny), ask: conv(spec.ask) },
-    readScope: { allow: EMPTY_READ_SCOPE, deny: EMPTY_READ_SCOPE, ask: EMPTY_READ_SCOPE },
-    webFetch: { allow: EMPTY_DOMAIN_SCOPE, deny: EMPTY_DOMAIN_SCOPE, ask: EMPTY_DOMAIN_SCOPE },
-  };
-}
-function vd(src: string, rules: PermissionRules = EMPTY_RULES) {
-  return evaluate(src, ROOT, START, rules).verdict;
+function vd(src: string, rules?: PermissionRules) {
+  return rules
+    ? evaluate(src, ROOT, AT_ROOT, rules).verdict
+    : evaluate(src, ROOT, AT_ROOT).verdict;
 }
 
 Deno.test("閘②整鏈 print-only → deny（不可由 Bash(echo *) 升級）", () => {
@@ -740,14 +750,24 @@ Deno.test("非整鏈 print → 不 deny", () => {
 
 Deno.test("閘① 字面 sleep → deny（不受遮蔽/賦值/重導向/升級影響）", () => {
   assertEquals(vd("sleep 5"), "deny");
+  assertEquals(vd("sleep"), "deny");
+  assertEquals(vd("sleep 0.5"), "deny");
   assertEquals(vd("sleep 5 && make"), "deny");
+  assertEquals(vd("sleep 2; echo waiting"), "deny");
   assertEquals(vd("FOO=1 sleep 5"), "deny");
   assertEquals(vd("sleep 5 > out"), "deny");
   assertEquals(vd('echo "$(sleep 5)"'), "deny");
   assertEquals(vd("while true; do sleep 1; done"), "deny");
+  assertEquals(vd("for i in 1 2; do sleep 1; done"), "deny");
   assertEquals(vd("sleep 1", rulesOf({ allow: ["Bash(sleep *)"] })), "deny"); // 不可升級
   assertEquals(vd("sleep(){ :; }; sleep 5"), "deny");           // 遮蔽不豁免
   assertEquals(vd("sleep 5; sleep(){ :; }"), "deny");
+});
+
+Deno.test("閘① sleep deny 理由透過 pollingDenyReason 傳出", () => {
+  const d = evaluate("sleep 5", ROOT, AT_ROOT);
+  assertEquals(d.verdict, "deny");
+  assertStringIncludes(d.reason, "ScheduleWakeup");
 });
 
 Deno.test("閘③ 函式遮蔽 → ask（不可升級）", () => {
@@ -755,8 +775,29 @@ Deno.test("閘③ 函式遮蔽 → ask（不可升級）", () => {
   assertEquals(vd("pwd(){ echo fake; }; pwd"), "ask");
   assertEquals(vd("waiter(){ sleep 5; }; waiter"), "ask");
   assertEquals(vd("date(){ sleep 5; }; date", rulesOf({ allow: ["Bash(date *)"] })), "ask");
+  assertEquals(vd('echo "$(date(){ rm x; }; date)"'), "ask");   // 替換內定義 + 呼叫
   assertEquals(vd("f(){ :; }; ls -la"), "allow");               // ls 未被遮蔽
 });
+
+Deno.test("§1.5 已接受繞道：巢狀直譯器 / exec wrapper / 等價等待原語 預設 ask；廣域 allow 可升級", () => {
+  // 預設（無對應 permissions.allow）→ ask（葉指令名非 allowlist）
+  assertEquals(vd("bash -c 'echo fake'"), "ask");
+  assertEquals(vd("eval 'echo fake'"), "ask");
+  assertEquals(vd("python -c 'import time; time.sleep(5)'"), "ask");
+  assertEquals(vd("read -t 5"), "ask");
+  assertEquals(vd("timeout 5 sleep 10"), "ask");
+  assertEquals(vd("env sleep 5"), "ask");
+  assertEquals(vd("command echo fake"), "ask");
+  // 既有升級層：使用者自設廣域 allow → allow（使用者自負；本功能不硬擋）
+  assertEquals(vd("bash -c 'echo fake'", rulesOf({ allow: ["Bash(bash *)"] })), "allow");
+  assertEquals(vd("timeout 5 sleep 10", rulesOf({ allow: ["Bash(timeout *)"] })), "allow");
+});
+```
+
+The `assertStringIncludes` import: the existing file imports only `assertEquals`. Extend its first line to:
+
+```ts
+import { assertEquals, assertStringIncludes } from "@std/assert";
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -840,10 +881,17 @@ Deno.test("輸入重導向 < 目標範圍檢查（第4條中央前置規則）",
   assertEquals(only("cat <<EOF\nx\nEOF").kind, "allow");         // heredoc 非 `<`，不受此規則
 });
 
-Deno.test("輸入重導向 ask 可被 Read()/Bash 升級", () => {
+Deno.test("輸入重導向 ask 可被 Bash() 升級", () => {
   assertEquals(onlyWith("cat < /etc/passwd", rulesOf({ allow: ["Bash(cat *)"] })).kind, "allow");
 });
+
+Deno.test("輸入重導向 ask 可被 Read() 讀取範圍放寬升級", () => {
+  // rulesWithRead 為 classify_test.ts 既有 helper（將 Read(...) 規則轉成 readScope.allow）
+  assertEquals(onlyWith("cat < /etc/passwd", rulesWithRead(["Read(//etc/passwd)"])).kind, "allow");
+});
 ```
+
+> Reuse the existing `rulesWithRead([...])` helper already defined in `src/engine/classify_test.ts` (do not redefine it).
 
 - [ ] **Step 2: Run tests to verify they fail**
 
@@ -954,9 +1002,9 @@ import type { FlagMatcher } from "../flags.ts";
 import { exact, prefix } from "../flags.ts";
 import { flagGatedReader } from "../factory.ts";
 
-/** 短旗標群集含 f / F（如 -fn、-Fq），代表 follow 模式。 */
+/** 短旗標群集含 f / F（如 -fn、-Fq、-fn10），代表 follow 模式。允許群集尾端帶數字（-fn10 = -f -n 10）。 */
 const shortClusterHasF: FlagMatcher = (t) =>
-  /^-[A-Za-z]+$/.test(t) && !t.includes("=") && /[fF]/.test(t.slice(1));
+  /^-[A-Za-z0-9]+$/.test(t) && /[fF]/.test(t.slice(1));
 
 export const tailRule: CommandRule = flagGatedReader({
   names: ["tail"],
@@ -1111,12 +1159,15 @@ Expected: each line prints JSON with the noted `permissionDecision` and exits 0.
 
 - [ ] **Step 5: Update `CLAUDE.md`**
 
-Edit `CLAUDE.md` per spec §9:
+Edit `CLAUDE.md` per spec §9 (make each of these edits explicitly):
 - 「這是什麼」段：deny 改述為**三類**（遞迴根掃描、整鏈 print-only 偽裝、sleep 輪詢）。
-- 「架構（評估管線）」段：補 `evaluate` 在 walk 後、classify 前的**三閘**（①sleep→deny、②整鏈 print-only→deny、③函式遮蔽→ask）；補 `print_only.ts` 模組與 `walk` 的 `redirect.body` 列舉 + `definedFunctionNames`。
-- 「三條中央前置規則」段：改為**四條**，補第 4 條「輸入重導向 `<` 目標範圍檢查 → ask」；補 `tailRule`（`tail -f`→ask）。
-- 「核心不變量」段：deny 三類、三閘在 classify 前短路不可由 `permissions.allow` 解除。
-- 「hook 決策 vs settings.json 權限的優先序」段：補 print-only / sleep 兩類硬 deny 不可解除；記錄 §1.5 已接受繞道（巢狀直譯器 / exec wrapper / 整鏈 print 洗白：預設 ask、可由使用者自設廣域 `Bash(...)` 升級，使用者自負）。
+- 「架構（評估管線）」段：補 `evaluate` 在 walk 後、classify 前的**三閘**（①sleep→deny、②整鏈 print-only→deny、③函式遮蔽→ask）；補 `print_only.ts` 模組與 `walk` 的 `redirect.body` 列舉（含繼承）+ `definedFunctionNames`。
+- 「第三方套件：unbash」段：版本 **3.0.0 → 4.0.1**；補一條已查證事實——未引號 heredoc body 含展開時，`redirect.body` 為**結構化 Word**（其 `CommandExpansion.script` 為完整解析的內層指令），引號分隔符 `<<'EOF'` 則 `body` 為 `undefined`。
+- 「三條中央前置規則」段：標題與內容改為**四條**，補第 4 條「輸入重導向 `<` 目標 `resolvePath` 超出讀取範圍 → ask」；另補 `tailRule`（`tail -f`/`-F`/`--follow`→ask，已從 `fileReaderRule` 移出）。
+- 「核心不變量」段：deny 三類；三閘皆在 classify 前短路、不過 `settingsAllows`，不可由 `permissions.allow` 解除。
+- 「hook 決策 vs settings.json 權限的優先序」段：補 print-only / sleep 兩類硬 deny 不可解除；並**分開**記錄 §1.5 兩種不同性質的已接受繞道：
+  - **預設 ask、可由使用者自設廣域 `Bash(...)` 升級為 allow（使用者自負）**：巢狀直譯器（`bash -c`/`eval`/`python -c`/`perl -e`）、exec wrapper（`command`/`env`/`nice`/`nohup`/`timeout`）、等價等待原語（`read -t`、`python -c 'time.sleep'`）、以及 `tail -f`（現為 ask、可由 `Bash(tail *)` 升級）。
+  - **「整鏈 print」洗白繞道**（`pwd; echo 假`、`true && echo 已驗證`、`cat README.md; printf 假`）：因鏈中有真實 / no-op 指令而**非全鏈 print**，故**不 deny**，落該真實指令的既有判定（可能是 `allow` 或 `ask`，**非**「預設 ask + 升級」那一類）。此為使用者明確選擇維持乾淨結構規則、零誤殺的取捨。
 
 - [ ] **Step 6: Commit**
 
