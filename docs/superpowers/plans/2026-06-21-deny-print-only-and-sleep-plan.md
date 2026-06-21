@@ -293,7 +293,7 @@ Deno.test("print-only 邊界：%b 純字串 / -ne 跳脫 / 數值轉換 / proces
 });
 
 Deno.test("printf 動態/替換型第一引數 → 保守視為非 print（與 echo 不對稱、刻意；落 ask 非 deny）", () => {
-  // 規格 §4.1.2 的 `first === null → return false` 守則：無法靜態確認首引數是否為選項（如 -v），
+  // printf 第一引數為命令替換時 staticValue 為 null，無法靜態確認它不是選項（如 -v），
   // 故 printf 的命令替換包裝**不**比照 echo 硬 deny，而是非 print 形態 → 落 classify（ask）。
   assertEquals(isPrintOnlyForm(invs('printf "$(echo fake)"')[0]), false);
 });
