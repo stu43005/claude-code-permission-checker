@@ -492,10 +492,12 @@ return combine(invocations.map((inv) => classify(inv, root, rules, home, trusted
   sleep** 誤降為 ask。故 sleep deny **一律對字面 sleep 生效**；`sleep(){ :; }; sleep 5`（重定義為
   no-op）也照 deny（over-deny 一個 no-op，安全、可接受）。
 - **閘② 不受遮蔽豁免（修 round 14 finding 1）**：整鏈 print-form 名即 deny。global `anyShadowed` 是
-  名稱集合、非執行序，若用它豁免 print-only 會被 `echo "fake"; echo(){ :; }`（呼叫在前、定義在後）或
-  dead 分支定義降級為 ask——破壞硬 deny。故 print-form 名一律 deny；代價是 `echo(){ grep x f; }; echo`
-  （把 echo 重定義為 grep 再呼叫）也會被當 print-only deny（理由略不精確，但 deny 是安全方向、且此構造
-  極罕見、非合法用途，可接受）。
+  名稱集合、非執行序，若用它豁免 print-only 會被 `echo "fake"; echo(){ :; }`（呼叫在前、定義在後、
+  **鏈中無其他葉指令**）降級為 ask——破壞硬 deny。故 print-form 名一律 deny；代價是 `echo(){ grep x f; };
+  echo`（把 echo 重定義為 grep 再呼叫）也會被當 print-only deny（理由略不精確，但 deny 是安全方向、且
+  此構造極罕見、非合法用途，可接受）。
+  - 註：`if false; then echo(){:;}; fi; echo "fake"` **不**因本豁免移除而 deny——walk 會額外列舉
+    `false` 葉指令使整鏈非全 print → 落閘③ **ask**（dead 分支不可達無法靜態判定，保守 ask，安全）。
 - **閘③ 涵蓋「呼叫使用者自定函式」（修 round 12 finding 1）**：`waiter(){ sleep 5; }; waiter`、
   `report(){ echo "verified"; }; report` 的 `waiter`/`report` ∈ `definedFunctionNames` → 閘③ ask
   （非 upgradeable）。**不走訪函式本體**（YAGNI，見 §4.9）；body 內的 sleep/echo 不被展開，但已由
@@ -693,8 +695,9 @@ for (const r of inv.redirects) {
   等**真實會跑的 sleep** 誤降為 ask。故凡字面 `sleep` 葉指令 → deny；`sleep(){:;}; sleep 5`（no-op
   重定義）亦 deny（over-deny 一個 no-op，安全）。
 - **閘②（print-only deny）對整鏈 print-form 名一律生效、不排除遮蔽**（修 round 14 finding 1）：同 sleep
-  之理由——若以 `anyShadowed` 豁免，`echo "fake"; echo(){:;}`（呼叫在前、定義在後）或 dead 分支定義會把
-  真實 print-only 降級為 ask。故 print-form 名（echo/printf/cat-heredoc）一律 deny；代價是
+  之理由——若以 `anyShadowed` 豁免，`echo "fake"; echo(){:;}`（呼叫在前、定義在後、鏈中無其他葉指令）
+  會被降級為 ask。故 print-form 名（echo/printf/cat-heredoc）一律 deny。（註：`if false; then echo(){:;};
+  fi; echo "fake"` 因 walk 額外列舉 `false` 葉指令而非全 print → 落閘③ **ask**，非 deny。）代價是
   `echo(){ grep needle README.md; }; echo`（重定義 echo 為 grep 再呼叫）也被當 print-only deny（理由略
   不精確、但 deny 安全，且此構造極罕見非合法用途，可接受）。
 - 閘③（ask）在閘①②之後，承接「**非 print-form 名**」的遮蔽 / 呼叫使用者函式情形（`date(){sleep;}; date`、
@@ -869,10 +872,14 @@ for (const r of inv.redirects) {
   `Bash(pwd *)` 仍 ask**，驗證閘③在 classify/settingsAllows 之前）；`f(){ :; }; ls -la` → **非** ask
   （ls 未被遮蔽，照常 allow）；`waiter(){ sleep 5; }; waiter`、`report(){ echo fake; }; report` →
   **ask**（呼叫使用者自定函式，含 `Bash(waiter *)` 仍 ask）。
-  **print-only 不受遮蔽降級（finding 1 回歸）**：`echo "fake"; echo(){ :; }`（呼叫在前定義在後）、
-  `if false; then echo(){:;}; fi; echo "fake"`（dead 分支）→ 皆 **deny**（閘② print-form 名一律 deny、
-  不被 anyShadowed 降級）；`echo(){ grep needle README.md; }; echo`（重定義 echo）→ 亦 **deny**（接受
-  之 over-deny）。
+  **print-only 不受「後置/重定義」函式定義降級（finding 1 回歸）**：`echo "fake"; echo(){ :; }`
+  （呼叫在前、定義在後，鏈中**無其他葉指令**）→ **deny**（整鏈僅 echo "fake" → 閘② print-form 名一律
+  deny、不被 anyShadowed 降級）；`echo(){ grep needle README.md; }; echo`（重定義 echo）→ 亦 **deny**
+  （接受之 over-deny）。
+  **dead 分支函式定義 + 額外真實葉指令 → ask（已實測 walk 行為）**：`if false; then echo(){:;}; fi;
+  echo "fake"` → walk 會額外列舉 `false` 葉指令（`["false","echo"]`），使整鏈**非全 print** → 閘② 不
+  觸發；又因 echo 被（dead 分支）函式定義遮蔽 → 落閘③ **ask**。靜態分析無法判定分支不可達，保守 ask
+  （安全、非靜默 allow）；此為 round-15 plan review 依實測 walk 行為更正之邊界（原例誤標 deny）。
   **sleep 不受遮蔽影響（round 12 finding 2 回歸）**：`sleep(){ :; }; sleep 5`、`sleep 5; sleep(){ :; }`、
   `if false; then sleep(){ :; }; fi; sleep 5` → 皆 **deny**（閘① 對字面 sleep 一律生效）；
   `foo(){ :; }; foo; sleep 5` → deny（字面 sleep）。
