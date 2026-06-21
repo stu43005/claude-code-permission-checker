@@ -87,3 +87,8 @@ Deno.test("walk 列舉繼承（外層掛載）heredoc body / here-string 替換"
 Deno.test("walk here-string target 替換仍被列舉（回歸）", () => {
   assertEquals(names('cat <<<"$(rm)"').includes("rm"), true);
 });
+
+Deno.test("walk 繼承 heredoc body 替換只列舉一次（compound 多葉、內部 cd 不重複/不改 cwd）", () => {
+  const ns = names("{ cd sub; cat; } <<EOF\n$(rm x)\nEOF");
+  assertEquals(ns.filter((n) => n === "rm").length, 1); // 只列舉一次
+});

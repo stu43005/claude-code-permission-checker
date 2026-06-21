@@ -28,6 +28,9 @@ function walkSequence(
 ): CwdState {
   let cur = cwd;
   for (const stmt of statements) {
+    // 此 statement 自身掛載的 redirects（如 compound 的 heredoc）在此引入 inherited：
+    // 其 target/body 內的命令替換在此以當前 cwd 列舉一次（heredoc 於語句執行前展開一次）。
+    for (const r of stmt.redirects) enumerateRedirectScripts(r, cur, out);
     cur = walkNode(stmt.command, cur, out, [...inherited, ...stmt.redirects], persistent);
   }
   return cur;
@@ -144,16 +147,23 @@ function emitCommand(
     cwd: execCwd,
   });
 
-  // command substitution / process substitution 內層指令（非持久、用當前 cwd 副本）
-  const allRedirects = [...inherited, ...cmd.redirects]; // 與 invocation.redirects 同源
+  // command substitution / process substitution 內層指令（非持久、用當前 cwd 副本）。
+  // 只列舉「自身」redirect 的替換；繼承（compound 掛載）的 redirect 由 walkSequence 在引入點
+  // 列舉一次，避免每個葉指令重複列舉、且避免套用葉指令內部 cd 後的錯誤 cwd。
   const words: Word[] = [
     ...(cmd.name ? [cmd.name] : []),
     ...cmd.suffix,
     ...cmd.prefix.flatMap((a) => (a.value ? [a.value] : [])),
-    ...allRedirects.flatMap((r) => (r.target ? [r.target] : [])),
-    ...allRedirects.flatMap((r) => (r.body ? [r.body] : [])), // heredoc body 內的替換
+    ...cmd.redirects.flatMap((r) => (r.target ? [r.target] : [])),
+    ...cmd.redirects.flatMap((r) => (r.body ? [r.body] : [])), // 自身 heredoc body 內的替換
   ];
   for (const w of words) enumerateInnerScripts(w, cwd, out);
+}
+
+/** 列舉單一 redirect 的 target / body 內的命令替換內層指令（以指定 cwd、非持久）。 */
+function enumerateRedirectScripts(r: Redirect, cwd: CwdState, out: CommandInvocation[]): void {
+  if (r.target) enumerateInnerScripts(r.target, cwd, out);
+  if (r.body) enumerateInnerScripts(r.body, cwd, out);
 }
 
 /** 掃描 Word 內的 CommandExpansion / ProcessSubstitution，列舉其內層 Script。 */
