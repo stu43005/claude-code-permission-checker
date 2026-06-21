@@ -99,8 +99,11 @@ classify 的 allow/ask 判定。完整性界定如下：
 2. **walk() 不深入、因而不在 print-only 閘範圍的構造**（其葉指令交既有 classify）：
    - **巢狀直譯器字串**：`bash -c '…'`、`sh -c '…'`、`eval '…'`、`source`/`.`、`python -c`、
      `perl -e`、`node -e` 等——其字串引數**不被 walk 解析**。葉指令名（`bash`/`eval`/`python`…）
-     **皆不在 allowlist → `ask`**，永不靜默 allow。屬**刻意接受、已記錄**的繞道（agent 仍會被
-     ask 攔下、需人工確認），非本功能保證範圍。
+     **皆不在 allowlist → 預設 `ask`**。屬**刻意接受、已記錄**的繞道，非本功能保證範圍。
+     > ⚠️ **準確說明**：此 `ask` 走既有 classify，**可被** `settingsAllows` 升級——若使用者自設廣域
+     > `Bash(bash *)` / `Bash(python *)` / `Bash(eval *)` 等，`bash -c 'sleep 5'`、`python -c '…'` 等
+     > **會升級為 allow**。本功能**不新增**此路徑（它是既有 permissions.allow 行為），但也**不**硬擋；
+     > 屬使用者自負的 settings 風險。未設這些廣域 allow 時維持 ask。
    - **heredoc body 內的命令替換（已正確封堵，非殘留風險）**：§4.6 讓 walk 列舉 `redirect.body`，使
      heredoc body 內的 `$( … )` **像其他位置的替換一樣被解析成獨立 invocation、逐一權限檢查**。故
      `cat <<EOF\n$(rm -rf x)\nEOF` 的 `rm` 走正常分類 → `ask`；且 `Bash(cat *)` 以還原字串
@@ -110,8 +113,12 @@ classify 的 allow/ask 判定。完整性界定如下：
    無從偽裝，維持 allow 安全。
 4. **sleep 強制邊界＝裸 `sleep` token**（使用者明確決定）：等價等待原語
    （`bash -c 'sleep'`、`python -c 'time.sleep'`、`perl -e 'sleep'`、`read -t`、`tail -f`、
-   `while …; do …; done` 計時迴圈）**不**在 sleep rule 範圍；它們皆非 allowlist 指令 → `ask`，
-   屬**刻意接受、已記錄**的邊界（落 ask 非 allow）。本功能不追求攔截所有等待原語。
+   `while …; do …; done` 計時迴圈）**不**在 sleep evaluate 層掃描範圍；其葉指令（`bash`/`python`/
+   `read`/`tail`…）皆非 allowlist → **預設 `ask`**。屬**刻意接受、已記錄**的邊界，本功能不追求攔截
+   所有等待原語。
+   > ⚠️ 同上：此 `ask` 可被既有 `settingsAllows` 升級——使用者若自設 `Bash(bash *)` / `Bash(python *)`
+   > / `Bash(read *)` 等廣域 allow，對應等待形式**會升級為 allow**（裸 `sleep` 因 evaluate 層硬 deny
+   > 不受影響）。本功能不新增此路徑、亦不硬擋等價形式；屬使用者自負的 settings 風險。
 5. **「整鏈 print」閘的洗白繞道（使用者確認維持原設計，2026-06-21）**：聚合閘要求**每個**葉指令
    皆 print 形態才 deny，故只要鏈中夾一個非 print 指令即不擋。可被以下方式繞過：
    - **瑣碎 no-op 前綴**：`pwd; echo "假報告"`、`true && echo "已驗證"`、`: ; printf "通過"`
@@ -124,10 +131,11 @@ classify 的 allow/ask 判定。完整性界定如下：
    > 接受」，且這些繞道最差落該真實指令既有判定，多為 ask）。
 
 **一句話總結**：本功能把使用者列舉的**常見直接形式**（裸 echo/printf/cat-heredoc 鏈、裸 sleep）
-硬 deny；heredoc body 內的命令替換以「逐一分類」正確檢查（point 2，非繞道）。對巢狀直譯器 / 等價
-等待原語 / 「整鏈 print」洗白繞道**不保證 deny**，但這些**最差落 ask**（巢狀/等待原語）或落該真實
-指令既有判定（洗白），**不新增任何靜默 allow 路徑**——皆為使用者確認、刻意接受的取捨，優先保留設計
-簡潔與零誤殺。
+硬 deny（不可由 permissions.allow 解除）；heredoc body 內的命令替換以「逐一分類」正確檢查（point 2，
+非繞道）。對巢狀直譯器 / 等價等待原語 / 「整鏈 print」洗白繞道**不保證 deny**：預設落 ask 或該真實
+指令既有判定，**本功能不新增任何 allow 路徑**；但它們仍受**既有** `permissions.allow` 升級層影響——
+使用者若自設廣域 `Bash(bash *)` / `Bash(python *)` 等，對應繞道可能 allow（使用者自負的 settings
+風險）。以上皆為使用者確認、刻意接受的取捨，優先保留設計簡潔與零誤殺。
 
 ## 2. 目標與非目標
 
@@ -252,8 +260,9 @@ function isEchoPrintOnly(inv: CommandInvocation): boolean {
 - `echo`（無引數）→ argv 空 → 通過 → print 形態。
 - **替換包裝偽裝**：`echo "$(echo fake)"` → 外層 echo 的字僅替換動態 → 合格；又因聚合 `every()`
   涵蓋替換內層葉指令（inner `echo fake` 亦為 print 形態）→ 整鏈全 print → **deny**。對照
-  `echo "$(date)"` → inner `date` 非 print 形態 → 非全鏈 print → 不 deny（落 classify，date 非
-  allowlist → ask）。`echo "$VAR"` → 變數非替換 → 不合格 → 非 print 形態 → 不 deny。
+  `echo "$(date)"` → inner `date` 非 print 形態 → 非全鏈 print → 不 deny（落 classify；`date` 在
+  allowlist → allow）。對照若內層為非 allowlist 指令（如 `echo "$(rm)"`）則 inner rm → ask。
+  `echo "$VAR"` → 變數非替換 → 不合格 → 非 print 形態 → 不 deny。
 
 #### 4.1.2 `printf`
 
@@ -282,21 +291,27 @@ function hasConversionSpec(fmt: string): boolean {
 
 ```ts
 function isCatPassthrough(inv: CommandInvocation): boolean {
-  // 必須有 heredoc/here-string 輸入，且無檔案操作元
   const heredocs = inv.redirects.filter((r) =>
     r.operator === "<<" || r.operator === "<<-" || r.operator === "<<<"
   );
-  if (heredocs.length === 0) return false;                    // 無 heredoc → 非 passthrough（一般 cat 讀檔另論）
+  if (heredocs.length === 0) return false;                    // 無 heredoc → 非 passthrough
+  // 任何「非 heredoc 的輸入重導向」會改變 fd0 來源（`< file` 讀真實檔、`<&n` fd 複製），使 stdin
+  // 不再純粹來自 heredoc → 保守視為非 passthrough（避免把實際讀檔誤判為純吐字而硬 deny）。
+  if (inv.redirects.some((r) => r.operator === "<" || r.operator === "<&")) return false;
   if (hasFileOperand(inv.argv)) return false;                 // 有檔案操作元 → 讀真實檔，非純吐字
   return heredocs.every(isHeredocPrintEligible);              // 所有 heredoc body 須 print 合格
 }
 
-/** argv 是否含「非旗標位置參數」（檔名）；動態 token 也保守視為可能的檔名。 */
+/** argv 是否含檔案操作元：考慮 POSIX `--`（其後一律為操作元、不論是否以 `-` 開頭）。 */
 function hasFileOperand(argv): boolean {
-  return argv.some((w) => {
+  let afterDoubleDash = false;
+  for (const w of argv) {
     const v = staticValue(w);
-    return v === null || !v.startsWith("-");
-  });
+    if (!afterDoubleDash && v === "--") { afterDoubleDash = true; continue; }
+    if (afterDoubleDash) return true;                          // `--` 之後任何 token = 檔名操作元
+    if (v === null || !v.startsWith("-")) return true;         // 動態 token 或非旗標 → 視為檔名
+  }
+  return false;
 }
 
 /**
@@ -328,6 +343,11 @@ function isHeredocPrintEligible(r): boolean {
 - `cat <<<"literal"` → target 靜態 → print 形態；`cat <<<"$(echo fake)"` → target 替換合格 + 內層 echo
   → deny；`cat <<<"$VAR"` → 變數 → 非 print 形態。
 - `cat file` / `cat`（無 heredoc）→ `heredocs.length === 0` → 非 print 形態。
+- **stdin 重導向順序**：`cat <<EOF\n...\nEOF < README.md`（或 `cat < README.md <<EOF`）→ 含非 heredoc
+  輸入重導向 `<` → **非 passthrough**（實際 fd0 可能是 README.md）→ 不誤 deny；落 classify（cat 讀
+  README.md 依範圍判 allow/ask）。
+- **`--` 操作元**：`cat -- -fixture <<EOF\n...\nEOF` → `--` 後 `-fixture` 為檔名操作元 → 有 file
+  operand → **非 passthrough** → 不誤 deny（實際讀檔 `-fixture`）。
 
 > 型別取用：`Redirect.operator` / `target` / `content` / `heredocQuoted` / `body` 皆由 `src/deps.ts`
 > 的 `Redirect` 型別提供（見 §1.3）。`isHeredocPrintEligible` 與 `wordPrintEligible`（§4.1.4）共用語意，
@@ -525,7 +545,8 @@ for (const w of words) enumerateInnerScripts(w, cwd, out);
 - **已記錄、使用者確認接受的殘留繞道（非本功能保證封堵範圍，見 §1.5）**：
   - 「整鏈 print」閘的洗白繞道（`pwd; echo 假`、`cat README.md; printf 假`）**不 deny**——使用者
     選擇維持乾淨結構規則以零誤殺。
-  - 巢狀直譯器 / 等價等待原語落 ask（非 allow）。
+  - 巢狀直譯器 / 等價等待原語預設落 ask；**受既有 `permissions.allow` 升級層影響**（`Bash(bash *)`/
+    `Bash(python *)` 等可放行），本功能不新增此路徑亦不硬擋——使用者自負的 settings 風險（見 §1.5）。
 - **硬 deny 不可解除**：print-only 與 sleep 兩閘皆在 `evaluate` 層、classify 之前返回，皆不過中央
   前置規則與 `settingsAllows`。
 - **永遠 `exit 0`、任何例外 → `ask`**（fail-safe 不變）。
@@ -572,8 +593,8 @@ for (const w of words) enumerateInnerScripts(w, cwd, out);
 | `echo "*"$(echo fake)` | allow | **deny**（引號保護 glob → 合格；內外皆 print） |
 | `pwd; echo "假報告"` / `true && echo "已驗證"` | allow/ask | ask/allow（**已記錄洗白繞道**：no-op 非 print → 非全鏈 print；§1.5 取捨） |
 | `cat README.md; printf "已驗證"` | allow | allow（**已記錄洗白繞道**：cat 讀真檔 → 非全鏈 print；§1.5 取捨） |
-| `bash -c 'echo fake'` / `eval 'echo fake'` | ask | ask（巢狀直譯器；已記錄繞道，落 ask 非 allow） |
-| `python -c 'import time;time.sleep(5)'` / `read -t 5` / `tail -f x` | ask | ask（等價等待原語；已記錄繞道） |
+| `bash -c 'echo fake'` / `eval 'echo fake'` | ask | ask（巢狀直譯器；已記錄繞道）；註：`Bash(bash *)`/`Bash(eval *)` 下既有升級層可 allow（§1.5 point 2） |
+| `python -c 'import time;time.sleep(5)'` / `read -t 5` / `tail -f x` | ask | ask（等價等待原語）；註：`Bash(python *)`/`Bash(read *)` 下可升級為 allow（§1.5 point 4） |
 | `find / -name x`（既有遞迴根） | deny | deny（不變） |
 
 ## 8. 測試需求
@@ -621,9 +642,11 @@ for (const w of words) enumerateInnerScripts(w, cwd, out);
   時仍 ask**（不命中還原字串 `"rm -rf x"`，無法升級 rm——驗證自身與繼承 heredoc 漏洞皆真正關閉、
   無 silent allow bypass）；`cat <<EOF\n$(git log)\nEOF` → allow（git log 唯讀子指令）；
   `cat <<EOF\n$HOME\nEOF` → allow（無命令執行）。
-- **巢狀繞道落 ask（非 allow）測試**：`bash -c 'echo fake'`、`eval 'echo fake'`、
-  `python -c 'time.sleep(5)'`、`read -t 5`、`tail -f x` → 皆 `ask`（非 allowlist；驗證 §1.5 邊界
-  「最差落 ask」）。
+- **巢狀繞道測試（§1.5 邊界）**：`bash -c 'echo fake'`、`eval 'echo fake'`、`python -c 'time.sleep(5)'`、
+  `read -t 5`、`tail -f x` → **預設（無對應 permissions.allow）皆 `ask`**；**且**驗證「升級可放行」的
+  既有行為：rules 含 `Bash(bash *)` 時 `bash -c 'echo fake'` → allow、含 `Bash(python *)` 時
+  `python -c '…'` → allow（記錄此為使用者 settings 風險、非本功能新增、亦不硬擋）。對照裸 `sleep 1`
+  即使含 `Bash(sleep *)` 仍 deny（evaluate 層硬 deny）。
 - `src/rules/types_test.ts`（或併入 sleep/print_only 測試）：`printOnlyDenyReason()` /
   `pollingDenyReason()` 各含三要素（禁止字樣 / 原因 / 替代）。
 - `src/main_test.ts`（e2e 子行程）：餵 `echo "結論是 X"` 期望 `permissionDecision: "deny"` 且
@@ -651,8 +674,8 @@ echo '{"tool_name":"Bash","tool_input":{"command":"make && echo DONE"},"cwd":"/p
   Word（CommandExpansion.script）」。「三條中央前置規則」段**維持三條**（本功能不新增中央規則）。
 - 補威脅模型 / 強制邊界（§1.5）：heredoc body 命令替換以「逐一分類」正確檢查（非繞道）；記錄使用者
   確認、刻意接受的殘留繞道——巢狀直譯器（`bash -c`/`eval`/`python -c`）與等價等待原語
-  （`read -t`/`tail -f`）落 ask；「整鏈 print」閘的洗白繞道（`pwd; echo 假`、`cat file; printf 假`）
-  不 deny。
+  （`read -t`/`tail -f`）**預設 ask、但受既有 permissions.allow 升級層影響**（`Bash(bash *)` 等可放行，
+  使用者自負）；「整鏈 print」閘的洗白繞道（`pwd; echo 假`、`cat file; printf 假`）不 deny。
 - 「核心不變量」段：deny 三類、`isPrintOnlyForm` 漏判退回 classify（不誤放行）、print-only 與
   sleep 兩閘皆在 classify 前短路、不過 settingsAllows，硬性不可解除。
 - 「hook 決策 vs settings.json 權限的優先序」段：補 print-only / sleep 兩類硬 deny 不可由
