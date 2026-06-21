@@ -111,14 +111,16 @@ classify 的 allow/ask 判定。完整性界定如下：
      此非繞道，而是**與一般 `$()` 一致的正確行為**。
 3. **零葉指令（no-op）**：parse 後無可執行指令 → 既有 allow（no-op）。零指令即「什麼都不執行」、
    無從偽裝，維持 allow 安全。
-4. **sleep 強制邊界＝裸 `sleep` token**（使用者明確決定）：等價等待原語
-   （`bash -c 'sleep'`、`python -c 'time.sleep'`、`perl -e 'sleep'`、`read -t`、`tail -f`、
-   `while …; do …; done` 計時迴圈）**不**在 sleep evaluate 層掃描範圍；其葉指令（`bash`/`python`/
-   `read`/`tail`…）皆非 allowlist → **預設 `ask`**。屬**刻意接受、已記錄**的邊界，本功能不追求攔截
-   所有等待原語。
-   > ⚠️ 同上：此 `ask` 可被既有 `settingsAllows` 升級——使用者若自設 `Bash(bash *)` / `Bash(python *)`
-   > / `Bash(read *)` 等廣域 allow，對應等待形式**會升級為 allow**（裸 `sleep` 因 evaluate 層硬 deny
-   > 不受影響）。本功能不新增此路徑、亦不硬擋等價形式；屬使用者自負的 settings 風險。
+4. **sleep 強制邊界＝裸 `sleep` token**（使用者明確決定）：sleep 等價等待原語
+   （`bash -c 'sleep'`、`python -c 'time.sleep'`、`perl -e 'sleep'`、`read -t`、`while …; sleep …`
+   計時迴圈）**不**在 sleep evaluate 層硬 deny 範圍；其葉指令（`bash`/`python`/`read`…）皆非 allowlist
+   → **預設 `ask`**。屬**刻意接受、已記錄**的邊界，本功能不追求攔截所有等待原語。
+   - **例外（本次一併修）`tail -f`/`-F`/`--follow`**：原為 allow（fileReaderRule 無 gate），現由
+     §4.8 `tailRule` 收緊為 **ask**（無界跟隨需人工確認）。
+   > ⚠️ 上述 `ask`（含 tail -f）皆走既有 classify，**可被** `settingsAllows` 升級——使用者若自設
+   > `Bash(bash *)` / `Bash(python *)` / `Bash(read *)` / `Bash(tail *)` 等廣域 allow，對應形式**會
+   > 升級為 allow**（裸 `sleep` 因 evaluate 層硬 deny 不受影響）。本功能不新增此升級路徑、亦不硬擋等價
+   > 形式；屬使用者自負的 settings 風險。
 5. **「整鏈 print」閘的洗白繞道（使用者確認維持原設計，2026-06-21）**：聚合閘要求**每個**葉指令
    皆 print 形態才 deny，故只要鏈中夾一個非 print 指令即不擋。可被以下方式繞過：
    - **瑣碎 no-op 前綴**：`pwd; echo "假報告"`、`true && echo "已驗證"`、`: ; printf "通過"`
@@ -151,7 +153,12 @@ classify 的 allow/ask 判定。完整性界定如下：
 - 改 `src/engine/walk.ts`：`emitCommand` 列舉內層 command substitution 的來源加入 `redirect.body`，
   使 heredoc body 內的 `$( … )` 被解析成獨立 `CommandInvocation`、**逐一接受正常權限檢查**（與其他
   位置的 `$()` 一致）。藉此 `cat <<EOF\n$(rm -rf x)\nEOF` 的 `rm` → ask，且 `Bash(cat *)` 無法升級
-  rm；**正確封堵 heredoc 命令替換盲點，不新增 classify 中央規則、不靠硬 deny**（見 §4.6）。
+  rm；**正確封堵 heredoc 命令替換盲點、不靠硬 deny**（見 §4.6）。
+- **（一併修的兩個相鄰既有漏洞，經使用者確認納入）**：
+  - 新增 **classify 第 4 條中央前置規則**：輸入重導向 `<` 目標 `resolvePath` 超出讀取範圍 → `ask`
+    （堵 `cat < /etc/passwd` 等未範圍檢查的外部讀取，見 §4.7）。
+  - 新增 **`tailRule`**：`tail -f`/`-F`/`--follow` → `ask`（原 allow；堵無界跟隨/輪詢，見 §4.8），並把
+    `tail` 從 `fileReaderRule` 移出。
 - 在 `src/engine/evaluate.ts` walk 之後、classify 之前插入**兩個 evaluate 層硬 deny 閘**：
   (①) `some(inv.name === "sleep")` → `deny`；(②) `isAllPrintOnly` 整鏈 print → `deny`。皆在 classify
   前返回 → 天生硬性、不過任何中央前置規則與 `settingsAllows`。
@@ -175,14 +182,16 @@ classify 的 allow/ask 判定。完整性界定如下：
 - **不**處理 print-laundering（`echo x | cat`：cat 無 heredoc → 非 print 形態 → 不 deny）。罕見、
   可接受的弱點。
 - **不**偵測迴圈語意的 sleep（`while … sleep …`）為特例：sleep 一律無條件 deny，迴圈與否不影響。
-- **不**動既有的寫入重導向 / 賦值前綴 / 非唯讀指令偵測；**只新增 deny，不放寬任何既有判定**。
+- **不**動既有的寫入重導向 / 賦值前綴 / 非唯讀指令偵測；**只收緊（新增 deny，或把既有 allow 收為
+  ask：tail -f、輸入重導向外部讀取），不放寬任何既有判定**。
 - **不**引入快取、**不**讀 enterprise managed-settings。
 
 ## 3. 架構與資料流
 
-新增邏輯掛在兩處：`evaluate` 的**兩個聚合硬 deny 閘**（sleep 名稱掃描 + 整鏈 print-only，皆在
-classify 之前返回）、與 `walk` 的 **heredoc `body` 內層替換列舉**（使 body 內的 `$()` 逐一受檢）。
-classify 的中央前置規則維持既有三條、不新增；parse 職責不變。
+新增邏輯掛在數處：`evaluate` 的**兩個聚合硬 deny 閘**（sleep 名稱掃描 + 整鏈 print-only，皆在
+classify 之前返回）、`walk` 的 **heredoc `body` 內層替換列舉**（使 body 內的 `$()` 逐一受檢）、
+classify 的**第 4 條中央前置規則「輸入重導向 `<` 目標範圍檢查」**（§4.7），以及新增 `tailRule`
+（`-f`/`-F`/`--follow` → ask，§4.8）。parse 職責不變。
 
 ```
 main.ts → evaluate(command, root, initialCwd, rules, home, trustedReadRoots)
@@ -191,7 +200,8 @@ main.ts → evaluate(command, root, initialCwd, rules, home, trustedReadRoots)
        ├─ 硬 deny 閘①：some(inv.name === "sleep") → deny(pollingDenyReason())  （新增；classify 前短路）
        ├─ 硬 deny 閘②：isAllPrintOnly(invocations) → deny(printOnlyDenyReason()) （新增；classify 前短路）
        └─ combine(invocations.map(classify))                          （既有；含 heredoc body 內層指令）
-             └─ classify → classifyBuiltin（中央前置規則維持三條，不新增）
+             └─ classify → classifyBuiltin
+                   └─ 中央前置規則 #4：輸入重導向 `<` 目標超出讀取範圍 → ask  （新增；見 §4.7）
 ```
 
 ### 3.1 為何 print-only 與 sleep 皆放 `evaluate` 聚合層（classify 之前）
@@ -273,19 +283,25 @@ function isPrintfPrintOnly(inv: CommandInvocation): boolean {
   const fmtWord = inv.argv.find((w) => staticValue(w) !== "--");
   if (!fmtWord) return true;                                  // 無 format（如僅 "--"）→ 視為純輸出
   const fmt = staticValue(fmtWord);                           // 替換型 format → null
-  if (fmt !== null && hasConversionSpec(fmt)) return false;   // carve-out：靜態 format 含轉換符 → 行為檢查
-  return true;                                                // format 為替換型（無法檢查轉換符）→ 視為純輸出
+  if (fmt !== null && hasFormatterConversion(fmt)) return false; // carve-out：含「格式化」轉換符 → 行為檢查
+  return true;                                                // format 替換型 或 僅含 %s/%b → 視為純輸出（print 形態）
 }
 
-/** format 是否含真實轉換符（%d/%s/%f/…），排除字面 %%。 */
-function hasConversionSpec(fmt: string): boolean {
+/**
+ * format 是否含「會做格式化轉換」的轉換符（carve-out 條件，窄化）。
+ * **刻意排除 `%s` / `%b`（純字串輸出）**——`printf "%s\n" "結論"` 只是把靜態字串吐出、屬 print-only
+ * 偽裝，不該 carve-out。只有數值 / 字元 / 浮點等「真的轉換值」的轉換符才算行為檢查。排除字面 `%%`。
+ */
+function hasFormatterConversion(fmt: string): boolean {
   const stripped = fmt.replace(/%%/g, "");
-  return /%[-+ 0#]*[0-9.*]*[diouxXeEfFgGaAcsbq]/.test(stripped);
+  return /%[-+ 0#]*[0-9.*]*[diouxXeEfFgGaACc]/.test(stripped);   // 不含 s / b（字串）
 }
 ```
 
-- 含轉換符（`printf "%05d\n" 42`）→ carve-out → 非 print 形態 → 落回（printf 不在 allowlist）`ask`。
-- 無轉換符（`printf "結論：x\n"`、`printf "%%done\n"`）→ print 形態。
+- 含格式化轉換符（`printf "%05d\n" 42`、`printf "%.2f" 3.14`、`printf "%c" 65`）→ carve-out → 非 print
+  形態 → 落回（printf 不在 allowlist）`ask`。
+- **僅 `%s`/`%b` 或無轉換符**（`printf "%s\n" "結論"`、`printf "結論：x\n"`、`printf "%%done\n"`）→
+  **print 形態**；整鏈 print 時由 evaluate 層硬 deny（`Bash(printf *)` 無法升級——封堵主要偽裝向量）。
 
 #### 4.1.3 `cat` / `tac`（heredoc / here-string passthrough）
 
@@ -518,6 +534,55 @@ for (const w of words) enumerateInnerScripts(w, cwd, out);
 > `( cat ) <<EOF $(rm) EOF`、`while read; do …; done <<EOF $(rm) EOF` 的 `rm` 都會被分類為 ask、且
 > 不可由 `Bash(cat *)` 升級——**無 silent allow bypass**。
 
+### 4.7 第 4 條中央前置規則：輸入重導向 `<` 目標範圍檢查（`src/engine/classify.ts`）
+
+**動機**：既有中央前置規則只檢查**寫入**重導向；**輸入**重導向 `< file`（把 fd0 接到檔案）會讓指令
+**讀取**該檔，但目前**完全未做範圍檢查**——例如 `cat < /etc/passwd`（cat 無位置參數）落 `fileReaderRule`
+allow，靜默讀取專案外檔案，牴觸「只讀專案內」核心宗旨。本功能的 cat-passthrough fallback（§4.1.3 對
+含 `<` 者改交 classify）亦依賴此檢查才正確。
+
+**規則**：於 `classifyBuiltin` 既有三條中央前置規則之後新增第 4 條（在個別 rule 之前）：
+
+```ts
+// 中央前置規則之四：輸入重導向 < 的目標路徑須落在允許讀取範圍
+for (const r of inv.redirects) {
+  if (r.operator !== "<") continue;            // 只查讀檔 <；heredoc <</<<-/<<< 與 fd 複製 <& 不在此
+  if (!r.target) continue;
+  if (ctx.resolvePath(r.target) !== "in-project") {
+    return ask(`${inv.name}：輸入重導向讀取超出專案範圍或無法靜態解析（${r.target.value}）`);
+  }
+}
+```
+
+- `resolvePath` 已涵蓋專案內 ∪ 使用者 `Read()`/allow 宣告的外部讀取範圍 ∪ trusted session 根，語意與
+  位置參數、`pathValueFlags` 一致。靜態外部路徑 / 動態 target → `ask`。
+- 此為 `ask`（非 deny），**可被** `permissions.allow` 升級（與既有讀取位置放寬一致）——例如使用者明設
+  `Read(//etc/passwd)` 或 `Bash(cat *)` 則放行；屬使用者自負範圍。
+- 效果：`cat < /etc/passwd` → ask（原 allow，堵讀取盲點）；`cat < ./README.md` → in-project → 不受此
+  規則影響（依後續 cat 規則 allow）；`grep pat < /etc/shadow` → ask。
+- **classifyBuiltin 需把 `resolvePath` 用於 redirect target**：`RuleContext.resolvePath(word)` 已可用，
+  此檢查可直接在 `classifyBuiltin` 內以 `scope` 呼叫 `resolvePath(r.target, inv.cwd, scope)`（與建構
+  ctx 同源），不必等進個別 rule。
+
+### 4.8 `tailRule`：`tail` 跟隨模式（`-f`/`-F`/`--follow`）→ ask（`src/rules/commands/`）
+
+**動機**：`tail` 現於 `coreutils.ts` 的 `fileReaderRule` 群組、`-f` 無 gate，故 `tail -f project.log`
+（專案內路徑）→ allow，形成**無界跟隨 / 輪詢**的放行路徑，牴觸「防 Bash 輪詢」目標。
+
+**變更**：
+
+1. 從 `fileReaderRule` 的 `names` **移除 `"tail"`**（避免在共用群組對 `-f` 開 askFlag 而誤殺
+   `cut -f`（欄位選擇）等其他成員）。
+2. 新增專用 `tailRule = flagGatedReader({ names: ["tail"], askFlags: [...follow...] })`：
+   - follow 旗標：`exact("-f", "-F", "--follow")`、`prefix("--follow=")`（如 `--follow=name`）、
+     `exact("--retry")`、以及短旗標群集含 `f`/`F`（如 `-fn`、`-Fq`）。命中即 `ask`。
+   - 其餘維持 `flagGatedReader` 既有唯讀行為（位置參數 `resolvePath`、無寫檔 flag）。
+3. 在 `allowlist.ts` 註冊 `tailRule`（name `tail` 不可與既有重複——已從 fileReaderRule 移除故不衝突）。
+
+- 採 **ask 而非 deny**：`tail -f log` 有合法「查看日誌尾巴」用途，交人工確認即可；且與 sleep（硬 deny）
+  區隔——sleep 在唯讀情境無正當用途，tail -f 有。此 ask **可被** `Bash(tail *)` 升級（使用者自負）。
+- `tail`（無 `-f`）→ 維持唯讀 allow（同原 fileReaderRule 行為）。
+
 ## 5. 與 `permissions.allow` 升級層的互動
 
 - **整鏈 print-only deny** 在 `evaluate` 層、`classify` 之前返回，根本不進入 `settingsAllows`：
@@ -550,7 +615,8 @@ for (const w of words) enumerateInnerScripts(w, cwd, out);
 - **硬 deny 不可解除**：print-only 與 sleep 兩閘皆在 `evaluate` 層、classify 之前返回，皆不過中央
   前置規則與 `settingsAllows`。
 - **永遠 `exit 0`、任何例外 → `ask`**（fail-safe 不變）。
-- **只新增 deny，不放寬任何既有判定**：寫入重導向 / 賦值前綴 / 非唯讀指令偵測一律不動。
+- **只收緊、不放寬任何既有判定**：新增 deny（print-only/sleep），或把既有 allow 收為 ask（tail -f
+  跟隨、輸入重導向 `<` 外部讀取）；寫入重導向 / 賦值前綴 / 非唯讀指令偵測一律不動，無任何放寬。
 
 ## 7. 行為對照表
 
@@ -574,7 +640,8 @@ for (const w of words) enumerateInnerScripts(w, cwd, out);
 | `echo data \| grep x` | ask（grep 視範圍） | 不變（grep 非 print → 非全鏈 print） |
 | `cat <<EOF...EOF \| python` | ask | 不變（python 非 print → 非全鏈 print） |
 | `echo -e "a\tb"` | allow | allow（carve-out：跳脫旗標） |
-| `printf "%05d\n" 42` | ask | ask（carve-out：含轉換符） |
+| `printf "%05d\n" 42` / `printf "%.2f" 3.14` | ask | ask（carve-out：數值/格式化轉換符 → 行為檢查） |
+| `printf "%s\n" "結論"` / `printf "%b" "x"` | ask | **deny**（%s/%b 純字串非行為檢查；整鏈 print；`Bash(printf *)` 不可升級） |
 | `echo {1..5}` / `echo *.txt` | allow | 不變（brace/glob → 非全靜態 → 非 print 形態） |
 | `echo x > file` | ask（寫入重導向） | ask（寫檔 → 非 print 形態） |
 | `cat > /tmp/x << EOF...EOF` | ask（寫入重導向） | ask（寫檔 → 非 print 形態） |
@@ -595,6 +662,13 @@ for (const w of words) enumerateInnerScripts(w, cwd, out);
 | `cat README.md; printf "已驗證"` | allow | allow（**已記錄洗白繞道**：cat 讀真檔 → 非全鏈 print；§1.5 取捨） |
 | `bash -c 'echo fake'` / `eval 'echo fake'` | ask | ask（巢狀直譯器；已記錄繞道）；註：`Bash(bash *)`/`Bash(eval *)` 下既有升級層可 allow（§1.5 point 2） |
 | `python -c 'import time;time.sleep(5)'` / `read -t 5` / `tail -f x` | ask | ask（等價等待原語）；註：`Bash(python *)`/`Bash(read *)` 下可升級為 allow（§1.5 point 4） |
+| `tail -f project.log` | **allow**（漏洞：fileReaderRule 無 -f gate） | ask（§4.8 tailRule follow → ask；`Bash(tail *)` 可升級） |
+| `tail project.log`（無 -f） | allow | allow（不變） |
+| `cut -f1 data.csv` | allow | allow（不受 tail follow gate 影響——tail 已拆出獨立 rule） |
+| `cat < /etc/passwd` | **allow**（漏洞：輸入重導向未範圍檢查） | ask（§4.7 輸入重導向 `<` 目標超出範圍） |
+| `cat < ./README.md` | allow | allow（in-project；§4.7 通過） |
+| `grep pat < /etc/shadow` | allow | ask（§4.7 輸入重導向超出範圍） |
+| `cat <<EOF\nfake\nEOF < README.md` | allow | allow（含 `<` → 非 passthrough；讀 README.md in-project；heredoc 未用） |
 | `find / -name x`（既有遞迴根） | deny | deny（不變） |
 
 ## 8. 測試需求
@@ -612,7 +686,10 @@ for (const w of words) enumerateInnerScripts(w, cwd, out);
     `echo x | grep y`、`cat <<EOF\nx\nEOF | python`、`echo data | wc -l`、`echo "$(date)"`
     （inner date 非 print）、`echo "$(cat real)"`（inner cat 讀檔非 print）、`cat <<EOF\n$(rm)\nEOF`
     （內層 rm 非 print → 非全鏈 print）。
-  - carve-out **不** deny：`echo -e "a\tb"`、`echo -ne "x"`、`printf "%05d\n" 42`、`printf "%s\n" "x"`。
+  - carve-out **不** deny（行為檢查）：`echo -e "a\tb"`、`echo -ne "x"`、`printf "%05d\n" 42`、
+    `printf "%.2f" 3.14`、`printf "%c" 65`。
+  - **carve-out 收窄後仍 deny**（`%s`/`%b` 純字串非行為檢查）：`printf "%s\n" "結論"`、`printf "%b" "x"`
+    （整鏈 print → deny；且含 `Bash(printf *)` 仍 deny，驗證不可升級）。
   - 前置排除**不** deny：`echo x > f`（寫檔）、`cat > /tmp/x << EOF\nx\nEOF`（寫檔）、`FOO=1 echo x`
     （賦值）、`echo "$VAR"`（變數非替換 → 不合格）、`echo "a$VAR b"`（含變數）、`echo {1..5}`（brace）。
   - `wordPrintEligible` 邊界：`echo "$(c)"` 合格、`echo a$(c)b` 合格、`echo "$VAR"` 不合格、
@@ -647,10 +724,18 @@ for (const w of words) enumerateInnerScripts(w, cwd, out);
   既有行為：rules 含 `Bash(bash *)` 時 `bash -c 'echo fake'` → allow、含 `Bash(python *)` 時
   `python -c '…'` → allow（記錄此為使用者 settings 風險、非本功能新增、亦不硬擋）。對照裸 `sleep 1`
   即使含 `Bash(sleep *)` 仍 deny（evaluate 層硬 deny）。
+- `src/engine/classify_test.ts`（§4.7 輸入重導向範圍檢查）：`cat < /etc/passwd`、`grep pat < /etc/shadow`
+  → `ask`；`cat < ./README.md`、`head < src/x.ts` → 通過此規則（in-project）；`cat < $VAR`（動態 target）
+  → ask；`cat <<EOF\nx\nEOF`（heredoc 非 `<`，不受此規則）→ 不誤判；此 ask 命中 `Read(//etc/passwd)` 或
+  `Bash(cat *)` 可升級為 allow。
+- `src/rules/commands/tail_test.ts`（新；§4.8）：`tail -f log`、`tail -F log`、`tail --follow=name log`、
+  `tail -fn10 log`、`tail --retry log` → `ask`；`tail log`、`tail -n 20 log`（in-project）→ allow；
+  `tail -f /etc/x`（專案外）→ ask；確認 `cut -f1 data.csv` **不**受影響（仍 allow）。
 - `src/rules/types_test.ts`（或併入 sleep/print_only 測試）：`printOnlyDenyReason()` /
   `pollingDenyReason()` 各含三要素（禁止字樣 / 原因 / 替代）。
 - `src/main_test.ts`（e2e 子行程）：餵 `echo "結論是 X"` 期望 `permissionDecision: "deny"` 且
-  `exit 0`；餵 `sleep 1` 期望 deny；餵 `make && echo DONE` 期望非 deny。
+  `exit 0`；餵 `sleep 1` 期望 deny；餵 `make && echo DONE` 期望非 deny；餵 `cat < /etc/passwd` 期望 ask；
+  餵 `tail -f x` 期望 ask。
 
 **Operational verification（build 後必做）**：
 
@@ -671,7 +756,8 @@ echo '{"tool_name":"Bash","tool_input":{"command":"make && echo DONE"},"cwd":"/p
 - 「架構（評估管線）」段：補 `evaluate` 在 walk 後、classify 前的**兩個聚合硬 deny 閘**（sleep 掃描
   + 整鏈 print-only）；補 `print_only.ts` 模組職責；補 `walk` 列舉 heredoc `redirect.body` 內層替換。
 - 「unbash 事實」段：版本 3.0.0 → **4.0.1**；補「heredoc body 含展開時 `redirect.body` 為結構化
-  Word（CommandExpansion.script）」。「三條中央前置規則」段**維持三條**（本功能不新增中央規則）。
+  Word（CommandExpansion.script）」。「三條中央前置規則」段**改為四條**，補第 4 條「輸入重導向 `<`
+  目標範圍檢查 → ask」（§4.7）；另補 `tailRule`（`tail -f`/`-F`/`--follow` → ask，§4.8）。
 - 補威脅模型 / 強制邊界（§1.5）：heredoc body 命令替換以「逐一分類」正確檢查（非繞道）；記錄使用者
   確認、刻意接受的殘留繞道——巢狀直譯器（`bash -c`/`eval`/`python -c`）與等價等待原語
   （`read -t`/`tail -f`）**預設 ask、但受既有 permissions.allow 升級層影響**（`Bash(bash *)` 等可放行，
@@ -689,10 +775,15 @@ echo '{"tool_name":"Bash","tool_input":{"command":"make && echo DONE"},"cwd":"/p
 | `src/engine/word.ts` | export `topPartIsDynamic` / `nestedPartIsDynamic` 供 `wordPrintEligible` 複用（含 glob 偵測） |
 | `src/engine/evaluate.ts` | walk 後、classify 前插入兩個硬 deny 閘：①`some(name==="sleep")` ②`isAllPrintOnly` |
 | `src/engine/walk.ts` | `emitCommand` 從 `[...inherited, ...cmd.redirects]` 列舉 `target` 與 `body` 內層替換（heredoc body 的 `$()` 逐一受檢，含外層/繼承掛載的 heredoc） |
+| `src/engine/classify.ts` | 新增第 4 條中央前置規則：輸入重導向 `<` 目標 `resolvePath` 超出範圍 → ask（§4.7） |
+| `src/rules/commands/coreutils.ts` | `fileReaderRule.names` **移除 `"tail"`**（改由 tailRule 管） |
+| `src/rules/commands/tail.ts` | 新檔：`tailRule`（follow 旗標 `-f`/`-F`/`--follow`/`--retry`/短群集含 f → ask） |
+| `src/rules/allowlist.ts` | 註冊 `tailRule` |
 | `src/rules/types.ts` | 新增 `printOnlyDenyReason()`、`pollingDenyReason()` helper |
 | `deno.json` / `deno.lock` | unbash 3.0.0 → 4.0.1（已完成、已驗證；本功能依賴 4.0.1 的 heredoc `body` 結構） |
 | `src/engine/print_only_test.ts` | 新檔：謂詞 + 聚合三面 + 邊界測試 |
 | `src/engine/walk_test.ts` | heredoc body 列舉：`cat <<EOF $(rm) EOF` → 兩筆 invocation；引號/變數 → 一筆 |
+| `src/rules/commands/tail_test.ts` | 新檔：tail follow → ask；`tail`/`cut -f` → allow |
 | `src/engine/evaluate_test.ts`（或 `classify_test.ts`） | sleep evaluate 層硬 deny（含 `FOO=1 sleep`/`sleep>out`/`Bash(sleep *)` 回歸）/ print-only 聚合 deny / 硬性不可解除 / heredoc body 命令替換正確分類（`Bash(cat *)` 不升級 rm）/ 巢狀繞道落 ask |
 | `src/main_test.ts` | e2e：echo 結論 deny、sleep deny、make && echo 非 deny、`cat <<EOF $(rm) EOF` ask |
 | `CLAUDE.md` | deny 三類、管線（含 walk body 列舉）、不變量、優先序段更新 |
