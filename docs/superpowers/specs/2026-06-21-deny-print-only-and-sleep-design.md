@@ -430,23 +430,30 @@ heredoc 而言 `target` 是**分隔符**、命令替換在 **`body`**，故 **he
 跑。**正確做法**（經使用者確認）：把 `redirect.body` 也納入內層 script 列舉來源，使 body 內的每個
 命令替換**像其他位置的 `$(...)` 一樣被解析成獨立 `CommandInvocation`、逐一接受權限檢查**。
 
-**變更**：`emitCommand` 的 `words` 蒐集陣列加入 `redirect.body`：
+**變更**：`emitCommand` 改為從**該 invocation 實際承載的全部 redirect**（`inherited` + `cmd.redirects`，
+即與 invocation `redirects` 欄位同一集合）列舉 `target` 與 `body` 的內層替換：
 
 ```ts
+const allRedirects = [...inherited, ...cmd.redirects];   // 與 invocation.redirects 同源
 const words: Word[] = [
   ...(cmd.name ? [cmd.name] : []),
   ...cmd.suffix,
   ...cmd.prefix.flatMap((a) => (a.value ? [a.value] : [])),
-  ...cmd.redirects.flatMap((r) => (r.target ? [r.target] : [])),
-  ...cmd.redirects.flatMap((r) => (r.body ? [r.body] : [])),   // 新增：heredoc body 內的替換
+  ...allRedirects.flatMap((r) => (r.target ? [r.target] : [])),  // 改：含 inherited（原僅 cmd.redirects）
+  ...allRedirects.flatMap((r) => (r.body ? [r.body] : [])),      // 新增：heredoc body 內的替換（含 inherited）
 ];
 for (const w of words) enumerateInnerScripts(w, cwd, out);
 ```
 
-`redirect.body` 是結構化 Word（§1.3 #1）；`enumerateInnerScripts` 既有邏輯即會走訪其 `parts`、對
-`CommandExpansion` 取 `.script` 列舉內層指令（與處理 `$()` 於 suffix/target 完全一致）。引號分隔符
-heredoc（`heredocQuoted === true`）的 `body` 為 `undefined` → 自然不列舉（`$(...)` 是字面、不執行），
-正確。
+- **為何含 `inherited`**：Statement / 複合結構的 heredoc 掛在**外層**（如 `{ cat; } <<EOF\n$(rm)\nEOF`、
+  `( cat ) <<EOF\n$(rm)\nEOF`、`while read; do …; done <<EOF\n$(rm)\nEOF`），會以 `inherited` 傳給內層
+  指令。若只掃 `cmd.redirects` 會漏掉外層 heredoc body 的 `$(rm)` → `cat` 仍 allow 而 `rm` 靜默執行
+  （silent allow bypass）。改掃 `[...inherited, ...cmd.redirects]` 即涵蓋自身與繼承的 heredoc/target。
+- `redirect.body` 是結構化 Word（§1.3 #1）；`enumerateInnerScripts` 既有邏輯走訪其 `parts`、對
+  `CommandExpansion` 取 `.script` 列舉內層指令（與處理 `$()` 於 suffix/target 完全一致）。引號分隔符
+  heredoc（`heredocQuoted === true`）的 `body` 為 `undefined` → 自然不列舉（`$(...)` 字面、不執行）。
+- **重複列舉無害**：複合 heredoc 由 N 個兄弟指令共享 `inherited` 時，body 的 `$(rm)` 會被各兄弟各列舉
+  一次（rm 出現 N 筆）；verdict 為冪等（deny/ask 重複不影響），故**不需去重**，仍正確。
 
 **效果（取代原「動態 heredoc → ask 中央規則」，更精準）**：
 
@@ -463,13 +470,13 @@ heredoc（`heredocQuoted === true`）的 `body` 為 `undefined` → 自然不列
 heredoc → body 動態 → `isHeredocStatic` 為 false → cat 非 print 形態 → 非全鏈 print → 交 classify
 （cat + 內層指令各自判定）。
 
-> **不需**第 4 條中央前置規則、**不需** `isHeredocDynamic`（已刪）；`isHeredocStatic` 仍由
+> **不需**新增 classify 中央前置規則、**不需** `isHeredocDynamic`；`isHeredocStatic` 仍由
 > `print_only.ts` 的 `isCatPassthrough` 使用（見 §4.1.3）。
 >
-> **範圍備註**：本變更列舉 `cmd.redirects.body`（指令自身的 heredoc，涵蓋實務全部情形）。Statement /
-> 複合結構**繼承**而來的 redirect（`inherited`）其 target/body 之內層替換未被列舉，屬 walk **既有**
-> 限制（target 亦然），非本功能新增、不在範圍；漏列舉僅導致該內層指令不被檢查 → 退回 cat 既有判定
-> （safe 方向，非誤放行新指令）。
+> **涵蓋範圍**：自身（`cmd.redirects`）與繼承（`inherited`，含 Statement / brace group / subshell /
+> 控制流迴圈掛載的 heredoc）的 `target` 與 `body` 內層替換**皆列舉**，故 `{ cat; } <<EOF $(rm) EOF`、
+> `( cat ) <<EOF $(rm) EOF`、`while read; do …; done <<EOF $(rm) EOF` 的 `rm` 都會被分類為 ask、且
+> 不可由 `Bash(cat *)` 升級——**無 silent allow bypass**。
 
 ## 5. 與 `permissions.allow` 升級層的互動
 
@@ -536,6 +543,7 @@ heredoc → body 動態 → `isHeredocStatic` 為 false → cat 非 print 形態
 | `echo "$(date)"` | allow（date 在 allowlist） | allow（不變；echo 替換合格→print，date 非 print→非全鏈 print；classify 皆 allow） |
 | `(echo fake)` / `{ echo a; echo b; }` | allow | **deny**（subshell/brace 已被 walk 攤平） |
 | `cat <<EOF\n$(rm -rf x)\nEOF` | **allow**（漏洞） | ask（walk 列舉 body→rm 逐一判 ask；`Bash(cat *)` 不命中 rm、無法升級） |
+| `{ cat; } <<EOF\n$(rm -rf x)\nEOF`（繼承 heredoc） | **allow**（漏洞） | ask（walk 列舉 inherited body→rm 判 ask；無法由 `Bash(cat *)` 升級） |
 | `cat <<EOF\n$(git log)\nEOF` | allow | allow（內層 git log 在 git 唯讀子指令集 → allow） |
 | `cat <<EOF\n$HOME\nEOF` | allow | allow（純變數插值、無 CommandExpansion → 不列舉內層 → cat allow） |
 | `pwd; echo "假報告"` / `true && echo "已驗證"` | allow/ask | ask/allow（**已記錄洗白繞道**：no-op 非 print → 非全鏈 print；§1.5 取捨） |
@@ -577,10 +585,13 @@ heredoc → body 動態 → `isHeredocStatic` 為 false → cat 非 print 形態
   產出**兩筆** invocation（`cat` + `rm`，後者 name==="rm"）；`cat <<EOF\n$HOME\nEOF`（純變數）→ **一筆**
   （`cat`，無內層）；`cat <<'EOF'\n$(rm)\nEOF`（引號 → body undefined）→ **一筆**；`cat <<<"$(rm)"`
   （here-string）→ 兩筆（既有 target 列舉，確認回歸不破）。
+  **繼承 heredoc（外層掛載）**：`{ cat; } <<EOF\n$(rm)\nEOF`、`( cat ) <<EOF\n$(rm)\nEOF`、
+  `while read; do cat; done <<EOF\n$(rm)\nEOF` → 各含一筆 `rm` invocation（驗證 inherited 也被列舉）。
 - `src/engine/classify_test.ts` / e2e（heredoc body 命令替換經正確分類）：`cat <<EOF\n$(rm -rf x)\nEOF`
-  → **ask**（rm 非 allowlist）；**且 rules 含 `Bash(cat *)` 時仍 ask**（`Bash(cat *)` 不命中還原字串
-  `"rm -rf x"`，無法升級 rm——驗證漏洞真正關閉、非可升級）；`cat <<EOF\n$(git log)\nEOF` → allow
-  （git log 唯讀子指令）；`cat <<EOF\n$HOME\nEOF` → allow（無命令執行）。
+  與 `{ cat; } <<EOF\n$(rm -rf x)\nEOF` 皆 → **ask**（rm 非 allowlist）；**且 rules 含 `Bash(cat *)`
+  時仍 ask**（不命中還原字串 `"rm -rf x"`，無法升級 rm——驗證自身與繼承 heredoc 漏洞皆真正關閉、
+  無 silent allow bypass）；`cat <<EOF\n$(git log)\nEOF` → allow（git log 唯讀子指令）；
+  `cat <<EOF\n$HOME\nEOF` → allow（無命令執行）。
 - **巢狀繞道落 ask（非 allow）測試**：`bash -c 'echo fake'`、`eval 'echo fake'`、
   `python -c 'time.sleep(5)'`、`read -t 5`、`tail -f x` → 皆 `ask`（非 allowlist；驗證 §1.5 邊界
   「最差落 ask」）。
@@ -624,7 +635,7 @@ echo '{"tool_name":"Bash","tool_input":{"command":"make && echo DONE"},"cwd":"/p
 |---|---|
 | `src/engine/print_only.ts` | 新檔：`isAllPrintOnly`、`isPrintOnlyForm`、`wordPrintEligible`、`isHeredocStatic`、echo/printf/cat 子判定 + carve-out |
 | `src/engine/evaluate.ts` | walk 後、classify 前插入兩個硬 deny 閘：①`some(name==="sleep")` ②`isAllPrintOnly` |
-| `src/engine/walk.ts` | `emitCommand` 列舉內層 script 來源加入 `redirect.body`（heredoc body 內的 `$()` 逐一受檢） |
+| `src/engine/walk.ts` | `emitCommand` 從 `[...inherited, ...cmd.redirects]` 列舉 `target` 與 `body` 內層替換（heredoc body 的 `$()` 逐一受檢，含外層/繼承掛載的 heredoc） |
 | `src/rules/types.ts` | 新增 `printOnlyDenyReason()`、`pollingDenyReason()` helper |
 | `deno.json` / `deno.lock` | unbash 3.0.0 → 4.0.1（已完成、已驗證；本功能依賴 4.0.1 的 heredoc `body` 結構） |
 | `src/engine/print_only_test.ts` | 新檔：謂詞 + 聚合三面 + 邊界測試 |
