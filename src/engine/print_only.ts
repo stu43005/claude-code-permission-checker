@@ -1,5 +1,5 @@
 import type { CommandInvocation } from "../types.ts";
-import type { Word, WordPart } from "../deps.ts";
+import type { Redirect, Word, WordPart } from "../deps.ts";
 import { hasWriteRedirect } from "./redirect.ts";
 import { isStatic, nestedPartIsDynamic, staticValue, topPartIsDynamic } from "./word.ts";
 
@@ -49,6 +49,9 @@ export function isPrintOnlyForm(inv: CommandInvocation): boolean {
       return isEchoPrintOnly(inv);
     case "printf":
       return isPrintfPrintOnly(inv);
+    case "cat":
+    case "tac":
+      return isCatPassthrough(inv);
     default:
       return false;
   }
@@ -89,4 +92,42 @@ function hasFormatterConversion(fmt: string): boolean {
   const stripped = fmt.replace(/%%/g, "");
   return /%[-+ 0#']*[0-9*]*(\.[0-9*]*)?(hh|h|ll|l|L|j|z|t)?[diouxXeEfFgGaAcCqn]/.test(stripped) ||
     /%\([^)]*\)T/.test(stripped);
+}
+
+function isCatPassthrough(inv: CommandInvocation): boolean {
+  if (hasFileOperand(inv.argv)) return false;                 // 有檔案操作元 → 讀真實檔
+  // 依 Bash 重導向順序決定 fd0 來源：影響 fd0 的輸入重導向中**最後一個勝**。
+  const fd0Inputs = inv.redirects.filter((r) =>
+    (r.operator === "<" || r.operator === "<<" || r.operator === "<<-" ||
+      r.operator === "<<<" || r.operator === "<&") &&
+    (r.fileDescriptor === undefined || r.fileDescriptor === 0)
+  );
+  if (fd0Inputs.length === 0) return false;                   // 無 fd0 輸入 → 非 passthrough
+  const effective = fd0Inputs[fd0Inputs.length - 1];          // 最後者 = 有效 stdin
+  if (effective.operator !== "<<" && effective.operator !== "<<-" && effective.operator !== "<<<") {
+    return false;                                             // 有效 stdin 是 < file 或 <&fd
+  }
+  return isHeredocPrintEligible(effective);
+}
+
+/** argv 是否含檔案操作元：考慮 POSIX `--`（其後一律為操作元）。 */
+function hasFileOperand(argv: Word[]): boolean {
+  let afterDoubleDash = false;
+  for (const w of argv) {
+    const v = staticValue(w);
+    if (!afterDoubleDash && v === "--") { afterDoubleDash = true; continue; }
+    if (afterDoubleDash) return true;                          // `--` 之後任何 token = 檔名
+    if (v === null || !v.startsWith("-")) return true;         // 動態或非旗標 → 視為檔名
+  }
+  return false;
+}
+
+/** heredoc/here-string body 是否「print 合格」（靜態，或唯一動態為 $( … )）。 */
+function isHeredocPrintEligible(r: Redirect): boolean {
+  if (r.operator === "<<<") {
+    return r.target ? wordPrintEligible(r.target) : true;     // here-string：target 為實際字串 Word
+  }
+  if (r.heredocQuoted === true) return true;                  // 引號分隔符 → 靜態字面
+  if (r.body) return wordPrintEligible(r.body);               // body 存在（含展開）→ 以 wordPrintEligible 判
+  return !/[$`]/.test(r.content ?? "");                       // body 不存在 → 純文字（無 $/反引號才算靜態）
 }

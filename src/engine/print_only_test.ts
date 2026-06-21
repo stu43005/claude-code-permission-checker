@@ -109,3 +109,30 @@ Deno.test("printf carve-out 涵蓋 length modifier / %q / %n / strftime（避免
   assertEquals(isPrintOnlyForm(invs('printf "%s\\n" "結論"')[0]), true);  // %s 純字串 → 仍 print（回歸）
   assertEquals(isPrintOnlyForm(invs('printf "%b" "x"')[0]), true);        // %b 純字串 → 仍 print（回歸）
 });
+
+Deno.test("cat heredoc passthrough → print；含真實指令/變數 → 非全鏈 print", () => {
+  assertEquals(isAllPrintOnly(invs("cat <<EOF\nhello\nEOF")), true);
+  assertEquals(isAllPrintOnly(invs("cat <<'EOF'\n$x\nEOF")), true);      // 引號分隔符 → 靜態
+  assertEquals(isAllPrintOnly(invs('cat <<<"x"')), true);                // here-string
+  assertEquals(isAllPrintOnly(invs("cat <<EOF\n$(echo 假)\nEOF")), true); // body 僅替換 + inner echo
+  assertEquals(isAllPrintOnly(invs('cat <<<"$(echo 假)"')), true);        // here-string 替換包裝
+  assertEquals(isAllPrintOnly(invs("cat <<EOF\n$(rm x)\nEOF")), false);   // inner rm 非 print
+  assertEquals(isAllPrintOnly(invs("cat <<EOF\n$HOME\nEOF")), false);     // body 變數 → cat 非 print
+  assertEquals(isAllPrintOnly(invs('cat <<<"$VAR"')), false);             // here-string 變數
+  assertEquals(isAllPrintOnly(invs("cat file")), false);                  // 無 heredoc
+  assertEquals(isAllPrintOnly(invs("cat -n <<EOF\nx\nEOF")), true);       // 僅旗標、有 heredoc
+  assertEquals(isAllPrintOnly(invs("cat f && echo ok")), false);          // cat 讀真檔 → 非全鏈 print
+  // 管線：heredoc 在 brace group 內，外層 pipe python（python 非 print）
+  // 注意：unbash 以換行終止 heredoc body，故管線須用 brace group 包裝才能正確解析
+  assertEquals(isAllPrintOnly(invs("{ cat <<EOF\nx\nEOF\n} | python")), false);
+});
+
+Deno.test("cat fd0 重導向順序（最後者勝）+ -- 操作元", () => {
+  // 最後是 < README.md → 讀真實檔 → 非 passthrough
+  // 注意：unbash 解析 heredoc 時，額外重導向寫在同一行（<<EOF 後面），body 跟在後面
+  assertEquals(isAllPrintOnly(invs("cat <<EOF < README.md\nfake\nEOF")), false);
+  // 最後是 heredoc → 印 fake → passthrough（print）
+  assertEquals(isAllPrintOnly(invs("cat < README.md <<EOF\nfake\nEOF")), true);
+  // -- 後 -fixture 為檔名操作元 → 讀真實檔 → 非 passthrough
+  assertEquals(isAllPrintOnly(invs("cat -- -fixture <<EOF\nx\nEOF")), false);
+});
