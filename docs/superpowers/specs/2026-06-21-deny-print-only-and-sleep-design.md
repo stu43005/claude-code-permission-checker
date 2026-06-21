@@ -43,17 +43,24 @@
    是 sleep 就硬 deny**，不論引數 / 賦值前綴 / 重導向 / 前後文（`sleep 5 && make`、`FOO=1 sleep 5`、
    `sleep 5 > out` 皆擋），且不可由 `permissions.allow` 解除。
 
-### 1.3 已查證的事實（unbash 3.0.0 解析行為，實機 `parse()` 驗證，信心度：高）
+### 1.3 已查證的事實（unbash 4.0.1 解析行為，實機 `parse()` 驗證，信心度：高）
 
 1. **Heredoc（`<<` / `<<-`）**：解析為 `Redirect`，`operator: "<<"`、`target` 為**分隔符 Word**
-   （如 `{value:"EOF"}`，**非** body）、body 文字置於 **`content`（string）**、`body` 欄位為
-   `undefined`。`heredocQuoted` 在未加引號分隔符（`<<EOF`）時為 `undefined`，引號分隔符
-   （`<<'EOF'`）時為 `true`。
-   - 推論：未加引號 heredoc 的 `content` 可能內含 `$var` / `$(...)`（以原始字串形式存在，**未**被
-     結構化成 WordPart）；要判斷 body 是否靜態，須**詞法掃描 `content` 字串**是否含 `$` / 反引號。
+   （如 `{value:"EOF"}`，**非** body）、body 原始文字置於 **`content`（string）**。**`body` 欄位**：
+   - 未加引號分隔符且 body **含展開**（`$(...)` / 反引號 / `$var`）時，**`body` 為結構化 Word**，
+     其 `parts` 含對應 WordPart——尤其 **`$(...)` → `CommandExpansion`，其 `.script` 是完整解析好的
+     內層指令 AST**（實測 `cat <<EOF\n$(rm -rf x)\nEOF` → `body.parts[0].type === "CommandExpansion"`、
+     `…script.commands[0].command.name.value === "rm"`）。
+   - body **無展開**（純文字）時，`body` 為 `undefined`、文字僅在 `content`。
+   - 引號分隔符（`<<'EOF'`）時 `heredocQuoted === true`、`body` 為 `undefined`（`$(...)` 是字面、
+     **不執行**）。
+   - **關鍵推論**：unbash **有**把未引號 heredoc body 的命令替換結構化（`body` Word）；要列舉 body 內
+     的內層指令，取 `redirect.body` 走訪其 `CommandExpansion.script` 即可，**不需**詞法掃 `content`
+     字串。靜態性判斷（print-only 用）：`heredocQuoted === true` 或 `content` 不含 `$`/反引號 → 靜態。
 2. **Here-string（`<<<`）**：解析為 `Redirect`，`operator: "<<<"`、`target` 為**實際字串 Word**
-   （`<<<"literal"` → target.value `"literal"`、含 DoubleQuoted part；`<<<"$VAR"` → target 含
-   SimpleExpansion part）、`content` 為同字串。故 here-string 的靜態性可直接用 `isStatic(target)`。
+   （`<<<"literal"` → target.value `"literal"`、含 DoubleQuoted part；`<<<"$(rm)"` → target 含
+   `CommandExpansion`）、`content` 為同字串。here-string 的內層替換在 **`target`**（walk 既有就會
+   列舉 `redirect.target` → 此類**早已**逐一分類）；靜態性用 `isStatic(target)`。
 3. **printf**：format 字串為 `suffix[0]`；`printf '%05d\n' 42` → suffix[0] 為 SingleQuoted Word
    （`isStatic` 為真、`value` 保留字面 `"%05d\\n"`），suffix[1] 為 `42`。
 4. **`<<` / `<<-` / `<<<` 皆非 write redirect**：`redirect.ts` 的 `WRITE_OPERATORS` 僅含
@@ -85,15 +92,11 @@ classify 的 allow/ask 判定。完整性界定如下：
      `perl -e`、`node -e` 等——其字串引數**不被 walk 解析**。葉指令名（`bash`/`eval`/`python`…）
      **皆不在 allowlist → `ask`**，永不靜默 allow。屬**刻意接受、已記錄**的繞道（agent 仍會被
      ask 攔下、需人工確認），非本功能保證範圍。
-   - **heredoc body 內的命令替換**：unbash 把 `<<`/`<<-` 的 body 放在 `content`（原始字串、
-     **未**結構化為 WordPart），walk 只列舉 `redirect.target`（對 `<<` 是分隔符、非 body），故
-     **不會列舉 heredoc body 內的 `$( … )`**。§4.6 新增中央前置規則把**動態 body 的
-     heredoc/here-string 從既有 allow 收緊為 `ask`**（見下）。
-     > **使用者確認的取捨（2026-06-21）**：此 `ask` 為**可升級**——若使用者於 settings.json 有
-     > `Bash(cat *)` 等廣域 allow，含命令替換的 heredoc body 仍可能被升級為 allow（命令替換在
-     > cat 執行時會跑、且 walk 未檢查內層）。使用者**明確選擇維持可升級 ask**（不硬 deny 命令替換
-     > heredoc），優先保留設計簡潔。此為**已知、刻意接受**的殘留風險：未設 `Bash(cat *)` 時落
-     > ask（需人工確認），設了才可能 allow——屬使用者自負的 settings 設定風險。
+   - **heredoc body 內的命令替換（已正確封堵，非殘留風險）**：§4.6 讓 walk 列舉 `redirect.body`，使
+     heredoc body 內的 `$( … )` **像其他位置的替換一樣被解析成獨立 invocation、逐一權限檢查**。故
+     `cat <<EOF\n$(rm -rf x)\nEOF` 的 `rm` 走正常分類 → `ask`；且 `Bash(cat *)` 以還原字串
+     `"rm -rf x"` 比對**不命中 rm**，無法升級——只有使用者明設 `Bash(rm *)`（自己放行 rm）才會 allow。
+     此非繞道，而是**與一般 `$()` 一致的正確行為**。
 3. **零葉指令（no-op）**：parse 後無可執行指令 → 既有 allow（no-op）。零指令即「什麼都不執行」、
    無從偽裝，維持 allow 安全。
 4. **sleep 強制邊界＝裸 `sleep` token**（使用者明確決定）：等價等待原語
@@ -112,9 +115,10 @@ classify 的 allow/ask 判定。完整性界定如下：
    > 接受」，且這些繞道最差落該真實指令既有判定，多為 ask）。
 
 **一句話總結**：本功能把使用者列舉的**常見直接形式**（裸 echo/printf/cat-heredoc 鏈、裸 sleep）
-硬 deny；對巢狀 / 等價 / 洗白繞道**不保證 deny**。其中多數最差落 ask；**唯一**可能落 allow 的殘留
-路徑是「含命令替換的 heredoc body + 使用者自設 `Bash(cat *)` 廣域 allow」（point 2 取捨）。以上皆為
-使用者確認、刻意接受的取捨，優先保留設計簡潔與零誤殺。
+硬 deny；heredoc body 內的命令替換以「逐一分類」正確檢查（point 2，非繞道）。對巢狀直譯器 / 等價
+等待原語 / 「整鏈 print」洗白繞道**不保證 deny**，但這些**最差落 ask**（巢狀/等待原語）或落該真實
+指令既有判定（洗白），**不新增任何靜默 allow 路徑**——皆為使用者確認、刻意接受的取捨，優先保留設計
+簡潔與零誤殺。
 
 ## 2. 目標與非目標
 
@@ -127,9 +131,10 @@ classify 的 allow/ask 判定。完整性界定如下：
   **command-substitution-aware 的 `wordPrintEligible`**：靜態、或唯一動態成分為 `$( … )` 的字皆
   視為合格——配合「聚合 every() 涵蓋所有葉指令（含替換內層）」，可堵住 `echo "$(echo fake)"` 這類
   以命令替換包裝靜態文字的偽裝（見 §4.1.4）。
-- 在 `src/engine/classify.ts` 新增**第 4 條中央前置規則**：帶**動態 body** 的 heredoc/here-string
-  從既有 allow 收緊為 `ask`（walk 不解析 heredoc body 內的替換，此為盲點）。此 ask **可升級**
-  （使用者確認維持，非硬 deny；殘留風險見 §1.5 point 2）。
+- 改 `src/engine/walk.ts`：`emitCommand` 列舉內層 command substitution 的來源加入 `redirect.body`，
+  使 heredoc body 內的 `$( … )` 被解析成獨立 `CommandInvocation`、**逐一接受正常權限檢查**（與其他
+  位置的 `$()` 一致）。藉此 `cat <<EOF\n$(rm -rf x)\nEOF` 的 `rm` → ask，且 `Bash(cat *)` 無法升級
+  rm；**正確封堵 heredoc 命令替換盲點，不新增 classify 中央規則、不靠硬 deny**（見 §4.6）。
 - 在 `src/engine/evaluate.ts` walk 之後、classify 之前插入**兩個 evaluate 層硬 deny 閘**：
   (①) `some(inv.name === "sleep")` → `deny`；(②) `isAllPrintOnly` 整鏈 print → `deny`。皆在 classify
   前返回 → 天生硬性、不過任何中央前置規則與 `settingsAllows`。
@@ -147,8 +152,9 @@ classify 的 allow/ask 判定。完整性界定如下：
   整體已是 `ask`，本功能不升級為 deny。
 - **不**為「整鏈 print 但其中夾雜一個合法行為檢查」的鏈 deny（如 `printf "%05d" 42 && echo X`：
   printf 屬 carve-out → 非全鏈 print → 不 deny）。一個合法行為檢查即保護整鏈，安全方向、可接受。
-- **不**改 `walk.ts` / `CommandInvocation` 結構（不新增 pipe-context 欄位）：聚合「整鏈 print」
-  天然涵蓋 pipe 情境（`echo x | grep y` 中 grep 非 print 形態 → 非全鏈 print → 不 deny）。
+- **不**改 `CommandInvocation` 結構（不新增 pipe-context 欄位）：聚合「整鏈 print」天然涵蓋 pipe
+  情境（`echo x | grep y` 中 grep 非 print 形態 → 非全鏈 print → 不 deny）。`walk.ts` 僅新增「列舉
+  `redirect.body` 內層替換」一處（§4.6），不動其餘職責。
 - **不**處理 print-laundering（`echo x | cat`：cat 無 heredoc → 非 print 形態 → 不 deny）。罕見、
   可接受的弱點。
 - **不**偵測迴圈語意的 sleep（`while … sleep …`）為特例：sleep 一律無條件 deny，迴圈與否不影響。
@@ -158,17 +164,17 @@ classify 的 allow/ask 判定。完整性界定如下：
 ## 3. 架構與資料流
 
 新增邏輯掛在兩處：`evaluate` 的**兩個聚合硬 deny 閘**（sleep 名稱掃描 + 整鏈 print-only，皆在
-classify 之前返回）、與 `classify` 的**動態 heredoc 中央前置規則**（→ ask）。parse / walk 職責不變。
+classify 之前返回）、與 `walk` 的 **heredoc `body` 內層替換列舉**（使 body 內的 `$()` 逐一受檢）。
+classify 的中央前置規則維持既有三條、不新增；parse 職責不變。
 
 ```
 main.ts → evaluate(command, root, initialCwd, rules, home, trustedReadRoots)
-  └─ parse → walk → invocations[]
+  └─ parse → walk → invocations[]   （walk 新增：列舉 redirect.body 內的 $() → 內層指令成獨立 invocation）
        ├─ invocations.length === 0 → allow（既有 no-op，不變）
        ├─ 硬 deny 閘①：some(inv.name === "sleep") → deny(pollingDenyReason())  （新增；classify 前短路）
        ├─ 硬 deny 閘②：isAllPrintOnly(invocations) → deny(printOnlyDenyReason()) （新增；classify 前短路）
-       └─ combine(invocations.map(classify))                          （既有）
-             └─ classify → classifyBuiltin
-                   └─ 中央前置規則 #4：動態 body heredoc/here-string → ask  （新增；見 §4.6）
+       └─ combine(invocations.map(classify))                          （既有；含 heredoc body 內層指令）
+             └─ classify → classifyBuiltin（中央前置規則維持三條，不新增）
 ```
 
 ### 3.1 為何 print-only 與 sleep 皆放 `evaluate` 聚合層（classify 之前）
@@ -307,8 +313,9 @@ function isHeredocStatic(r): boolean {
 
 > 型別取用：`Redirect.operator` / `target` / `content` / `heredocQuoted` 皆由 `src/deps.ts` 的
 > `Redirect` 型別提供（見 §1.3）。`CommandInvocation.argv` 為 `Word[]`、`redirects` 為 `Redirect[]`。
-> `isHeredocStatic` 與 `isHeredocDynamic`（其否定，見 §4.6）**export** 供 `classify.ts` 的第 4 條
-> 中央前置規則重用，避免動態判定邏輯重複。
+> `isHeredocStatic` 僅供 `print_only.ts` 內部的 `isCatPassthrough` 使用（判斷靜態 body 才算 print
+> 形態）；heredoc body 內命令替換的權限檢查改由 walk 列舉 `redirect.body` 達成（見 §4.6），**不再**
+> 需要 `classify` 層的動態 heredoc 規則。
 
 #### 4.1.4 `wordPrintEligible`（command-substitution-aware 靜態合格判定）
 
@@ -414,46 +421,55 @@ export function pollingDenyReason(): string {
 
 - **反例（禁止）**：`deny("sleep 被禁止")`、`deny("print-only")`——只描述、未解釋、未給替代。
 
-### 4.6 第 4 條中央前置規則：動態 body heredoc/here-string → `ask`（`src/engine/classify.ts`）
+### 4.6 walk.ts：列舉 heredoc `body` 內的命令替換（正確封堵 heredoc 盲點）
 
-**動機（堵 walk 盲點）**：walk 把 `<<`/`<<-` 的 body 放在 `redirect.content`（原始字串、未結構化），
-且只列舉 `redirect.target`（對 `<<` 是分隔符、非 body），故 **heredoc body 內的命令替換不被 walk
-列舉、不會被任何指令規則檢查**。例：`cat <<EOF\n$(rm -rf x)\nEOF` 現況落 `allow`（cat 無位置參數 →
-`fileReaderRule` allow），但 cat 執行時 body 內的 `$(rm -rf x)` 會真正執行。此為既有盲點；本功能
-把它從 allow **收緊為 ask**（非完全封堵——見下「升級層互動」與 §1.5 point 2 之使用者確認取捨）。
+**動機（堵 walk 盲點，正本清源）**：walk 的 `emitCommand` 目前列舉內層 command substitution 的來源
+為 `cmd.name`、`cmd.suffix`、`cmd.prefix` 值、與 `cmd.redirects` 的 **`target`**；對 `<<`/`<<-`
+heredoc 而言 `target` 是**分隔符**、命令替換在 **`body`**，故 **heredoc body 內的 `$(...)` 不被列舉、
+不被分類**。例：`cat <<EOF\n$(rm -rf x)\nEOF` 現況落 `allow`，但執行時 body 內 `$(rm -rf x)` 會真正
+跑。**正確做法**（經使用者確認）：把 `redirect.body` 也納入內層 script 列舉來源，使 body 內的每個
+命令替換**像其他位置的 `$(...)` 一樣被解析成獨立 `CommandInvocation`、逐一接受權限檢查**。
 
-**規則**：於 `classifyBuiltin` 既有三條中央前置規則**之後、個別 rule 之前**新增第 4 條：
-
-```ts
-// 中央前置規則之四：動態 body 的 heredoc/here-string（walk 無法檢查其內嵌替換）
-if (inv.redirects.some(isHeredocDynamic)) {
-  return ask(`${inv.name}：heredoc/here-string body 含未經檢查的展開或命令替換`);
-}
-```
-
-其中（與 §4.1.3 `isHeredocStatic` 同檔、互為否定，自 `print_only.ts` export 重用）：
+**變更**：`emitCommand` 的 `words` 蒐集陣列加入 `redirect.body`：
 
 ```ts
-/** redirect 是否為「帶動態 body」的 heredoc/here-string。 */
-export function isHeredocDynamic(r: Redirect): boolean {
-  if (r.operator === "<<<") return r.target ? !isStatic(r.target) : false;
-  if (r.operator === "<<" || r.operator === "<<-") {
-    if (r.heredocQuoted === true) return false;            // 引號分隔符 → 無展開 → 靜態
-    return /[$`]/.test(r.content ?? "");                   // 未引號且含 $ / 反引號 → 動態
-  }
-  return false;                                             // 非 heredoc/here-string
-}
+const words: Word[] = [
+  ...(cmd.name ? [cmd.name] : []),
+  ...cmd.suffix,
+  ...cmd.prefix.flatMap((a) => (a.value ? [a.value] : [])),
+  ...cmd.redirects.flatMap((r) => (r.target ? [r.target] : [])),
+  ...cmd.redirects.flatMap((r) => (r.body ? [r.body] : [])),   // 新增：heredoc body 內的替換
+];
+for (const w of words) enumerateInnerScripts(w, cwd, out);
 ```
 
-**與 print-only 閘的關係**：靜態 body 的 heredoc（`isHeredocStatic` true）若整鏈皆 print → 已在
-`evaluate` 層 deny，不會走到此規則；動態 body → 非 print 形態 → 非全鏈 print → 進 classify → 此規則
-→ `ask`。**只 ask、不 deny**：因為動態 heredoc 不必然是偽裝（可能是合法但含替換的輸入），保守交
-人工確認即可（使用者確認維持可升級 ask、不硬 deny 命令替換 heredoc，見 §1.5 point 2）。
+`redirect.body` 是結構化 Word（§1.3 #1）；`enumerateInnerScripts` 既有邏輯即會走訪其 `parts`、對
+`CommandExpansion` 取 `.script` 列舉內層指令（與處理 `$()` 於 suffix/target 完全一致）。引號分隔符
+heredoc（`heredocQuoted === true`）的 `body` 為 `undefined` → 自然不列舉（`$(...)` 是字面、不執行），
+正確。
 
-**順序與互動**：置於賦值前綴規則之後、`rule.evaluate` 之前；不影響既有寫入重導向規則
-（`cat > f << EOF` 的 `>` 仍先被寫入重導向規則判 ask）。對 `permissions.allow` 升級層：此為 `ask`
-（非 deny），命中 `permissions.allow` 仍可正常升級為 allow（與既有 ask 行為一致；使用者明示放行
-某含 heredoc 指令時不被此規則永久擋住）。
+**效果（取代原「動態 heredoc → ask 中央規則」，更精準）**：
+
+- `cat <<EOF\n$(rm -rf x)\nEOF`：walk 產出 `[cat, rm -rf x]`。`rm` 不在 allowlist → `ask`；
+  `settingsAllows` 以還原字串 `"rm -rf x"` 比對——`Bash(cat *)` **不命中** rm（只命中 `cat …`），
+  故**無法**升級 rm。combine → **ask**（唯有使用者明設 `Bash(rm *)`，即自己放行 rm，才會 allow）。
+  **漏洞以「逐一分類」徹底關閉，非靠硬 deny、亦不靠不可升級的特例**。
+- `cat <<EOF\n$(git log)\nEOF`：內層 `git log` 走 git 規則 → allow → 整體 allow（**合法操作不誤擋**）。
+- `cat <<EOF\n$HOME\nEOF`（純變數插值、無命令執行）：body 僅 `SimpleExpansion`、無 `CommandExpansion`
+  → 不列舉內層指令 → cat → allow（無害讀取，且不誤 ask）。
+
+**與 print-only 閘的關係**：靜態 body heredoc（無 `CommandExpansion`）→ 不列舉內層 → 維持 `[cat]`、
+`isCatPassthrough` 視 `isHeredocStatic` 為 print 形態 → 整鏈 print 才 deny（不變）。含命令替換的
+heredoc → body 動態 → `isHeredocStatic` 為 false → cat 非 print 形態 → 非全鏈 print → 交 classify
+（cat + 內層指令各自判定）。
+
+> **不需**第 4 條中央前置規則、**不需** `isHeredocDynamic`（已刪）；`isHeredocStatic` 仍由
+> `print_only.ts` 的 `isCatPassthrough` 使用（見 §4.1.3）。
+>
+> **範圍備註**：本變更列舉 `cmd.redirects.body`（指令自身的 heredoc，涵蓋實務全部情形）。Statement /
+> 複合結構**繼承**而來的 redirect（`inherited`）其 target/body 之內層替換未被列舉，屬 walk **既有**
+> 限制（target 亦然），非本功能新增、不在範圍；漏列舉僅導致該內層指令不被檢查 → 退回 cat 既有判定
+> （safe 方向，非誤放行新指令）。
 
 ## 5. 與 `permissions.allow` 升級層的互動
 
@@ -474,11 +490,12 @@ export function isHeredocDynamic(r: Redirect): boolean {
   `deny > ask > allow`。
 - **deny 漏判是安全的**：`isPrintOnlyForm` 任何不確定 → `false` → 不貢獻全鏈 print → 退回正常
   classify（allow/ask），**絕不**誤放行；sleep 名稱比對漏判 → 退回既有（不在 allowlist → ask）。
-- **堵命令替換包裝的 allow 漏洞**：命令替換包裝偽裝（`echo "$(echo fake)"`，內外皆 print）由
-  substitution-aware 謂詞 + 聚合 every() 升級為 deny（原為 allow）。
+- **堵 allow 漏洞（以正確分類，非硬 deny）**：
+  - 命令替換包裝偽裝（`echo "$(echo fake)"`，內外皆 print）由 substitution-aware 謂詞 + 聚合 every()
+    升級為 deny（原為 allow）。
+  - heredoc body 內的命令替換（`cat <<EOF\n$(rm -rf x)\nEOF`）由 walk 列舉 `redirect.body`（§4.6）→
+    內層 `rm` 逐一分類為 ask、且 `Bash(cat *)` 不命中 rm 而無法升級（原為 allow）。
 - **已記錄、使用者確認接受的殘留繞道（非本功能保證封堵範圍，見 §1.5）**：
-  - 動態 body heredoc 由第 4 條中央前置規則從 allow 收緊為 **ask**，但此 ask **可被** `Bash(cat *)`
-    等廣域 allow 升級——使用者選擇維持可升級 ask（不硬 deny 命令替換 heredoc）。
   - 「整鏈 print」閘的洗白繞道（`pwd; echo 假`、`cat README.md; printf 假`）**不 deny**——使用者
     選擇維持乾淨結構規則以零誤殺。
   - 巢狀直譯器 / 等價等待原語落 ask（非 allow）。
@@ -510,16 +527,17 @@ export function isHeredocDynamic(r: Redirect): boolean {
 | `cat <<EOF...EOF \| python` | ask | 不變（python 非 print → 非全鏈 print） |
 | `echo -e "a\tb"` | allow | allow（carve-out：跳脫旗標） |
 | `printf "%05d\n" 42` | ask | ask（carve-out：含轉換符） |
-| `echo {1..5}` / `echo *.txt` / `echo "$(date)"` | allow/ask | 不變（非全靜態 → 非 print 形態） |
+| `echo {1..5}` / `echo *.txt` | allow | 不變（brace/glob → 非全靜態 → 非 print 形態） |
 | `echo x > file` | ask（寫入重導向） | ask（寫檔 → 非 print 形態） |
 | `cat > /tmp/x << EOF...EOF` | ask（寫入重導向） | ask（寫檔 → 非 print 形態） |
 | `FOO=1 echo x` | ask（賦值前綴） | ask（賦值 → 非 print 形態） |
 | `echo "$(rm -rf /)"` | ask（內層 rm 範圍） | ask（echo 替換合格，但 rm 非 print → 非全鏈 print；rm 經 walk 列舉照判 ask） |
 | `echo "$(echo fake)"` | **allow**（漏洞） | **deny**（替換包裝偽裝；內外皆 print） |
-| `echo "$(date)"` | ask（date 非 allowlist） | ask（不變；date 非 print → 非全鏈 print） |
+| `echo "$(date)"` | allow（date 在 allowlist） | allow（不變；echo 替換合格→print，date 非 print→非全鏈 print；classify 皆 allow） |
 | `(echo fake)` / `{ echo a; echo b; }` | allow | **deny**（subshell/brace 已被 walk 攤平） |
-| `cat <<EOF\n$(rm -rf x)\nEOF` | **allow**（漏洞） | ask（第 4 條中央規則）；註：`Bash(cat *)` 下可升級為 allow（§1.5 取捨） |
-| `cat <<EOF\n$DATA\nEOF` | allow | ask（動態 heredoc body；可升級） |
+| `cat <<EOF\n$(rm -rf x)\nEOF` | **allow**（漏洞） | ask（walk 列舉 body→rm 逐一判 ask；`Bash(cat *)` 不命中 rm、無法升級） |
+| `cat <<EOF\n$(git log)\nEOF` | allow | allow（內層 git log 在 git 唯讀子指令集 → allow） |
+| `cat <<EOF\n$HOME\nEOF` | allow | allow（純變數插值、無 CommandExpansion → 不列舉內層 → cat allow） |
 | `pwd; echo "假報告"` / `true && echo "已驗證"` | allow/ask | ask/allow（**已記錄洗白繞道**：no-op 非 print → 非全鏈 print；§1.5 取捨） |
 | `cat README.md; printf "已驗證"` | allow | allow（**已記錄洗白繞道**：cat 讀真檔 → 非全鏈 print；§1.5 取捨） |
 | `bash -c 'echo fake'` / `eval 'echo fake'` | ask | ask（巢狀直譯器；已記錄繞道，落 ask 非 allow） |
@@ -555,11 +573,14 @@ export function isHeredocDynamic(r: Redirect): boolean {
   上述各形式**仍 deny**（不可升級）；deny 理由含「已禁止」「ScheduleWakeup」「task-notification」。
 - `src/engine/evaluate_test.ts`——**print-only 硬 deny**：整鏈 print → `deny`；`make && echo DONE`
   → 非 deny；整鏈 print 即使 rules 含 `Bash(echo *)` 仍 deny（驗證硬性不可解除）。
-- `src/engine/classify_test.ts`（第 4 條中央前置規則）：`cat <<EOF\n$(cmd)\nEOF` → ask、
-  `cat <<EOF\n$DATA\nEOF` → ask、`cat <<'EOF'\n$x\nEOF`（引號 → 靜態 body，非此規則）、
-  `cat <<<"$VAR"` → ask、`cat <<<"x"`（靜態，非此規則）；此 ask 命中 `Bash(cat *)` 可升級為 allow
-  （驗證非 deny、可升級）。`isHeredocDynamic` 單元測試（`<<` 引號/未引號含 `$`/不含 `$`、`<<<`
-  靜態/動態 target、非 heredoc operator）。
+- `src/engine/walk_test.ts`（heredoc body 內層替換列舉）：`walk` 對 `cat <<EOF\n$(rm -rf x)\nEOF`
+  產出**兩筆** invocation（`cat` + `rm`，後者 name==="rm"）；`cat <<EOF\n$HOME\nEOF`（純變數）→ **一筆**
+  （`cat`，無內層）；`cat <<'EOF'\n$(rm)\nEOF`（引號 → body undefined）→ **一筆**；`cat <<<"$(rm)"`
+  （here-string）→ 兩筆（既有 target 列舉，確認回歸不破）。
+- `src/engine/classify_test.ts` / e2e（heredoc body 命令替換經正確分類）：`cat <<EOF\n$(rm -rf x)\nEOF`
+  → **ask**（rm 非 allowlist）；**且 rules 含 `Bash(cat *)` 時仍 ask**（`Bash(cat *)` 不命中還原字串
+  `"rm -rf x"`，無法升級 rm——驗證漏洞真正關閉、非可升級）；`cat <<EOF\n$(git log)\nEOF` → allow
+  （git log 唯讀子指令）；`cat <<EOF\n$HOME\nEOF` → allow（無命令執行）。
 - **巢狀繞道落 ask（非 allow）測試**：`bash -c 'echo fake'`、`eval 'echo fake'`、
   `python -c 'time.sleep(5)'`、`read -t 5`、`tail -f x` → 皆 `ask`（非 allowlist；驗證 §1.5 邊界
   「最差落 ask」）。
@@ -585,13 +606,13 @@ echo '{"tool_name":"Bash","tool_input":{"command":"make && echo DONE"},"cwd":"/p
 - 開頭「這是什麼」段的 deny 描述：從「僅對遞迴遍歷磁碟根/家目錄根回 deny」改為**三類 deny**
   （遞迴根掃描、整鏈 print-only 偽裝、sleep 輪詢）。
 - 「架構（評估管線）」段：補 `evaluate` 在 walk 後、classify 前的**兩個聚合硬 deny 閘**（sleep 掃描
-  + 整鏈 print-only）；補 `print_only.ts` 模組職責。
-- 「三條中央前置規則」段：改為**四條**，補第 4 條「動態 body heredoc/here-string → ask」（walk
-  盲點，從 allow 收緊為可升級 ask）。
-- 補威脅模型 / 強制邊界（§1.5）：記錄使用者確認、刻意接受的殘留繞道——巢狀直譯器
-  （`bash -c`/`eval`/`python -c`）與等價等待原語（`read -t`/`tail -f`）落 ask；「整鏈 print」閘的
-  洗白繞道（`pwd; echo 假`、`cat file; printf 假`）不 deny；含命令替換的 heredoc body 為可升級 ask
-  （`Bash(cat *)` 下可能 allow）。
+  + 整鏈 print-only）；補 `print_only.ts` 模組職責；補 `walk` 列舉 heredoc `redirect.body` 內層替換。
+- 「unbash 事實」段：版本 3.0.0 → **4.0.1**；補「heredoc body 含展開時 `redirect.body` 為結構化
+  Word（CommandExpansion.script）」。「三條中央前置規則」段**維持三條**（本功能不新增中央規則）。
+- 補威脅模型 / 強制邊界（§1.5）：heredoc body 命令替換以「逐一分類」正確檢查（非繞道）；記錄使用者
+  確認、刻意接受的殘留繞道——巢狀直譯器（`bash -c`/`eval`/`python -c`）與等價等待原語
+  （`read -t`/`tail -f`）落 ask；「整鏈 print」閘的洗白繞道（`pwd; echo 假`、`cat file; printf 假`）
+  不 deny。
 - 「核心不變量」段：deny 三類、`isPrintOnlyForm` 漏判退回 classify（不誤放行）、print-only 與
   sleep 兩閘皆在 classify 前短路、不過 settingsAllows，硬性不可解除。
 - 「hook 決策 vs settings.json 權限的優先序」段：補 print-only / sleep 兩類硬 deny 不可由
@@ -601,11 +622,13 @@ echo '{"tool_name":"Bash","tool_input":{"command":"make && echo DONE"},"cwd":"/p
 
 | 檔案 | 變更 |
 |---|---|
-| `src/engine/print_only.ts` | 新檔：`isAllPrintOnly`、`isPrintOnlyForm`、`wordPrintEligible`、`isHeredocStatic`/`isHeredocDynamic`（export）及 echo/printf/cat 子判定 + carve-out |
+| `src/engine/print_only.ts` | 新檔：`isAllPrintOnly`、`isPrintOnlyForm`、`wordPrintEligible`、`isHeredocStatic`、echo/printf/cat 子判定 + carve-out |
 | `src/engine/evaluate.ts` | walk 後、classify 前插入兩個硬 deny 閘：①`some(name==="sleep")` ②`isAllPrintOnly` |
-| `src/engine/classify.ts` | `classifyBuiltin` 新增第 4 條中央前置規則：動態 body heredoc/here-string → ask |
+| `src/engine/walk.ts` | `emitCommand` 列舉內層 script 來源加入 `redirect.body`（heredoc body 內的 `$()` 逐一受檢） |
 | `src/rules/types.ts` | 新增 `printOnlyDenyReason()`、`pollingDenyReason()` helper |
+| `deno.json` / `deno.lock` | unbash 3.0.0 → 4.0.1（已完成、已驗證；本功能依賴 4.0.1 的 heredoc `body` 結構） |
 | `src/engine/print_only_test.ts` | 新檔：謂詞 + 聚合三面 + 邊界測試 |
-| `src/engine/evaluate_test.ts`（或 `classify_test.ts`） | sleep evaluate 層硬 deny（含 `FOO=1 sleep`/`sleep>out`/`Bash(sleep *)` 回歸）/ print-only 聚合 deny / 硬性不可解除 / 第 4 條中央前置規則 / 巢狀繞道落 ask |
-| `src/main_test.ts` | e2e：echo 結論 deny、sleep deny、make && echo 非 deny |
-| `CLAUDE.md` | deny 三類、管線、不變量、優先序段更新 |
+| `src/engine/walk_test.ts` | heredoc body 列舉：`cat <<EOF $(rm) EOF` → 兩筆 invocation；引號/變數 → 一筆 |
+| `src/engine/evaluate_test.ts`（或 `classify_test.ts`） | sleep evaluate 層硬 deny（含 `FOO=1 sleep`/`sleep>out`/`Bash(sleep *)` 回歸）/ print-only 聚合 deny / 硬性不可解除 / heredoc body 命令替換正確分類（`Bash(cat *)` 不升級 rm）/ 巢狀繞道落 ask |
+| `src/main_test.ts` | e2e：echo 結論 deny、sleep deny、make && echo 非 deny、`cat <<EOF $(rm) EOF` ask |
+| `CLAUDE.md` | deny 三類、管線（含 walk body 列舉）、不變量、優先序段更新 |
