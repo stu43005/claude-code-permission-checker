@@ -157,8 +157,8 @@ classify 的 allow/ask 判定。完整性界定如下：
 
 ## 3. 架構與資料流
 
-新增邏輯掛在兩處：`evaluate` 的聚合 print-only 閘、與 sleep 的 per-command rule。parse / walk
-職責不變。
+新增邏輯掛在兩處：`evaluate` 的**兩個聚合硬 deny 閘**（sleep 名稱掃描 + 整鏈 print-only，皆在
+classify 之前返回）、與 `classify` 的**動態 heredoc 中央前置規則**（→ ask）。parse / walk 職責不變。
 
 ```
 main.ts → evaluate(command, root, initialCwd, rules, home, trustedReadRoots)
@@ -459,9 +459,12 @@ export function isHeredocDynamic(r: Redirect): boolean {
 
 - **整鏈 print-only deny** 在 `evaluate` 層、`classify` 之前返回，根本不進入 `settingsAllows`：
   `permissions.allow`（如 `Bash(echo *)`）無法解除。
-- **sleep deny** 經 `classify.ts` builtin-deny 短路（`v.kind === "deny"` 先於 `settingsAllows`）：
-  `permissions.allow`（如 `Bash(sleep *)`）無法解除。
-- 兩者皆符合「硬 deny、不可解除」，與既有遞迴根 deny 一致。
+- **sleep deny** 同樣在 `evaluate` 層、`classify` 之前以 `inv.name === "sleep"` 掃描後返回，
+  **不進入** classify 的中央前置規則、**不進入** `settingsAllows`：`permissions.allow`
+  （如 `Bash(sleep *)`）無法解除，且不會被賦值前綴 / 寫入重導向等中央 ask 規則搶先（見 §3.1）。
+- 兩者皆符合「硬 deny、不可解除」，與既有遞迴根 deny 一致。**設計不變量**：sleep deny **絕不**得
+  實作為 `CommandRule` 或 classify 層規則（否則會被中央 ask 規則 preempt → 可升級，破壞硬 deny）；
+  §8 以 `FOO=1 sleep 5` / `sleep 5 > out` / `Bash(sleep *)` 為驗收測試守住此不變量。
 
 ## 6. 不變量（改動後）
 
@@ -479,8 +482,8 @@ export function isHeredocDynamic(r: Redirect): boolean {
   - 「整鏈 print」閘的洗白繞道（`pwd; echo 假`、`cat README.md; printf 假`）**不 deny**——使用者
     選擇維持乾淨結構規則以零誤殺。
   - 巢狀直譯器 / 等價等待原語落 ask（非 allow）。
-- **硬 deny 不可解除**：print-only 在 classify 前返回、sleep 經 builtin-deny 短路，皆不過
-  `settingsAllows`。
+- **硬 deny 不可解除**：print-only 與 sleep 兩閘皆在 `evaluate` 層、classify 之前返回，皆不過中央
+  前置規則與 `settingsAllows`。
 - **永遠 `exit 0`、任何例外 → `ask`**（fail-safe 不變）。
 - **只新增 deny，不放寬任何既有判定**：寫入重導向 / 賦值前綴 / 非唯讀指令偵測一律不動。
 
