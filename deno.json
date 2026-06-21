@@ -1,7 +1,7 @@
 {
   "imports": {
-    "unbash": "npm:unbash@3.0.0",
-    "unbash/printer": "npm:unbash@3.0.0/printer",
+    "unbash": "npm:unbash@4.0.1",
+    "unbash/printer": "npm:unbash@4.0.1/printer",
     "@std/assert": "jsr:@std/assert@^1.0.0"
   },
   "tasks": {
