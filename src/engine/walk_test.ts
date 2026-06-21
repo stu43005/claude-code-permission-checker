@@ -1,6 +1,6 @@
 import { assertEquals } from "@std/assert";
 import { parseCommand } from "./parse.ts";
-import { walk } from "./walk.ts";
+import { definedFunctionNames, walk } from "./walk.ts";
 import type { CwdState } from "../types.ts";
 
 const ROOT = "/proj";
@@ -100,4 +100,23 @@ Deno.test("walk pipeline/巢狀成員上的 compound here-string 替換被列舉
 
 Deno.test("walk 函式定義的延後 redirect 在定義時不列舉（回歸鎖定）", () => {
   assertEquals(names("f() { cat; } <<EOF\n$(rm)\nEOF").includes("rm"), false);
+});
+
+function fns(src: string) {
+  return [...definedFunctionNames(parseCommand(src).script)].sort();
+}
+
+Deno.test("definedFunctionNames 收集函式定義名（含巢狀）", () => {
+  assertEquals(fns("date(){ sleep 5; }; date"), ["date"]);
+  assertEquals(fns("pwd(){ echo x; }; pwd"), ["pwd"]);
+  assertEquals(fns("{ f(){ :; }; }; f"), ["f"]);
+  assertEquals(fns("if true; then g(){ :; }; fi"), ["g"]);
+  assertEquals(fns("echo hi"), []);
+});
+
+Deno.test("definedFunctionNames 涵蓋命令替換內的函式定義（含繼承 heredoc）", () => {
+  // walk 會列舉 $() 內層的 date 呼叫；定義名也須被收集，閘③ 才能攔成 ask
+  assertEquals(fns('echo "$(date(){ rm x; }; date)"'), ["date"]);
+  // 繼承（Statement 層）heredoc body 內的定義也須收集
+  assertEquals(fns("{ cat; } <<EOF\n$(f(){ :; }; f)\nEOF"), ["f"]);
 });

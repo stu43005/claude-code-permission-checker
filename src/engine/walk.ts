@@ -227,3 +227,109 @@ function containsCd(node: Node): boolean {
 function seqContainsCd(statements: Statement[]): boolean {
   return statements.some((s) => containsCd(s.command));
 }
+
+/** 遞迴掃描 AST 收集所有函式定義名（靜態名；動態名忽略），含命令替換內層腳本。供 evaluate 閘③偵測函式遮蔽。 */
+export function definedFunctionNames(script: Script): Set<string> {
+  const out = new Set<string>();
+  for (const s of script.commands) {
+    // 掃 Statement 層的 redirect（如 `{ cat; } <<EOF $(f(){:;};f) EOF` 的繼承 heredoc）
+    for (const r of s.redirects) {
+      if (r.target) collectFnsInWord(r.target, out);
+      if (r.body) collectFnsInWord(r.body, out);
+    }
+    collectFns(s.command, out);
+  }
+  return out;
+}
+
+function collectFns(node: Node, out: Set<string>): void {
+  switch (node.type) {
+    case "Function": {
+      const n = staticValue(node.name);
+      if (n !== null) out.add(n);
+      collectFns(node.body, out); // 巢狀定義
+      return;
+    }
+    case "Command": {
+      // 函式可定義於命令替換內（如 echo "$(f(){ … }; f)"）；walk 會列舉其內層呼叫，
+      // 故此處亦須掃 Word 內的 $( … ) / <( … ) 腳本，收集其中的函式定義名。
+      const words: Word[] = [
+        ...(node.name ? [node.name] : []),
+        ...node.suffix,
+        ...node.prefix.flatMap((a) => (a.value ? [a.value] : [])),
+        ...node.redirects.flatMap((r) => (r.target ? [r.target] : [])),
+        ...node.redirects.flatMap((r) => (r.body ? [r.body] : [])),
+      ];
+      for (const w of words) collectFnsInWord(w, out);
+      return;
+    }
+    case "AndOr":
+    case "Pipeline":
+      for (const m of node.commands) collectFns(m, out);
+      return;
+    case "Subshell":
+    case "BraceGroup":
+      collectFnsSeq(node.body.commands, out);
+      return;
+    case "CompoundList":
+      collectFnsSeq(node.commands, out);
+      return;
+    case "If":
+      collectFnsSeq(node.clause.commands, out);
+      collectFnsSeq(node.then.commands, out);
+      if (node.else) {
+        if (node.else.type === "If") collectFns(node.else, out);
+        else collectFnsSeq(node.else.commands, out);
+      }
+      return;
+    case "For":
+    case "Select":
+    case "ArithmeticFor":
+      collectFnsSeq(node.body.commands, out);
+      return;
+    case "While":
+      collectFnsSeq(node.clause.commands, out);
+      collectFnsSeq(node.body.commands, out);
+      return;
+    case "Case":
+      for (const it of node.items) collectFnsSeq(it.body.commands, out);
+      return;
+    case "Statement":
+      // Statement 層的重導向（如 `{ cat; } <<EOF $(f(){:;};f) EOF` 的 heredoc）會被 walk 以
+      // inherited 列舉其 body 內層呼叫；此處同步掃 target/body，函式定義名才不漏。
+      for (const r of node.redirects) {
+        if (r.target) collectFnsInWord(r.target, out);
+        if (r.body) collectFnsInWord(r.body, out);
+      }
+      collectFns(node.command, out);
+      return;
+    default:
+      // TestCommand / ArithmeticCommand / Coproc：無相關內層函式定義
+      return;
+  }
+}
+
+/** 逐一掃描 Statement[] 序列，含每個 statement 自身的 redirect（繼承 heredoc 等）。 */
+function collectFnsSeq(statements: Statement[], out: Set<string>): void {
+  for (const s of statements) {
+    for (const r of s.redirects) {
+      if (r.target) collectFnsInWord(r.target, out);
+      if (r.body) collectFnsInWord(r.body, out);
+    }
+    collectFns(s.command, out);
+  }
+}
+
+/** 掃描 Word 內的 CommandExpansion / ProcessSubstitution 腳本，遞迴收集函式定義名。 */
+function collectFnsInWord(word: Word, out: Set<string>): void {
+  if (!word.parts) return;
+  for (const part of word.parts) collectFnsInPart(part, out);
+}
+
+function collectFnsInPart(part: WordPart, out: Set<string>): void {
+  if ((part.type === "CommandExpansion" || part.type === "ProcessSubstitution") && part.script) {
+    for (const s of part.script.commands) collectFns(s.command, out);
+  } else if (part.type === "DoubleQuoted" || part.type === "LocaleString") {
+    for (const child of part.parts) collectFnsInPart(child, out);
+  }
+}
