@@ -37,9 +37,11 @@
    **不含** heredoc 寫檔（`cmd > file << EOF`，仍維持既有 `ask`）。
 4. **行為檢查 carve-out**：CLAUDE.md 判準一明許「驗證工具/直譯器本身行為」的合法用途
    （`printf "%05d\n" 42`、`echo -e "a\tb"`）。這類**不算 print 形態**，自然落回既有 classify。
-5. **sleep＝獨立指令 rule、無條件 deny**：sleep 不輸出任何東西，不適合塞進 print 形態謂詞。改為
-   獨立 `CommandRule`，**只要鏈中出現 `sleep` 就 deny**，不受「整鏈 print」聚合閘約束、不論引數
-   與前後文（`sleep 5 && make` 也擋）。
+5. **sleep＝evaluate 層聚合掃描、無條件硬 deny**：sleep 不輸出任何東西，不塞進 print 形態謂詞；
+   也**不**做成 per-command rule（會被中央前置 ask 規則搶先、可被 `permissions.allow` 升級——
+   見 §3.1）。改為在 `evaluate` 層、classify 之前掃描 `inv.name === "sleep"`：**只要鏈中任一葉指令
+   是 sleep 就硬 deny**，不論引數 / 賦值前綴 / 重導向 / 前後文（`sleep 5 && make`、`FOO=1 sleep 5`、
+   `sleep 5 > out` 皆擋），且不可由 `permissions.allow` 解除。
 
 ### 1.3 已查證的事實（unbash 3.0.0 解析行為，實機 `parse()` 驗證，信心度：高）
 
@@ -128,10 +130,11 @@ classify 的 allow/ask 判定。完整性界定如下：
 - 在 `src/engine/classify.ts` 新增**第 4 條中央前置規則**：帶**動態 body** 的 heredoc/here-string
   從既有 allow 收緊為 `ask`（walk 不解析 heredoc body 內的替換，此為盲點）。此 ask **可升級**
   （使用者確認維持，非硬 deny；殘留風險見 §1.5 point 2）。
-- 在 `src/engine/evaluate.ts` walk 之後、classify 之前插入聚合 print-only 閘：整鏈 print → 直接
-  回 `deny`（在 classify 前返回 → 天生硬性、不過 `settingsAllows`）。
-- 新增 `src/rules/commands/sleep.ts`：`CommandRule` 無條件 `deny`，於 `allowlist.ts` 註冊；經
-  既有 `classify.ts` 的 builtin-deny 短路而硬性、不可解除。
+- 在 `src/engine/evaluate.ts` walk 之後、classify 之前插入**兩個 evaluate 層硬 deny 閘**：
+  (①) `some(inv.name === "sleep")` → `deny`；(②) `isAllPrintOnly` 整鏈 print → `deny`。皆在 classify
+  前返回 → 天生硬性、不過任何中央前置規則與 `settingsAllows`。
+- **sleep 不做成 `CommandRule`**（避免被中央前置 ask 規則搶先 + 被 `permissions.allow` 升級，見
+  §3.1）；故無 `src/rules/commands/sleep.ts`、無 `allowlist.ts` 變更。
 - 新增兩個 deny 理由 helper（與 `recursiveRootDenyReason` 並列於 `src/rules/types.ts`）：
   `printOnlyDenyReason()`、`pollingDenyReason()`。
 - 全程 fail-safe：`isPrintOnlyForm` 任何不確定一律回 `false`（→ 不貢獻全鏈 print → 不誤 deny）；
@@ -161,26 +164,28 @@ classify 的 allow/ask 判定。完整性界定如下：
 main.ts → evaluate(command, root, initialCwd, rules, home, trustedReadRoots)
   └─ parse → walk → invocations[]
        ├─ invocations.length === 0 → allow（既有 no-op，不變）
-       ├─ isAllPrintOnly(invocations) → deny(printOnlyDenyReason())   （新增；classify 前短路）
+       ├─ 硬 deny 閘①：some(inv.name === "sleep") → deny(pollingDenyReason())  （新增；classify 前短路）
+       ├─ 硬 deny 閘②：isAllPrintOnly(invocations) → deny(printOnlyDenyReason()) （新增；classify 前短路）
        └─ combine(invocations.map(classify))                          （既有）
              └─ classify → classifyBuiltin
-                   ├─ 中央前置規則 #4：動態 body heredoc/here-string → ask  （新增；見 §4.6）
-                   └─ CommandRule.evaluate
-                         sleepRule.evaluate → deny(pollingDenyReason()) （新增；builtin-deny 短路）
+                   └─ 中央前置規則 #4：動態 body heredoc/here-string → ask  （新增；見 §4.6）
 ```
 
-### 3.1 為何 print-only 放 `evaluate` 聚合層、sleep 放 per-command rule
+### 3.1 為何 print-only 與 sleep 皆放 `evaluate` 聚合層（classify 之前）
 
 - **print-only 是跨指令聚合決策**（「整鏈每個指令都 print 才擋」），單一 `CommandRule` 看不到兄弟
   指令，故放 `evaluate`（方案 A，經使用者確認）。
-- **sleep 是單指令無條件決策**（「只要出現就擋」，不看兄弟指令），最自然的位置就是 per-command
-  rule，且能直接複用 `classify.ts:61` 既有 builtin-deny 短路，零新增短路邏輯。
+- **sleep 必須在 classify 之前硬 deny**：使用者要求「只要出現 sleep 就無條件硬 deny、不可解除」。
+  若做成 per-command rule，會排在中央前置規則（賦值 / 寫入重導向 / cwd / 動態 heredoc → ask）**之後**，
+  導致 `FOO=1 sleep 5`、`sleep 5 > out` 等被中央規則搶先判 `ask` 並可被 `permissions.allow` 升級，
+  破壞硬 deny 保證。故 sleep 改為 evaluate 層 `inv.name === "sleep"` 掃描，與 print-only 同樣在
+  classify 之前短路返回（不經中央規則、不經 settingsAllows）。
 
-### 3.2 兩類 deny 不衝突
+### 3.2 兩類 deny 不衝突且順序無關
 
-- 整鏈 print 的鏈不可能含 sleep（sleep 非 print 形態 → 含 sleep 的鏈必非全鏈 print → 走 classify
-  → sleepRule deny）。
-- `evaluate` 聚合 deny 與 `combine` 內 deny 都產出 `deny`，最終皆 `deny`，無優先序衝突。
+- 兩閘皆產出 `deny`，先後順序不影響最終結果（`deny > ask > allow`）。sleep 閘列於 print-only 閘之前
+  僅為可讀性；`sleep 5 && make`（非全鏈 print，但含 sleep）由 sleep 閘 deny，正是 per-command 設計
+  搆不到的案例。
 
 ## 4. 詳細設計
 
@@ -341,43 +346,50 @@ function partPrintEligible(p: WordPart): boolean {
 > `word.ts` 既有 `topPartIsDynamic` 為基礎，僅把 `CommandExpansion` 從「動態」名單豁免；兩種寫法
 > 等價，擇一即可（測試需涵蓋 §8 的 `echo "$(echo x)"` / `echo "a$VAR"` / `echo "a$(c)b"` 案例）。
 
-### 4.2 `src/engine/evaluate.ts`（聚合閘接線）
+### 4.2 `src/engine/evaluate.ts`（聚合閘接線——print-only 與 sleep 皆在此硬 deny）
 
-於既有 no-op 檢查之後、`combine(...)` 之前插入：
+於既有 no-op 檢查之後、`combine(...)` 之前插入**兩個 evaluate 層硬 deny 閘**：
 
 ```ts
 const invocations = walk(script, initialCwd, root);
 if (invocations.length === 0) {
   return { verdict: "allow", reason: "無可執行指令（no-op）" };
 }
+// 硬 deny 閘 ①：鏈中出現裸 sleep（無條件；含命令替換內層 sleep）
+if (invocations.some((inv) => inv.name === "sleep")) {
+  return { verdict: "deny", reason: pollingDenyReason() };
+}
+// 硬 deny 閘 ②：整鏈皆 print 形態
 if (isAllPrintOnly(invocations)) {
-  return { verdict: "deny", reason: printOnlyDenyReason() };   // 新增：硬 deny，classify 前短路
+  return { verdict: "deny", reason: printOnlyDenyReason() };
 }
 return combine(invocations.map((inv) => classify(inv, root, rules, home, trustedReadRoots)));
 ```
 
-- 在 `classify` 之前返回 → 不經 `settingsAllows` → 硬性、`permissions.allow` 無法解除。
+- **兩閘皆在 `classify` 之前返回 → 不經任何中央前置規則、不經 `settingsAllows` → 真正硬性、
+  `permissions.allow` 無法解除**。
+- **sleep 改為 evaluate 層掃描（取代原 per-command rule）的關鍵原因**：per-command rule 在
+  `classifyBuiltin` 中**排在中央前置規則之後**，故 `FOO=1 sleep 5`（賦值前綴）、`sleep 5 > out`
+  （寫入重導向）等會**先**被中央規則判 `ask`、根本到不了 sleep rule，且該 ask 還會被
+  `Bash(sleep *)` 升級為 allow——違反「sleep 硬 deny、不可解除」。改在 evaluate 層、classify 之前
+  以 `inv.name === "sleep"` 掃描，徹底避免此 ordering 漏洞。
+- `inv.name` 由 walk 的 `staticValue(cmd.name)` 設定：`sleep 5` / `FOO=1 sleep 5` 的 name 皆為
+  `"sleep"`（賦值是 prefix、不影響 name）；`echo "$(sleep 5)"` 的內層 sleep 經 walk 列舉為獨立
+  invocation、name 亦為 `"sleep"` → 一併命中。動態名（`$CMD 5`，CMD=sleep）→ name 為 null → 不命中
+  → 落 classify → 動態指令名 ask（屬 §1.5 已記錄之動態繞道）。
 - 仍在既有 try/catch 內 → 任何例外退化為 `ask`。
 
-### 4.3 `src/rules/commands/sleep.ts`（新檔）
+> **設計簡化**：sleep **不再**是 `CommandRule`，故**無** `src/rules/commands/sleep.ts`、**不需**在
+> `allowlist.ts` 註冊。sleep 與 print-only 一致，皆為 evaluate 層聚合硬 deny。
 
-```ts
-import type { CommandRule } from "../types.ts";
-import { deny } from "../types.ts";
-import { pollingDenyReason } from "../types.ts";
+### 4.3（已移除）
 
-export const sleepRule: CommandRule = {
-  names: ["sleep"],
-  evaluate: () => deny(pollingDenyReason()),
-};
-```
+sleep 改以 §4.2 evaluate 層掃描實作，原「sleep.ts CommandRule」設計作廢，本節保留編號佔位以對齊
+後續節次。
 
-- 無條件 deny，不看 argv / 前後文。
-- 經 `classify.ts:61`（`if (v.kind === "deny") return v;`）短路 → 硬性、不過 `settingsAllows`。
+### 4.4（已移除）
 
-### 4.4 `src/rules/allowlist.ts`（註冊 sleep）
-
-匯入 `sleepRule` 並加入 `RULES` 陣列（name `sleep` 不可與既有重複；載入時偵測重複）。
+無 allowlist 變更（sleep 不再是 CommandRule）。本節保留編號佔位。
 
 ### 4.5 deny 理由 helper（`src/rules/types.ts`）
 
@@ -482,9 +494,12 @@ export function isHeredocDynamic(r: Redirect): boolean {
 | `cat <<<"literal"` | allow | **deny**（整鏈 print） |
 | `echo a; echo b; echo c`（多行假報告） | allow | **deny**（整鏈 print） |
 | `echo a && echo b` | allow | **deny**（整鏈 print） |
-| `sleep 5` | ask | **deny**（sleep 無條件） |
-| `sleep 5 && make` | ask（make 未列管） | **deny**（sleep 無條件） |
-| `sleep 2; echo waiting` | ask | **deny**（sleep 無條件） |
+| `sleep 5` | ask | **deny**（sleep evaluate 層掃描） |
+| `sleep 5 && make` | ask（make 未列管） | **deny**（含 sleep；非全鏈 print 也擋） |
+| `sleep 2; echo waiting` | ask | **deny**（含 sleep） |
+| `FOO=1 sleep 5` | ask（賦值前綴） | **deny**（evaluate 層先於中央規則；不可由 `Bash(sleep *)` 解除） |
+| `sleep 5 > out` | ask（寫入重導向） | **deny**（evaluate 層先於中央規則） |
+| `echo "$(sleep 5)"` | ask | **deny**（內層 sleep 經 walk 列舉，name==="sleep"） |
 | `make && echo BUILD_DONE` | ask（make 未列管） | ask（非全鏈 print；make 非 print） |
 | `deno task test && echo PASS` | 視 settings | 不變（test 非 print → 非全鏈 print） |
 | `cat README.md && echo ok` | allow/ask | 不變（cat README.md 非 passthrough） |
@@ -530,13 +545,13 @@ export function isHeredocDynamic(r: Redirect): boolean {
     → print）。
   - printf 邊界：`printf "%%done\n"`（僅 `%%` → 無轉換符 → print）、`printf -- "結論\n"`（`--`
     後為 format → print）。
-- `src/rules/commands/sleep_test.ts`（新；複製既有 `ctxOf` helper）：`sleep 1`、`sleep 0.5`、
-  `sleep`（無引數）皆 **deny**；deny 理由含「已禁止」「ScheduleWakeup」「task-notification」關鍵字
-  （驗證 §4.5 三要素措辭）。
-- `src/engine/evaluate_test.ts`（若存在則補；否則併入 `classify_test.ts` / e2e）：整鏈 print →
-  `verdict: "deny"`；`sleep 5 && make` → deny（經 classify）；`make && echo DONE` → 非 deny；
-  整鏈 print 即使 rules 含 `Bash(echo *)` 仍 deny（驗證硬性不可解除）；`sleep 1` 即使 rules 含
-  `Bash(sleep *)` 仍 deny。
+- `src/engine/evaluate_test.ts`（若存在則補；否則併入 `classify_test.ts` / e2e）——**sleep evaluate 層
+  硬 deny**：`sleep 1`、`sleep 0.5`、`sleep`（無引數）、`sleep 5 && make`、`sleep 2; echo waiting`、
+  `echo "$(sleep 5)"` 皆 `verdict: "deny"`；**ordering 漏洞回歸測試**：`FOO=1 sleep 5`（賦值前綴）、
+  `sleep 5 > out`（寫入重導向）仍 **deny**（不被中央前置規則搶先判 ask）；`Bash(sleep *)` 存在時
+  上述各形式**仍 deny**（不可升級）；deny 理由含「已禁止」「ScheduleWakeup」「task-notification」。
+- `src/engine/evaluate_test.ts`——**print-only 硬 deny**：整鏈 print → `deny`；`make && echo DONE`
+  → 非 deny；整鏈 print 即使 rules 含 `Bash(echo *)` 仍 deny（驗證硬性不可解除）。
 - `src/engine/classify_test.ts`（第 4 條中央前置規則）：`cat <<EOF\n$(cmd)\nEOF` → ask、
   `cat <<EOF\n$DATA\nEOF` → ask、`cat <<'EOF'\n$x\nEOF`（引號 → 靜態 body，非此規則）、
   `cat <<<"$VAR"` → ask、`cat <<<"x"`（靜態，非此規則）；此 ask 命中 `Bash(cat *)` 可升級為 allow
@@ -566,16 +581,16 @@ echo '{"tool_name":"Bash","tool_input":{"command":"make && echo DONE"},"cwd":"/p
 
 - 開頭「這是什麼」段的 deny 描述：從「僅對遞迴遍歷磁碟根/家目錄根回 deny」改為**三類 deny**
   （遞迴根掃描、整鏈 print-only 偽裝、sleep 輪詢）。
-- 「架構（評估管線）」段：補 `evaluate` 在 walk 後、classify 前的聚合 print-only 閘；補
-  `print_only.ts` 模組職責；補 `sleep.ts` rule。
+- 「架構（評估管線）」段：補 `evaluate` 在 walk 後、classify 前的**兩個聚合硬 deny 閘**（sleep 掃描
+  + 整鏈 print-only）；補 `print_only.ts` 模組職責。
 - 「三條中央前置規則」段：改為**四條**，補第 4 條「動態 body heredoc/here-string → ask」（walk
   盲點，從 allow 收緊為可升級 ask）。
 - 補威脅模型 / 強制邊界（§1.5）：記錄使用者確認、刻意接受的殘留繞道——巢狀直譯器
   （`bash -c`/`eval`/`python -c`）與等價等待原語（`read -t`/`tail -f`）落 ask；「整鏈 print」閘的
   洗白繞道（`pwd; echo 假`、`cat file; printf 假`）不 deny；含命令替換的 heredoc body 為可升級 ask
   （`Bash(cat *)` 下可能 allow）。
-- 「核心不變量」段：deny 三類、`isPrintOnlyForm` 漏判退回 classify（不誤放行）、print-only 在
-  classify 前短路 / sleep 經 builtin-deny 短路皆硬性不可解除。
+- 「核心不變量」段：deny 三類、`isPrintOnlyForm` 漏判退回 classify（不誤放行）、print-only 與
+  sleep 兩閘皆在 classify 前短路、不過 settingsAllows，硬性不可解除。
 - 「hook 決策 vs settings.json 權限的優先序」段：補 print-only / sleep 兩類硬 deny 不可由
   `permissions.allow` 解除。
 
@@ -584,13 +599,10 @@ echo '{"tool_name":"Bash","tool_input":{"command":"make && echo DONE"},"cwd":"/p
 | 檔案 | 變更 |
 |---|---|
 | `src/engine/print_only.ts` | 新檔：`isAllPrintOnly`、`isPrintOnlyForm`、`wordPrintEligible`、`isHeredocStatic`/`isHeredocDynamic`（export）及 echo/printf/cat 子判定 + carve-out |
-| `src/engine/evaluate.ts` | walk 後、classify 前插入 `isAllPrintOnly` 聚合 deny 短路 |
+| `src/engine/evaluate.ts` | walk 後、classify 前插入兩個硬 deny 閘：①`some(name==="sleep")` ②`isAllPrintOnly` |
 | `src/engine/classify.ts` | `classifyBuiltin` 新增第 4 條中央前置規則：動態 body heredoc/here-string → ask |
-| `src/rules/commands/sleep.ts` | 新檔：`sleepRule` 無條件 deny |
-| `src/rules/allowlist.ts` | 註冊 `sleepRule` |
 | `src/rules/types.ts` | 新增 `printOnlyDenyReason()`、`pollingDenyReason()` helper |
 | `src/engine/print_only_test.ts` | 新檔：謂詞 + 聚合三面 + 邊界測試 |
-| `src/rules/commands/sleep_test.ts` | 新檔：sleep deny + 理由測試 |
-| `src/engine/evaluate_test.ts` 或 `classify_test.ts` | 聚合 deny / 硬性不可解除 / 第 4 條中央前置規則 / 巢狀繞道落 ask 測試 |
+| `src/engine/evaluate_test.ts`（或 `classify_test.ts`） | sleep evaluate 層硬 deny（含 `FOO=1 sleep`/`sleep>out`/`Bash(sleep *)` 回歸）/ print-only 聚合 deny / 硬性不可解除 / 第 4 條中央前置規則 / 巢狀繞道落 ask |
 | `src/main_test.ts` | e2e：echo 結論 deny、sleep deny、make && echo 非 deny |
 | `CLAUDE.md` | deny 三類、管線、不變量、優先序段更新 |
