@@ -123,7 +123,10 @@ function hasFileOperand(name: string | null, argv: Word[]): boolean {
     if (!afterDoubleDash && v === "--") { afterDoubleDash = true; continue; }
     if (afterDoubleDash) return true;                          // `--` 之後任何 token = 檔名
     if (v === null || !v.startsWith("-")) return true;         // 動態或非旗標 → 視為檔名
-    if (skipsValue && (v === "-s" || v === "--separator")) i++; // 跳過分隔符值 token
+    if (skipsValue && (v === "-s" || v === "--separator")) {
+      // tac 的分隔符值：靜態才跳過；動態（如 "$SEP"）不跳過，交由下一輪 v===null 判為非 passthrough
+      if (argv[i + 1] !== undefined && staticValue(argv[i + 1]) !== null) i++;
+    }
   }
   return false;
 }
