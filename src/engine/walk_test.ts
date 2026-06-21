@@ -70,3 +70,20 @@ Deno.test("dynamic command name yields null name invocation", () => {
 Deno.test("empty / comment-only script yields no invocations", () => {
   assertEquals(walk(parseCommand("# just a comment").script, START, ROOT).length, 0);
 });
+
+Deno.test("walk 列舉 heredoc body 內的命令替換", () => {
+  assertEquals(names("cat <<EOF\n$(rm -rf x)\nEOF"), ["cat", "rm"]);
+  assertEquals(names("cat <<EOF\n$HOME\nEOF"), ["cat"]);          // 純變數 → 無內層指令
+  assertEquals(names("cat <<'EOF'\n$(rm)\nEOF"), ["cat"]);        // 引號 → body 不解析
+});
+
+Deno.test("walk 列舉繼承（外層掛載）heredoc body / here-string 替換", () => {
+  assertEquals(names("{ cat; } <<EOF\n$(rm)\nEOF").includes("rm"), true);
+  assertEquals(names("( cat ) <<EOF\n$(rm)\nEOF").includes("rm"), true);
+  assertEquals(names("while read; do cat; done <<EOF\n$(rm)\nEOF").includes("rm"), true);
+  assertEquals(names('{ cat; } <<<"$(rm)"').includes("rm"), true); // 繼承 here-string target
+});
+
+Deno.test("walk here-string target 替換仍被列舉（回歸）", () => {
+  assertEquals(names('cat <<<"$(rm)"').includes("rm"), true);
+});

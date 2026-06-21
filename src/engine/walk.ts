@@ -145,11 +145,13 @@ function emitCommand(
   });
 
   // command substitution / process substitution 內層指令（非持久、用當前 cwd 副本）
+  const allRedirects = [...inherited, ...cmd.redirects]; // 與 invocation.redirects 同源
   const words: Word[] = [
     ...(cmd.name ? [cmd.name] : []),
     ...cmd.suffix,
     ...cmd.prefix.flatMap((a) => (a.value ? [a.value] : [])),
-    ...cmd.redirects.flatMap((r) => (r.target ? [r.target] : [])),
+    ...allRedirects.flatMap((r) => (r.target ? [r.target] : [])),
+    ...allRedirects.flatMap((r) => (r.body ? [r.body] : [])), // heredoc body 內的替換
   ];
   for (const w of words) enumerateInnerScripts(w, cwd, out);
 }
