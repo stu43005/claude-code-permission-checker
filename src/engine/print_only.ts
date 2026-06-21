@@ -128,12 +128,24 @@ function hasFileOperand(name: string | null, argv: Word[]): boolean {
   return false;
 }
 
+/**
+ * heredoc body 的 print 合格判定。heredoc 展開規則與一般 word 不同：不做 pathname(glob)
+ * 展開、不做分詞與 brace 展開，只做參數/命令/算術展開。故 body 內的 glob/brace 字元是
+ * 字面（Literal）→ 靜態；只有變數（SimpleExpansion/ParameterExpansion）與算術
+ * （ArithmeticExpansion）展開會產生不可知的動態輸出 → 不合格。命令替換 $( … )/反引號
+ * 的內層指令由 walk 另行列舉分類，故視為合格。
+ */
+function heredocBodyEligible(body: Word): boolean {
+  if (!body.parts) return true;          // 純字面（無展開）→ 靜態
+  return body.parts.every((p) => p.type === "Literal" || p.type === "CommandExpansion");
+}
+
 /** heredoc/here-string body 是否「print 合格」（靜態，或唯一動態為 $( … )）。 */
 function isHeredocPrintEligible(r: Redirect): boolean {
   if (r.operator === "<<<") {
     return r.target ? wordPrintEligible(r.target) : true;     // here-string：target 為實際字串 Word
   }
   if (r.heredocQuoted === true) return true;                  // 引號分隔符 → 靜態字面
-  if (r.body) return wordPrintEligible(r.body);               // body 存在（含展開）→ 以 wordPrintEligible 判
+  if (r.body) return heredocBodyEligible(r.body);             // heredoc body 用 heredoc 展開規則判
   return !/[$`]/.test(r.content ?? "");                       // body 不存在 → 純文字（無 $/反引號才算靜態）
 }
