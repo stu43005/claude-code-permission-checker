@@ -42,3 +42,25 @@ export function recursiveRootDenyReason(name: string, target: string): string {
     `此操作會掃描跨專案、跨使用者的大量檔案，屬資料外洩 / 偵察的高風險行為。` +
     `請改為指定專案內的具體子目錄（例如 ./src），而非 / 或 ~。`;
 }
+
+/** 整鏈 print-only 偽裝驗證的 deny 理由（回饋給 agent）。 */
+export function printOnlyDenyReason(): string {
+  return `已禁止：此指令鏈的每個指令都只是把靜態文字輸出到 stdout（echo / printf / cat heredoc），` +
+    `未讀取任何檔案、未執行任何真實計算或驗證——內容完全由你事先寫死，等同把推論用機器口吻轉述、` +
+    `偽裝成「電腦跑出來的結果」。若你已有結論，請直接寫在回覆文字中；若需驗證，請實際讀取檔案、` +
+    `執行測試、或執行會產生真實副作用的指令，而非用 echo/printf/heredoc 重述寫死的內容。`;
+}
+
+/** sleep 輪詢 / 等待的 deny 理由（回饋給 agent）。 */
+export function pollingDenyReason(): string {
+  return `已禁止：sleep 用於輪詢 / 等待，本工具的唯讀情境下無正當用途，且背景工作完成時 harness ` +
+    `會自動以 task-notification 重新喚醒你，不需主動等待。若需排程下次喚醒，請改用 ScheduleWakeup，` +
+    `不要用 Bash sleep 輪詢。`;
+}
+
+/** 函式遮蔽 allowlist 指令名的 ask 理由（回饋給 agent）。 */
+export function functionShadowReason(): string {
+  return `需確認：此指令在同一字串內定義了 shell 函式並覆寫（遮蔽）了一個指令名再呼叫，實際執行的是` +
+    `函式本體、而非該指令本身——權限檢查無法靜態得知函式本體做什麼。請改為直接執行真正的指令（不要` +
+    `用同名函式覆寫），或拆成多次呼叫以便逐一檢查。`;
+}
