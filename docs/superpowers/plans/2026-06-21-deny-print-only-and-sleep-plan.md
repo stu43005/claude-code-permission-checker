@@ -144,6 +144,7 @@ Deno.test("wordPrintEligible: 變數 / glob / brace / 混合 → 不合格", () 
   assertEquals(wordPrintEligible(arg0('echo "$VAR"')), false);
   assertEquals(wordPrintEligible(arg0('echo "$(c)$VAR"')), false);
   assertEquals(wordPrintEligible(arg0('echo *$(echo x)')), false); // 頂層未引號 glob Literal
+  assertEquals(wordPrintEligible(arg0('echo ?$(c)')), false);      // ? glob + 替換 → 不合格
   assertEquals(wordPrintEligible(arg0('echo *.txt')), false);
   assertEquals(wordPrintEligible(arg0('echo {1..5}')), false);     // brace expansion → 動態
   assertEquals(wordPrintEligible(arg0('echo "*"$(c)')), true);     // 引號保護 glob → 合格
@@ -281,12 +282,20 @@ Deno.test("isAllPrintOnly 聚合", () => {
   assertEquals(isAllPrintOnly([]), false);                                // 空 → false
 });
 
-Deno.test("print-only 邊界：%b 純字串 / -ne 跳脫 / 數值轉換 / process subst", () => {
+Deno.test("print-only 邊界：%b 純字串 / -ne 跳脫 / 數值轉換 / process subst / 變數 / --", () => {
   assertEquals(isPrintOnlyForm(invs('printf "%b" "x"')[0]), true);        // %b 純字串 → print
+  assertEquals(isPrintOnlyForm(invs('printf -- "結論\\n"')[0]), true);    // -- 後為 format → print
   assertEquals(isPrintOnlyForm(invs('echo -ne "x\\n"')[0]), false);       // -ne + 反斜線 → carve-out
   assertEquals(isPrintOnlyForm(invs('printf "%.2f" 3.14')[0]), false);    // 數值格式 → carve-out
   assertEquals(isPrintOnlyForm(invs('printf -v x "%s" y')[0]), false);    // -v 賦值 → 非 print
   assertEquals(isPrintOnlyForm(invs('echo <(cmd)')[0]), false);           // process subst → 非合格
+  assertEquals(isPrintOnlyForm(invs('echo "a$VAR b"')[0]), false);        // 含變數 → 非合格
+});
+
+Deno.test("printf 動態/替換型第一引數 → 保守視為非 print（與 echo 不對稱、刻意；落 ask 非 deny）", () => {
+  // 規格 §4.1.2 的 `first === null → return false` 守則：無法靜態確認首引數是否為選項（如 -v），
+  // 故 printf 的命令替換包裝**不**比照 echo 硬 deny，而是非 print 形態 → 落 classify（ask）。
+  assertEquals(isPrintOnlyForm(invs('printf "$(echo fake)"')[0]), false);
 });
 ```
 
@@ -903,6 +912,7 @@ Deno.test("輸入重導向 < 目標範圍檢查（第4條中央前置規則）",
   assertEquals(only("cat < /etc/passwd").kind, "ask");
   assertEquals(only("grep pat < /etc/shadow").kind, "ask");
   assertEquals(only("cat < src/a.ts").kind, "allow");           // in-project
+  assertEquals(only("head < src/x.ts").kind, "allow");          // in-project（其他讀指令同理）
   assertEquals(only("cat < $VAR").kind, "ask");                  // 動態 target
   assertEquals(only("cat <<EOF\nx\nEOF").kind, "allow");         // heredoc 非 `<`，不受此規則
 });
@@ -996,9 +1006,11 @@ const v = (src: string) => tailRule.evaluate(ctxOf("tail", src)).kind;
 Deno.test("tail follow → ask", () => {
   assertEquals(v("tail -f log"), "ask");
   assertEquals(v("tail -F log"), "ask");
+  assertEquals(v("tail --follow log"), "ask");
   assertEquals(v("tail --follow=name log"), "ask");
   assertEquals(v("tail --retry log"), "ask");
-  assertEquals(v("tail -fn10 log"), "ask");   // 短旗標群集含 f
+  assertEquals(v("tail -fn10 log"), "ask");   // 短旗標群集含 f + 數字
+  assertEquals(v("tail -Fq log"), "ask");     // 短旗標群集含 F
 });
 
 Deno.test("tail 非 follow → allow（唯讀）", () => {
