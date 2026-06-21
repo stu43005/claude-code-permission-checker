@@ -96,6 +96,8 @@ function hasFormatterConversion(fmt: string): boolean {
 
 function isCatPassthrough(inv: CommandInvocation): boolean {
   if (hasFileOperand(inv.name, inv.argv)) return false;        // 有檔案操作元 → 讀真實檔
+  // 已接受限制：未模擬 fd 複製鏈（如 `cat 3<<EOF <&3`，stdin 由 fd3 的 heredoc 複製而來）。
+  // 此類僅退回 ask（漏判 deny、安全方向），不誤放行；不為此病態構造加 fd 表模擬。
   // 依 Bash 重導向順序決定 fd0 來源：影響 fd0 的輸入重導向中**最後一個勝**。
   const fd0Inputs = inv.redirects.filter((r) =>
     (r.operator === "<" || r.operator === "<<" || r.operator === "<<-" ||
