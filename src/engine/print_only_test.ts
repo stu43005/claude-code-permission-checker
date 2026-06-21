@@ -23,3 +23,13 @@ Deno.test("wordPrintEligible: 變數 / glob / brace / 混合 → 不合格", () 
   assertEquals(wordPrintEligible(arg0('echo {1..5}')), false);     // brace expansion → 動態
   assertEquals(wordPrintEligible(arg0('echo "*"$(c)')), true);     // 引號保護 glob → 合格
 });
+
+Deno.test("wordPrintEligible: 未引號前導 tilde 展開 → 不合格；引號/非前導 tilde → 合格", () => {
+  assertEquals(wordPrintEligible(arg0("echo ~")), false);
+  assertEquals(wordPrintEligible(arg0("echo ~/file")), false);
+  assertEquals(wordPrintEligible(arg0("echo ~root")), false);
+  assertEquals(wordPrintEligible(arg0("echo ~/$(c)")), false); // 前導 tilde + 替換
+  assertEquals(wordPrintEligible(arg0('echo "~"')), true);     // 引號 → 字面
+  assertEquals(wordPrintEligible(arg0("echo '~'")), true);     // 單引號 → 字面
+  assertEquals(wordPrintEligible(arg0("echo a~b")), true);     // 非前導 → 字面
+});
