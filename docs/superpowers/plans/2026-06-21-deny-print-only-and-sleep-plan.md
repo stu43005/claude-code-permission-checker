@@ -140,11 +140,12 @@ Deno.test("wordPrintEligible: 靜態字面 / 命令替換 → 合格", () => {
   assertEquals(wordPrintEligible(arg0('echo a$(c)b')), true);
 });
 
-Deno.test("wordPrintEligible: 變數 / glob / 混合 → 不合格", () => {
+Deno.test("wordPrintEligible: 變數 / glob / brace / 混合 → 不合格", () => {
   assertEquals(wordPrintEligible(arg0('echo "$VAR"')), false);
   assertEquals(wordPrintEligible(arg0('echo "$(c)$VAR"')), false);
   assertEquals(wordPrintEligible(arg0('echo *$(echo x)')), false); // 頂層未引號 glob Literal
   assertEquals(wordPrintEligible(arg0('echo *.txt')), false);
+  assertEquals(wordPrintEligible(arg0('echo {1..5}')), false);     // brace expansion → 動態
   assertEquals(wordPrintEligible(arg0('echo "*"$(c)')), true);     // 引號保護 glob → 合格
 });
 ```
@@ -361,7 +362,7 @@ function hasFormatterConversion(fmt: string): boolean {
 }
 ```
 
-> Note: `cat`/`tac` are added in Task 4. Leaving them out of the `switch` now means `cat <<EOF…` returns `false` (non-print) — Task 3 tests do not cover cat, so this is fine until Task 4.
+> Note: `cat`/`tac` are added in **Task 5**. Leaving them out of the `switch` now means `cat <<EOF…` returns `false` (non-print) — Task 3 tests do not cover cat, so this is fine until Task 5.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -595,9 +596,11 @@ Deno.test("definedFunctionNames 收集函式定義名（含巢狀）", () => {
   assertEquals(fns("echo hi"), []);
 });
 
-Deno.test("definedFunctionNames 涵蓋命令替換內的函式定義", () => {
+Deno.test("definedFunctionNames 涵蓋命令替換內的函式定義（含繼承 heredoc）", () => {
   // walk 會列舉 $() 內層的 date 呼叫；定義名也須被收集，閘③ 才能攔成 ask
   assertEquals(fns('echo "$(date(){ rm x; }; date)"'), ["date"]);
+  // 繼承（Statement 層）heredoc body 內的定義也須收集
+  assertEquals(fns("{ cat; } <<EOF\n$(f(){ :; }; f)\nEOF"), ["f"]);
 });
 ```
 
@@ -671,6 +674,12 @@ function collectFns(node: Node, out: Set<string>): void {
       for (const it of node.items) for (const s of it.body.commands) collectFns(s.command, out);
       return;
     case "Statement":
+      // Statement 層的重導向（如 `{ cat; } <<EOF $(f(){:;};f) EOF` 的 heredoc）會被 walk 以
+      // inherited 列舉其 body 內層呼叫；此處同步掃 target/body，函式定義名才不漏。
+      for (const r of node.redirects) {
+        if (r.target) collectFnsInWord(r.target, out);
+        if (r.body) collectFnsInWord(r.body, out);
+      }
       collectFns(node.command, out);
       return;
     default:
@@ -734,18 +743,35 @@ Deno.test("閘②整鏈 print-only → deny（不可由 Bash(echo *) 升級）",
   assertEquals(vd("echo a; echo b"), "deny");
   assertEquals(vd('echo "$(echo fake)"'), "deny");
   assertEquals(vd('echo -e "verified"'), "deny");
-  assertEquals(vd('echo "結論是 X"', rulesOf({ allow: ["Bash(echo *)"] })), "deny"); // 不可升級
+  assertEquals(vd('echo "結論是 X"', rulesOf({ allow: ["Bash(echo *)"] })), "deny"); // echo 不可升級
+  assertEquals(vd('printf "%s\\n" "結論"', rulesOf({ allow: ["Bash(printf *)"] })), "deny"); // printf 不可升級
 });
 
-Deno.test("閘② print-only 不被後置/dead 函式定義降級", () => {
+Deno.test("閘② print-only 不被後置函式定義降級；前置真實/no-op 葉指令使其落他閘", () => {
+  // 呼叫在前、定義在後，且鏈中無其他葉指令 → 整鏈仍只有 echo "fake" → 閘② deny
   assertEquals(vd('echo "fake"; echo(){ :; }'), "deny");
-  assertEquals(vd("if false; then echo(){ :; }; fi; echo fake"), "deny");
+  // `if false; …` 會讓 walk 額外列舉 `false` 葉指令 → 非整鏈 print；且 echo 被（dead 分支）函式定義
+  // 遮蔽 → 落閘③ ask。靜態分析無法判定分支不可達，保守 ask（安全、非靜默 allow）。
+  assertEquals(vd("if false; then echo(){ :; }; fi; echo fake"), "ask");
 });
 
 Deno.test("非整鏈 print → 不 deny", () => {
   assertEquals(vd("make && echo DONE"), "ask");
   assertEquals(vd('echo -e "a\\tb"'), "allow");                 // carve-out
   assertEquals(vd('printf "%05d\\n" 42'), "ask");               // carve-out（printf 非 allowlist）
+});
+
+Deno.test("heredoc body 命令替換經逐一分類（含繼承）；寫檔 heredoc 非 deny", () => {
+  // body 內 rm 逐一分類 → ask；且 Bash(cat *) 無法升級 rm（自身與繼承 heredoc 皆然）
+  assertEquals(vd("cat <<EOF\n$(rm -rf x)\nEOF"), "ask");
+  assertEquals(vd("cat <<EOF\n$(rm -rf x)\nEOF", rulesOf({ allow: ["Bash(cat *)"] })), "ask");
+  assertEquals(vd("{ cat; } <<EOF\n$(rm -rf x)\nEOF"), "ask");
+  assertEquals(vd("{ cat; } <<EOF\n$(rm -rf x)\nEOF", rulesOf({ allow: ["Bash(cat *)"] })), "ask");
+  // 內層 git log 為唯讀子指令 → allow；純變數 heredoc 無命令執行 → allow
+  assertEquals(vd("cat <<EOF\n$(git log)\nEOF"), "allow");
+  assertEquals(vd("cat <<EOF\n$HOME\nEOF"), "allow");
+  // 寫檔 heredoc：`>` 寫入重導向 → 非 print 形態 → 中央寫入規則 ask（非 deny）
+  assertEquals(vd("cat > /tmp/x <<EOF\nfake\nEOF"), "ask");
 });
 
 Deno.test("閘① 字面 sleep → deny（不受遮蔽/賦值/重導向/升級影響）", () => {
@@ -779,7 +805,7 @@ Deno.test("閘③ 函式遮蔽 → ask（不可升級）", () => {
   assertEquals(vd("f(){ :; }; ls -la"), "allow");               // ls 未被遮蔽
 });
 
-Deno.test("§1.5 已接受繞道：巢狀直譯器 / exec wrapper / 等價等待原語 預設 ask；廣域 allow 可升級", () => {
+Deno.test("已接受繞道：巢狀直譯器 / exec wrapper / 等價等待原語 預設 ask；廣域 allow 可升級", () => {
   // 預設（無對應 permissions.allow）→ ask（葉指令名非 allowlist）
   assertEquals(vd("bash -c 'echo fake'"), "ask");
   assertEquals(vd("eval 'echo fake'"), "ask");
