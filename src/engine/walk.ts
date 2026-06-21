@@ -105,6 +105,10 @@ function walkNode(
       return walkSequence(node.commands, cwd, out, inherited, persistent);
     }
     case "Statement": {
+      // 此 Statement 自身掛載的 redirects（如 pipeline/AndOr 成員上的 compound heredoc）
+      // 在此引入 inherited：其 target/body 內的命令替換在此以當前 cwd 列舉一次。
+      // （函式定義的 redirect 由 unbash 掛在 Function.redirects、非此處，故自然延後到呼叫時。）
+      for (const r of node.redirects) enumerateRedirectScripts(r, cwd, out);
       return walkNode(
         node.command,
         cwd,
