@@ -27,6 +27,14 @@ function classifyBuiltin(inv: CommandInvocation, scope: ScopeConfig, webFetch: W
   if (inv.assignments.length > 0) {
     return ask(`${inv.name}：含環境變數賦值前綴，可能改變執行行為`);
   }
+  // 中央前置規則之四：輸入重導向 `<` 的目標路徑須落在允許讀取範圍
+  for (const r of inv.redirects) {
+    if (r.operator !== "<") continue;          // 只查讀檔 `<`；heredoc/here-string 與 fd 複製不在此
+    if (!r.target) continue;
+    if (resolvePath(r.target, inv.cwd, scope) !== "in-project") {
+      return ask(`${inv.name}：輸入重導向讀取超出專案範圍或無法靜態解析（${r.target.value}）`);
+    }
+  }
 
   return rule.evaluate({
     name: inv.name,

@@ -248,3 +248,21 @@ Deno.test("evaluate 把 trustedReadRoots 轉傳給 classify → allow", () => {
   );
   assertEquals(out.verdict, "allow");
 });
+
+Deno.test("輸入重導向 < 目標範圍檢查（第4條中央前置規則）", () => {
+  assertEquals(only("cat < /etc/passwd").kind, "ask");
+  assertEquals(only("grep pat < /etc/shadow").kind, "ask");
+  assertEquals(only("cat < src/a.ts").kind, "allow");           // in-project
+  assertEquals(only("head < src/x.ts").kind, "allow");          // in-project（其他讀指令同理）
+  assertEquals(only("cat < $VAR").kind, "ask");                  // 動態 target
+  assertEquals(only("cat <<EOF\nx\nEOF").kind, "allow");         // heredoc 非 `<`，不受此規則
+});
+
+Deno.test("輸入重導向 ask 可被 Bash() 升級", () => {
+  assertEquals(onlyWith("cat < /etc/passwd", rulesOf({ allow: ["Bash(cat *)"] })).kind, "allow");
+});
+
+Deno.test("輸入重導向 ask 可被 Read() 讀取範圍放寬升級", () => {
+  // rulesWithRead 為 classify_test.ts 既有 helper（將 Read(...) 規則轉成 readScope.allow）
+  assertEquals(onlyWith("cat < /etc/passwd", rulesWithRead(["Read(//etc/passwd)"])).kind, "allow");
+});
