@@ -10,7 +10,7 @@ import { exact, hasAnyFlag } from "../flags.ts";
  */
 export const fileReaderRule: CommandRule = flagGatedReader({
   names: [
-    "cat", "head", "tail", "wc", "ls", "stat", "cut", "tr", "column",
+    "cat", "head", "wc", "ls", "stat", "cut", "tr", "column",
     "cmp", "comm", "md5sum", "sha256sum", "hexdump", "jq", "nl", "fold",
     "basename", "dirname", "realpath", "readlink",
   ],

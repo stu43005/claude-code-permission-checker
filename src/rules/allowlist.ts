@@ -1,5 +1,6 @@
 import type { CommandRule } from "./types.ts";
 import { cdRule, diffRule, fileReaderRule, pureUtilRule } from "./commands/coreutils.ts";
+import { tailRule } from "./commands/tail.ts";
 import { sedRule } from "./commands/sed.ts";
 import { awkRule } from "./commands/awk.ts";
 import { findRule } from "./commands/find.ts";
@@ -13,6 +14,7 @@ import { curlRule } from "./commands/curl.ts";
 
 const RULES: CommandRule[] = [
   fileReaderRule,
+  tailRule,
   diffRule,
   pureUtilRule,
   cdRule,
