@@ -182,6 +182,11 @@ Deno.test("閘③ 函式遮蔽 → ask（不可升級）", () => {
   assertEquals(vd("date(){ sleep 5; }; date", rulesOf({ allow: ["Bash(date *)"] })), "ask");
   assertEquals(vd('echo "$(date(){ rm x; }; date)"'), "ask");   // 替換內定義 + 呼叫
   assertEquals(vd("f(){ :; }; ls -la"), "allow");               // ls 未被遮蔽
+  // 刻意保守：同名函式定義即使在呼叫之後（或 dead 分支），仍 ask（over-ask 為安全方向、非 bug）
+  assertEquals(vd("ls -la; ls(){ :; }"), "ask");   // 定義在呼叫後
+  assertEquals(vd("ls(){ :; }; ls -la"), "ask");   // 定義在呼叫前
+  // 對照：異名函式不影響合法指令
+  assertEquals(vd("ls -la; cd(){ :; }"), "allow");
 });
 
 Deno.test("已接受繞道：巢狀直譯器 / exec wrapper / 等價等待原語 預設 ask；廣域 allow 可升級", () => {

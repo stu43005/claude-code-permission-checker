@@ -38,6 +38,8 @@ export function evaluate(
       return { verdict: "deny", reason: printOnlyDenyReason() };
     }
     // 閘③（ask）：被呼叫的名被同腳本函式遮蔽 → name 分析不可信 → 人工確認
+    // 刻意採 script-wide、不分執行順序/可達性（如 `ls -la; ls(){…}`、dead 分支內定義皆 ask）：
+    // 此集合恆為「呼叫前已定義」的超集，只會 over-ask（安全），絕不 under-ask（危險）。
     const fnNames = definedFunctionNames(script);
     if (fnNames.size > 0 && invocations.some((inv) => inv.name !== null && fnNames.has(inv.name))) {
       return { verdict: "ask", reason: functionShadowReason() };
