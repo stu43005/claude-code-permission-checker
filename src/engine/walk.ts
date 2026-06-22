@@ -85,6 +85,7 @@ function walkNode(
     }
     case "For":
     case "Select": {
+      for (const w of node.wordlist) enumerateInnerScripts(w, cwd, out);
       walkSequence(node.body.commands, cwd, out, inherited, false);
       return afterControlFlow(node, cwd, persistent);
     }
@@ -101,7 +102,9 @@ function walkNode(
       return afterControlFlow(node, cwd, persistent);
     }
     case "Case": {
+      enumerateInnerScripts(node.word, cwd, out);
       for (const item of node.items) {
+        for (const p of item.pattern) enumerateInnerScripts(p, cwd, out);
         walkSequence(item.body.commands, cwd, out, inherited, false);
       }
       return afterControlFlow(node, cwd, persistent);
@@ -361,6 +364,7 @@ function collectFns(node: Node, out: Set<string>): void {
       return;
     case "For":
     case "Select":
+      for (const w of node.wordlist) collectFnsInWord(w, out);
       collectFnsSeq(node.body.commands, out);
       return;
     case "ArithmeticFor":
@@ -374,7 +378,11 @@ function collectFns(node: Node, out: Set<string>): void {
       collectFnsSeq(node.body.commands, out);
       return;
     case "Case":
-      for (const it of node.items) collectFnsSeq(it.body.commands, out);
+      collectFnsInWord(node.word, out);
+      for (const it of node.items) {
+        for (const p of it.pattern) collectFnsInWord(p, out);
+        collectFnsSeq(it.body.commands, out);
+      }
       return;
     case "Statement":
       // Statement 層的重導向（如 `{ cat; } <<EOF $(f(){:;};f) EOF` 的 heredoc）會被 walk 以

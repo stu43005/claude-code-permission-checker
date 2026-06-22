@@ -198,6 +198,14 @@ Deno.test("算術 / test / coproc 內的隱藏指令不再被靜默放行（crit
   assertEquals(vd("echo $(( $(cat /etc/passwd) + 1 ))"), "ask"); // 外部讀取現可見 → ask
 });
 
+Deno.test("for/select/case header 內的隱藏指令不再被靜默放行（critical 修補）", () => {
+  assertEquals(vd("for x in $(rm x); do git diff; done"), "ask");      // rm 現可見 → ask
+  assertEquals(vd("select x in $(rm x); do git diff; done"), "ask");
+  assertEquals(vd("case $(rm x) in *) git diff;; esac"), "ask");
+  assertEquals(vd("for x in $(sleep 1); do :; done"), "deny");         // 閘① 字面 sleep
+  assertEquals(vd("case $(cat /etc/passwd) in *) :;; esac"), "ask");   // 外部讀取現可見
+});
+
 Deno.test("已接受繞道：巢狀直譯器 / exec wrapper / 等價等待原語 預設 ask；廣域 allow 可升級", () => {
   // 預設（無對應 permissions.allow）→ ask（葉指令名非 allowlist）
   assertEquals(vd("bash -c 'echo fake'"), "ask");

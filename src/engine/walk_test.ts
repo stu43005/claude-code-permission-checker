@@ -150,3 +150,15 @@ Deno.test("definedFunctionNames 涵蓋算術 / test / coproc 內的函式定義"
   assertEquals(fns("[[ -n $(g(){ :; }; g) ]]"), ["g"]);
   assertEquals(fns("coproc name { h(){ :; }; h; }"), ["h"]);
 });
+
+Deno.test("walk 列舉 for/select/case header 位置的命令替換", () => {
+  assertEquals(names("for x in $(rm a) $(rm b); do :; done").filter((n) => n === "rm").length, 2);
+  assertEquals(names("select x in $(rm x); do :; done").includes("rm"), true);
+  assertEquals(names("case $(rm w) in foo) :;; esac").includes("rm"), true);
+  assertEquals(names("case foo in $(rm p)) :;; esac").includes("rm"), true);  // pattern position
+});
+
+Deno.test("definedFunctionNames 涵蓋 for/select/case header 內的函式定義", () => {
+  assertEquals(fns("for x in $(f(){ :; }; f); do :; done"), ["f"]);
+  assertEquals(fns("case $(g(){ :; }; g) in foo) :;; esac"), ["g"]);
+});
