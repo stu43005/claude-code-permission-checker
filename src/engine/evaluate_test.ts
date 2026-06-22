@@ -189,6 +189,15 @@ Deno.test("閘③ 函式遮蔽 → ask（不可升級）", () => {
   assertEquals(vd("ls -la; cd(){ :; }"), "allow");
 });
 
+Deno.test("算術 / test / coproc 內的隱藏指令不再被靜默放行（critical 修補）", () => {
+  assertEquals(vd("echo $(( $(rm x) + 1 ))"), "ask");          // rm 現可見 → ask（非 allow）
+  assertEquals(vd("echo $(( $(sleep 1) + 1 ))"), "deny");      // 閘① 字面 sleep
+  assertEquals(vd("(( $(rm x) ))"), "ask");
+  assertEquals(vd("[[ -n $(rm x) ]]"), "ask");
+  assertEquals(vd("cat <<EOF\n$(( $(rm x) + 1 ))\nEOF"), "ask");
+  assertEquals(vd("echo $(( $(cat /etc/passwd) + 1 ))"), "ask"); // 外部讀取現可見 → ask
+});
+
 Deno.test("已接受繞道：巢狀直譯器 / exec wrapper / 等價等待原語 預設 ask；廣域 allow 可升級", () => {
   // 預設（無對應 permissions.allow）→ ask（葉指令名非 allowlist）
   assertEquals(vd("bash -c 'echo fake'"), "ask");

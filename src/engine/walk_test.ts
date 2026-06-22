@@ -127,3 +127,26 @@ Deno.test("definedFunctionNames 涵蓋命令替換內的函式定義（含繼承
   // 函式自身的 heredoc redirect body 內定義的函式名也須收集（與 Command/Statement case 一致）
   assertEquals(fns("f(){ :; } <<EOF\n$(g(){ :; }; g)\nEOF"), ["f", "g"]);
 });
+
+Deno.test("walk 列舉算術展開內的命令替換（argv / 標準算術指令 / for / 三元 / 一元 / 群組 / heredoc）", () => {
+  assertEquals(names("echo $(( $(rm x) + 1 ))"), ["echo", "rm"]);
+  assertEquals(names("(( $(rm x) + 1 ))"), ["rm"]);
+  assertEquals(names("for (( i=$(rm x); i<1; i++ )); do :; done").includes("rm"), true);
+  assertEquals(names("echo $(( $(rm a) > $(rm b) ? $(rm c) : $(rm d) ))").filter((n) => n === "rm").length, 4);
+  assertEquals(names("echo $(( -$(rm u) ))").includes("rm"), true);
+  assertEquals(names("echo $(( ($(rm g)) ))").includes("rm"), true);
+  assertEquals(names("cat <<EOF\n$(( $(rm x) + 1 ))\nEOF").includes("rm"), true);
+});
+
+Deno.test("walk 列舉 [[ … ]] test 與 coproc 內的命令替換 / 指令", () => {
+  assertEquals(names("[[ -n $(rm x) ]]"), ["rm"]);
+  assertEquals(names("[[ $(rm a) == $(rm b) ]]").filter((n) => n === "rm").length, 2);
+  assertEquals(names("coproc $(rm x)").includes("rm"), true);
+  assertEquals(names("coproc name { cat; }").includes("cat"), true);
+});
+
+Deno.test("definedFunctionNames 涵蓋算術 / test / coproc 內的函式定義", () => {
+  assertEquals(fns("echo $(( $(f(){ :; }; f) + 1 ))"), ["f"]);
+  assertEquals(fns("[[ -n $(g(){ :; }; g) ]]"), ["g"]);
+  assertEquals(fns("coproc name { h(){ :; }; h; }"), ["h"]);
+});

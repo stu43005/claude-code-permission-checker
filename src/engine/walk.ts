@@ -1,9 +1,11 @@
 import type {
+  ArithmeticExpression,
   Command,
   Node,
   Redirect,
   Script,
   Statement,
+  TestExpression,
   Word,
   WordPart,
 } from "../deps.ts";
@@ -92,6 +94,9 @@ function walkNode(
       return afterControlFlow(node, cwd, persistent);
     }
     case "ArithmeticFor": {
+      enumerateArithmetic(node.initialize, cwd, out);
+      enumerateArithmetic(node.test, cwd, out);
+      enumerateArithmetic(node.update, cwd, out);
       walkSequence(node.body.commands, cwd, out, inherited, false);
       return afterControlFlow(node, cwd, persistent);
     }
@@ -117,11 +122,25 @@ function walkNode(
         persistent,
       );
     }
-    // Function 定義本體當下不執行；TestCommand / ArithmeticCommand 無外部指令。
+    case "ArithmeticCommand": {
+      enumerateArithmetic(node.expression, cwd, out);
+      return cwd;
+    }
+    case "TestCommand": {
+      if (node.expression) enumerateTest(node.expression, cwd, out);
+      return cwd;
+    }
+    case "Coproc": {
+      if (node.name) enumerateInnerScripts(node.name, cwd, out);
+      for (const r of node.redirects) {
+        if (r.target) enumerateInnerScripts(r.target, cwd, out);
+        if (r.body) enumerateInnerScripts(r.body, cwd, out);
+      }
+      walkNode(node.body, cwd, out, [], false);
+      return cwd;
+    }
+    // Function 定義本體當下不執行。
     case "Function":
-    case "TestCommand":
-    case "ArithmeticCommand":
-    case "Coproc":
     default:
       return cwd;
   }
@@ -176,12 +195,64 @@ function enumerateInnerScripts(word: Word, cwd: CwdState, out: CommandInvocation
   for (const part of word.parts) walkPart(part, cwd, out);
 }
 
+/** 遞迴遍歷算術運算式樹，列舉其中 ArithmeticCommandExpansion 內層 Script（算術內的 $(…) 仍會執行）。 */
+function enumerateArithmetic(expr: ArithmeticExpression | undefined, cwd: CwdState, out: CommandInvocation[]): void {
+  if (!expr) return;
+  switch (expr.type) {
+    case "ArithmeticCommandExpansion":
+      if (expr.script) walkSequence(expr.script.commands, cwd, out, [], false);
+      return;
+    case "ArithmeticBinary":
+      enumerateArithmetic(expr.left, cwd, out);
+      enumerateArithmetic(expr.right, cwd, out);
+      return;
+    case "ArithmeticUnary":
+      enumerateArithmetic(expr.operand, cwd, out);
+      return;
+    case "ArithmeticTernary":
+      enumerateArithmetic(expr.test, cwd, out);
+      enumerateArithmetic(expr.consequent, cwd, out);
+      enumerateArithmetic(expr.alternate, cwd, out);
+      return;
+    case "ArithmeticGroup":
+      enumerateArithmetic(expr.expression, cwd, out);
+      return;
+    case "ArithmeticWord":
+      return;
+  }
+}
+
+/** 遞迴遍歷 `[[ … ]]` test 運算式樹，對運算元 Word 列舉內層命令替換。 */
+function enumerateTest(expr: TestExpression, cwd: CwdState, out: CommandInvocation[]): void {
+  switch (expr.type) {
+    case "TestUnary":
+      enumerateInnerScripts(expr.operand, cwd, out);
+      return;
+    case "TestBinary":
+      enumerateInnerScripts(expr.left, cwd, out);
+      enumerateInnerScripts(expr.right, cwd, out);
+      return;
+    case "TestLogical":
+      enumerateTest(expr.left, cwd, out);
+      enumerateTest(expr.right, cwd, out);
+      return;
+    case "TestNot":
+      enumerateTest(expr.operand, cwd, out);
+      return;
+    case "TestGroup":
+      enumerateTest(expr.expression, cwd, out);
+      return;
+  }
+}
+
 function walkPart(part: WordPart, cwd: CwdState, out: CommandInvocation[]): void {
   if (
     (part.type === "CommandExpansion" || part.type === "ProcessSubstitution") &&
     part.script
   ) {
     walkSequence(part.script.commands, cwd, out, [], false);
+  } else if (part.type === "ArithmeticExpansion") {
+    enumerateArithmetic(part.expression, cwd, out);
   } else if (part.type === "DoubleQuoted" || part.type === "LocaleString") {
     for (const child of part.parts) walkPart(child, cwd, out);
   }
@@ -290,7 +361,12 @@ function collectFns(node: Node, out: Set<string>): void {
       return;
     case "For":
     case "Select":
+      collectFnsSeq(node.body.commands, out);
+      return;
     case "ArithmeticFor":
+      collectFnsInArithmetic(node.initialize, out);
+      collectFnsInArithmetic(node.test, out);
+      collectFnsInArithmetic(node.update, out);
       collectFnsSeq(node.body.commands, out);
       return;
     case "While":
@@ -309,8 +385,21 @@ function collectFns(node: Node, out: Set<string>): void {
       }
       collectFns(node.command, out);
       return;
+    case "ArithmeticCommand":
+      collectFnsInArithmetic(node.expression, out);
+      return;
+    case "TestCommand":
+      if (node.expression) collectFnsInTest(node.expression, out);
+      return;
+    case "Coproc":
+      if (node.name) collectFnsInWord(node.name, out);
+      for (const r of node.redirects) {
+        if (r.target) collectFnsInWord(r.target, out);
+        if (r.body) collectFnsInWord(r.body, out);
+      }
+      collectFns(node.body, out);
+      return;
     default:
-      // TestCommand / ArithmeticCommand / Coproc：無相關內層函式定義
       return;
   }
 }
@@ -332,9 +421,59 @@ function collectFnsInWord(word: Word, out: Set<string>): void {
   for (const part of word.parts) collectFnsInPart(part, out);
 }
 
+function collectFnsInArithmetic(expr: ArithmeticExpression | undefined, out: Set<string>): void {
+  if (!expr) return;
+  switch (expr.type) {
+    case "ArithmeticCommandExpansion":
+      if (expr.script) collectFnsSeq(expr.script.commands, out);
+      return;
+    case "ArithmeticBinary":
+      collectFnsInArithmetic(expr.left, out);
+      collectFnsInArithmetic(expr.right, out);
+      return;
+    case "ArithmeticUnary":
+      collectFnsInArithmetic(expr.operand, out);
+      return;
+    case "ArithmeticTernary":
+      collectFnsInArithmetic(expr.test, out);
+      collectFnsInArithmetic(expr.consequent, out);
+      collectFnsInArithmetic(expr.alternate, out);
+      return;
+    case "ArithmeticGroup":
+      collectFnsInArithmetic(expr.expression, out);
+      return;
+    case "ArithmeticWord":
+      return;
+  }
+}
+
+function collectFnsInTest(expr: TestExpression, out: Set<string>): void {
+  switch (expr.type) {
+    case "TestUnary":
+      collectFnsInWord(expr.operand, out);
+      return;
+    case "TestBinary":
+      collectFnsInWord(expr.left, out);
+      collectFnsInWord(expr.right, out);
+      return;
+    case "TestLogical":
+      collectFnsInTest(expr.left, out);
+      collectFnsInTest(expr.right, out);
+      return;
+    case "TestNot":
+      collectFnsInTest(expr.operand, out);
+      return;
+    case "TestGroup":
+      collectFnsInTest(expr.expression, out);
+      return;
+  }
+}
+
 function collectFnsInPart(part: WordPart, out: Set<string>): void {
   if ((part.type === "CommandExpansion" || part.type === "ProcessSubstitution") && part.script) {
     collectFnsSeq(part.script.commands, out);
+  } else if (part.type === "ArithmeticExpansion") {
+    collectFnsInArithmetic(part.expression, out);
   } else if (part.type === "DoubleQuoted" || part.type === "LocaleString") {
     for (const child of part.parts) collectFnsInPart(child, out);
   }

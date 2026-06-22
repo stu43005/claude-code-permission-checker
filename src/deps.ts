@@ -2,6 +2,7 @@ export { parse } from "unbash";
 export type {
   AndOr,
   ArithmeticCommand,
+  ArithmeticExpression,
   ArithmeticFor,
   AssignmentPrefix,
   BraceGroup,
@@ -23,6 +24,7 @@ export type {
   Statement,
   Subshell,
   TestCommand,
+  TestExpression,
   While,
   Word,
   WordPart,
