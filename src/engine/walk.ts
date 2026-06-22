@@ -139,7 +139,7 @@ function walkNode(
         if (r.target) enumerateInnerScripts(r.target, cwd, out);
         if (r.body) enumerateInnerScripts(r.body, cwd, out);
       }
-      walkNode(node.body, cwd, out, [], false);
+      walkNode(node.body, cwd, out, [...inherited, ...node.redirects], false);
       return cwd;
     }
     // Function 定義本體當下不執行。

@@ -227,3 +227,12 @@ Deno.test("反斜線跳脫的指令名/旗標經 bash quote removal 後仍命中
   assertEquals(vd("ec\\ho \"fake\""), "deny");     // ec\ho → echo（整鏈 print）
   assertEquals(vd("fin\\d /"), "deny");            // fin\d → find（遞迴根）
 });
+
+Deno.test("coproc 的重導向會套用到內層指令、被中央前置閘看見（防繞道）", () => {
+  assertEquals(vd("coproc { cat a; } > out.txt"), "ask");        // 寫入重導向 → ask（非 allow）
+  assertEquals(vd("coproc { cat; } < /etc/passwd"), "ask");      // 外部輸入讀取 → ask
+  assertEquals(vd("coproc myco { cat a; } > out.txt"), "ask");   // 具名 coproc
+  // 回歸：無危險重導向的 coproc 仍依內層指令判定
+  assertEquals(vd("coproc { cat; }"), "allow");                  // cat 讀 stdin → allow
+  assertEquals(vd("coproc { rm x; }"), "ask");                   // rm → ask（內層可見）
+});
