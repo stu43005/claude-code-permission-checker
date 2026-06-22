@@ -328,7 +328,7 @@ function collectFnsInWord(word: Word, out: Set<string>): void {
 
 function collectFnsInPart(part: WordPart, out: Set<string>): void {
   if ((part.type === "CommandExpansion" || part.type === "ProcessSubstitution") && part.script) {
-    for (const s of part.script.commands) collectFns(s.command, out);
+    collectFnsSeq(part.script.commands, out);
   } else if (part.type === "DoubleQuoted" || part.type === "LocaleString") {
     for (const child of part.parts) collectFnsInPart(child, out);
   }

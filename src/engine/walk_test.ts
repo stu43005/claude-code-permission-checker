@@ -119,4 +119,9 @@ Deno.test("definedFunctionNames 涵蓋命令替換內的函式定義（含繼承
   assertEquals(fns('echo "$(date(){ rm x; }; date)"'), ["date"]);
   // 繼承（Statement 層）heredoc body 內的定義也須收集
   assertEquals(fns("{ cat; } <<EOF\n$(f(){ :; }; f)\nEOF"), ["f"]);
+  // 命令替換內、再經繼承 heredoc body 定義的函式名也須收集（與 walk 的 walkSequence 一致）
+  assertEquals(
+    fns("echo $( { cat; } <<EOF\n$(g(){ :; }; g)\nEOF\n)"),
+    ["g"],
+  );
 });
