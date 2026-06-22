@@ -288,3 +288,51 @@ Deno.test("e2e: 讀 transcript .jsonl 本身 -> ask（不自動放行）", async
   );
   assertEquals(JSON.parse(out).hookSpecificOutput.permissionDecision, "ask");
 });
+
+Deno.test("e2e: print-only chain -> deny", async () => {
+  const out = await runHook(
+    { tool_name: "Bash", tool_input: { command: 'echo "結論是 X"' }, cwd: "/proj" },
+    "/proj",
+  );
+  assertEquals(JSON.parse(out).hookSpecificOutput.permissionDecision, "deny");
+});
+
+Deno.test("e2e: sleep -> deny", async () => {
+  const out = await runHook(
+    { tool_name: "Bash", tool_input: { command: "sleep 5" }, cwd: "/proj" },
+    "/proj",
+  );
+  assertEquals(JSON.parse(out).hookSpecificOutput.permissionDecision, "deny");
+});
+
+Deno.test("e2e: real command + status echo -> not deny", async () => {
+  const out = await runHook(
+    { tool_name: "Bash", tool_input: { command: "make && echo DONE" }, cwd: "/proj" },
+    "/proj",
+  );
+  assertEquals(JSON.parse(out).hookSpecificOutput.permissionDecision, "ask");
+});
+
+Deno.test("e2e: heredoc body command substitution -> ask", async () => {
+  const out = await runHook(
+    { tool_name: "Bash", tool_input: { command: "cat <<EOF\n$(rm -rf x)\nEOF" }, cwd: "/proj" },
+    "/proj",
+  );
+  assertEquals(JSON.parse(out).hookSpecificOutput.permissionDecision, "ask");
+});
+
+Deno.test("e2e: input redirect external read -> ask", async () => {
+  const out = await runHook(
+    { tool_name: "Bash", tool_input: { command: "cat < /etc/passwd" }, cwd: "/proj" },
+    "/proj",
+  );
+  assertEquals(JSON.parse(out).hookSpecificOutput.permissionDecision, "ask");
+});
+
+Deno.test("e2e: tail -f -> ask", async () => {
+  const out = await runHook(
+    { tool_name: "Bash", tool_input: { command: "tail -f x" }, cwd: "/proj" },
+    "/proj",
+  );
+  assertEquals(JSON.parse(out).hookSpecificOutput.permissionDecision, "ask");
+});

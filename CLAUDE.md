@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## 這是什麼
 
 一個 Claude Code `PreToolUse`（matcher: `Bash`）hook：用 Deno 寫、`deno compile` 成單一執行檔。
-解析 Bash 指令，只在「純唯讀且全部落在當前專案內」時回 `allow`，其餘回 `ask`。**僅對「遞迴遍歷磁碟根/家目錄根的唯讀指令」回 `deny`（硬性、不可由 `permissions.allow` 解除）；其餘（一切非遞迴根掃描）一律維持 `allow` / `ask`、不回 `deny`。**
+解析 Bash 指令，只在「純唯讀且全部落在當前專案內」時回 `allow`，其餘回 `ask`。**對以下三類情形回 `deny`（硬性、不可由 `permissions.allow` 解除）：① 遞迴遍歷磁碟根/家目錄根的唯讀指令；② 整鏈 print-only 偽裝（echo/printf/heredoc 靜態輸出，未讀檔/未計算）；③ sleep 輪詢等待。其餘一律維持 `allow` / `ask`、不回 `deny`。**
 從 stdin 收 hook JSON、往 stdout 寫 decision JSON、**永遠 `exit 0`**。
 
 此外，會在 runtime 讀取使用者的 `permissions.allow`：原本會 `ask`、但已被使用者在 settings.json 明確放行
@@ -47,17 +47,21 @@ operational verification 會讀取真實的 settings.json（含使用者 `<confi
 `evaluate(…, rules)`：
 
 ```
-parse.ts (unbash)  →  walk.ts  →  classify.ts (每指令)  →  combine.ts (最弱環節)
-   解析成 AST        攤平成          中央前置檢查 +            任一 deny → 整體 deny；否則任一 ask → 整體 ask
-   errors → ask     CommandInvocation[]   allowlist rule
+parse.ts (unbash)  →  walk.ts  →  evaluate 三閘  →  classify.ts (每指令)  →  combine.ts (最弱環節)
+   解析成 AST        攤平成      ①sleep→deny         中央前置檢查 +            任一 deny → 整體 deny；否則任一 ask → 整體 ask
+   errors → ask     CommandInvocation[]  ②整鏈 print-only→deny   allowlist rule
+                    (含 redirect.body     ③函式遮蔽→ask
+                     列舉 + definedFunctionNames)
 ```
 
 - **`walk.ts`** 把 AST 攤平成 `CommandInvocation[]`，每個葉指令一筆。負責：穿透 cwd（`cd` 在
   `&&`/`BraceGroup` 持久、subshell/pipeline 不持久、控制流含 cd → 之後標 unknown）、列舉
   command substitution `$(…)` 內層指令、把 Statement / 複合結構的重導向繼承給內部指令、對 `git`
-  套用 `gitEffectiveCwd`（`-C`/`--git-dir`/`--work-tree`/`-c core.worktree`）。
-- **`classify.ts`** 分兩層：`classifyBuiltin` 對單一指令依序判定（`name` 為 null（動態）→ ask；不在
-  allowlist → ask；**三條中央前置規則**（見下）→ ask；最後跑該指令的 `CommandRule.evaluate`）；外層
+  套用 `gitEffectiveCwd`（`-C`/`--git-dir`/`--work-tree`/`-c core.worktree`）。同時列舉 heredoc `redirect.body`
+  中的 command substitution（`$(…)` 展開），以及收集 `definedFunctionNames`（函式定義遮蔽偵測）。
+- **`print_only.ts`** 提供 `isAllPrintOnly(invocations, definedFunctionNames)`：判定整鏈指令是否全為
+  靜態輸出（echo / printf / cat heredoc / true / false / : / exit 0）。若是，`evaluate` 回整鏈 deny。
+- **`classify.ts`** 分兩層：`classifyBuiltin` 對單一指令先評估指令規則（其硬 deny 優先於任何中央前置 ask），再依序檢查**四條中央前置規則**（見下）→ ask；最後若仍在 allowlist，跑該指令的 `CommandRule.evaluate`；`name` 為 null（動態）或不在 allowlist → ask；外層
   `classify(inv, root, rules)` 在 builtin 判 `ask` 時，呼叫 `settingsAllows` 嘗試以 `permissions.allow`
   升級為 `allow`（命中 allow 且未被 deny/ask 命中才升級；builtin 已判 `allow` 者原樣返回，不受 rules 影響）。
   此外，builtin 回 `deny`（遞迴遍歷磁碟根/家目錄根，由 `scope.ts` 的 `dangerousRoot` 偵測、經 `RuleContext.isDangerousRoot` 提供給規則，接於 find/tree/ls -R/grep -r/rg 的遞迴閘門）時**先於升級層短路返回**，不經 `settingsAllows`，故 `permissions.allow` 無法解除此 deny。
@@ -74,20 +78,23 @@ parse.ts (unbash)  →  walk.ts  →  classify.ts (每指令)  →  combine.ts (
   字串匹配、`reconstructCommand` 把 invocation 還原成可比對字串、`settingsAllows` 綜合判定）。`matcher.ts`
   對 `settings.ts` 僅 `import type`（型別循環編譯期抹除，無 runtime 循環）。
 
-### 三條中央前置規則（在跑個別 rule 之前，於 classify.ts；個別 rule 不需重複處理）
+### 四條中央前置規則（在跑個別 rule 之前，於 classify.ts；個別 rule 不需重複處理）
 
-（註：對「遞迴遍歷磁碟根/家目錄根」的 `deny` 不是中央前置規則，而是各遞迴指令規則內以 `isDangerousRoot` 判定、再由 `classify` 對 `deny` 短路；故不在本三條之列。）
+（註：對「遞迴遍歷磁碟根/家目錄根」的 `deny` 不是中央前置規則，而是各遞迴指令規則內以 `isDangerousRoot` 判定、再由 `classify` 對 `deny` 短路；故不在本四條之列。）
 
 1. **cwd 範圍**：`cwd.kind === "known"` 但落在專案根外 → ask。
 2. **寫入型重導向**：`> >> >| &> &>> <>`（及 `>&` 接檔名）→ ask；null 裝置（`/dev/null`、`NUL`）
    與純 fd 複製（`2>&1`、`>&` 接 fd 數字）不算寫入。
 3. **環境變數賦值前綴**：任何 `var=val` 前綴（`LD_PRELOAD=…` 等）→ ask。
+4. **輸入重導向 `<` 目標 `resolvePath` 超出讀取範圍 → ask**：讀 `<` 的目標路徑，落在專案外（含 out-of-project / dynamic）即 ask。
+
+另注意：`tailRule`（`tail -f`/`-F`/`--follow` → ask）已從 `fileReaderRule` 移出，獨立為 `src/rules/commands/tail.ts` 並在 `allowlist.ts` 單獨註冊。
 
 ## 核心不變量（改動時不可違反）
 
 - **default-deny**：未明確判定為安全唯讀的一律 ask。新增指令規則時，未涵蓋的形式必須 fallback 到 ask。
-- **deny 僅限「遞迴遍歷恰好等於磁碟根/家目錄根的唯讀指令」**（find/tree/ls -R/grep -r/rg）；其餘維持「永不 `deny`」。verdict 三態優先序 `deny > ask > allow`。**永遠 `exit 0`**；任何例外都 try/catch 成 ask（fail-safe）。
-- **deny 為硬性**：`classify` 對 builtin `deny` 短路，**不經** `permissions.allow` 升級層（升級層只把 `ask` 變 `allow`，永遠碰不到 `deny`）。deny 漏判（遞迴/根偵測未覆蓋、home env 缺失）只退回 `ask`，絕不誤放行。
+- **deny 三類**：① 遞迴遍歷磁碟根/家目錄根（find/tree/ls -R/grep -r/rg）；② 整鏈 print-only 偽裝（evaluate 閘②）；③ sleep 輪詢等待（evaluate 閘①）。三閘皆在 `classify` 前短路、不過 `settingsAllows`，不可由 `permissions.allow` 解除。verdict 三態優先序 `deny > ask > allow`。**永遠 `exit 0`**；任何例外都 try/catch 成 ask（fail-safe）。
+- **deny 為硬性**：`classify` 對 builtin `deny` 短路，**不經** `permissions.allow` 升級層（升級層只把 `ask` 變 `allow`，永遠碰不到 `deny`）。`classifyBuiltin` 先評估指令規則：其硬 deny 優先於任何中央前置 ask（否則前置 ask 會被升級層以 `Bash(...)` 升級為 allow、繞過不可解除的 deny）。deny 漏判（遞迴/根偵測未覆蓋、home env 缺失）只退回 `ask`，絕不誤放行。
 - **新增/修改規則 = 改 `rules/commands/*.ts` → 在 `allowlist.ts` 註冊 → `deno task build`**。
   hook 每次 Bash 呼叫都重新執行那顆 `.exe`，故 rebuild 後**下一個指令即生效，不需重啟**（重啟只在改
   `<configDir>/settings.json` 時才需要）。
@@ -137,13 +144,16 @@ parse.ts (unbash)  →  walk.ts  →  classify.ts (每指令)  →  combine.ts (
 
 ### 第三方套件：unbash（禁止憑印象，已驗證的事實）
 
-- 節點用 `type: "字串"` 標記。`Script.commands: Statement[]`、`Statement.command: Node`、
+- 版本 **4.0.1**（`npm:unbash@4.0.1`）。節點用 `type: "字串"` 標記。`Script.commands: Statement[]`、`Statement.command: Node`、
   `Command.{name,prefix,suffix,redirects}`、`CommandExpansion.script: Script`、
   `Redirect.{operator,target}`。型別一律從 `src/deps.ts` 單一入口匯入。
 - **unbash 不結構化表示 glob**：`*.txt`（未加引號）的 Word 無 `parts`、`value` 就是 `"*.txt"`，
   與字面值 `a.txt` 結構相同。故 glob 必須在 `word.ts` 用 `GLOB_CHARS` **詞法偵測**，不能靠 WordPart。
 - **`>&` 同時是 fd 複製與寫檔**：`2>&1`/`>&2`（target 為數字）是複製、`>&out.txt`（target 為檔名）
   是寫檔——靠 target 是否為純數字 / `-` 區分（見 `redirect.ts`），不是靠有無 target。
+- **heredoc body 結構（已查證）**：未加引號分隔符（`<<EOF`）的 heredoc，若 body 含 `$(...)` 展開，
+  `redirect.body` 為**結構化 Word**（其 `CommandExpansion.script` 為完整解析的內層指令），
+  `walk.ts` 須遞迴列舉其內含指令。加引號分隔符（`<<'EOF'`）時展開被抑制，`redirect.body` 為 `undefined`，無需處理。
 
 ### 安全誤放（auto-allow 不該 allow）——這些是 review 實際抓到的
 
@@ -179,6 +189,18 @@ parse.ts (unbash)  →  walk.ts  →  classify.ts (每指令)  →  combine.ts (
   等會匹配一切的空 prefix、以及無法可靠解析的 pattern 一律不升級（維持 default-deny）。
 - 讀取來源：專案 `.claude/settings.json`、`.claude/settings.local.json`、使用者 `<configDir>/settings.json`
   （**不含** enterprise managed-settings）。讀檔失敗一律 fail-safe 退化為「無此來源規則」。
+- **print-only / sleep 兩類硬 deny 不可由 `permissions.allow` 解除**：三閘在 `classify` 前短路，升級層永遠碰不到。
+
+以下兩種性質不同的「已接受繞道」需分開記錄：
+
+**預設 ask、可由使用者自設廣域 `Bash(...)` 升級為 allow（使用者自負）**：
+- 巢狀直譯器（`bash -c`/`eval`/`python -c`/`perl -e`）
+- exec wrapper（`command`/`env`/`nice`/`nohup`/`timeout`）
+- 等價等待原語（`read -t`、`python -c 'time.sleep(...)'`）
+- `tail -f`（現為 ask，可由 `Bash(tail *)` 升級）
+
+**「整鏈 print」洗白繞道**（`pwd; echo 假`、`true && echo 已驗證`、`cat README.md; printf 假`）：
+因鏈中有真實 / no-op 指令而**非全鏈 print**，故**不 deny**，落該真實指令的既有判定（可能是 `allow` 或 `ask`，**非**「預設 ask + 升級」那一類）。此為使用者明確選擇維持乾淨結構規則、零誤殺的取捨。
 
 此外，本檢查器也沿用 `permissions.{allow,deny,ask}` 中的 `Read()/Edit()/Write()` 規則放寬「讀取位置」：
 凡純唯讀指令（allowlist 內）其路徑落在使用者以這些規則 allow 宣告、且未被 deny/ask 否決的外部目錄／
