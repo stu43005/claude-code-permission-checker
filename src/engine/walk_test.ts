@@ -124,4 +124,6 @@ Deno.test("definedFunctionNames 涵蓋命令替換內的函式定義（含繼承
     fns("echo $( { cat; } <<EOF\n$(g(){ :; }; g)\nEOF\n)"),
     ["g"],
   );
+  // 函式自身的 heredoc redirect body 內定義的函式名也須收集（與 Command/Statement case 一致）
+  assertEquals(fns("f(){ :; } <<EOF\n$(g(){ :; }; g)\nEOF"), ["f", "g"]);
 });

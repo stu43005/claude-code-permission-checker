@@ -247,6 +247,12 @@ function collectFns(node: Node, out: Set<string>): void {
     case "Function": {
       const n = staticValue(node.name);
       if (n !== null) out.add(n);
+      // 函式自身掛載的 redirect（如 heredoc body 內 `$(g(){…};g)`）也可能定義函式；
+      // 與 Command/Statement case 一致地掃描，保守收集（gate③ over-collect 為安全方向）。
+      for (const r of node.redirects) {
+        if (r.target) collectFnsInWord(r.target, out);
+        if (r.body) collectFnsInWord(r.body, out);
+      }
       collectFns(node.body, out); // 巢狀定義
       return;
     }
