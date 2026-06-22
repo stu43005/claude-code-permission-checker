@@ -219,3 +219,11 @@ Deno.test("已接受繞道：巢狀直譯器 / exec wrapper / 等價等待原語
   assertEquals(vd("bash -c 'echo fake'", rulesOf({ allow: ["Bash(bash *)"] })), "allow");
   assertEquals(vd("timeout 5 sleep 10", rulesOf({ allow: ["Bash(timeout *)"] })), "allow");
 });
+
+Deno.test("反斜線跳脫的指令名/旗標經 bash quote removal 後仍命中閘（防繞道）", () => {
+  assertEquals(vd("tail -\\f log"), "ask");        // -\f → -f follow
+  assertEquals(vd("tail --fol\\low log"), "ask");
+  assertEquals(vd("sl\\eep 5"), "deny");           // sl\eep → sleep
+  assertEquals(vd("ec\\ho \"fake\""), "deny");     // ec\ho → echo（整鏈 print）
+  assertEquals(vd("fin\\d /"), "deny");            // fin\d → find（遞迴根）
+});

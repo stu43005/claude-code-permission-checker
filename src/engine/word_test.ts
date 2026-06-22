@@ -49,3 +49,15 @@ Deno.test("quoted glob is static (glob chars protected by quotes)", () => {
   assertEquals(isStatic(w), true);
   assertEquals(staticValue(w), "*.txt");
 });
+
+Deno.test("staticValue：無 parts 未引號反斜線跳脫做 bash quote removal", () => {
+  const w = (src: string) => (parse(src).commands[0].command as Command).name!;
+  const a = (src: string) => (parse(src).commands[0].command as Command).suffix[0];
+  assertEquals(staticValue(w("sl\\eep")), "sleep");
+  assertEquals(staticValue(w("fin\\d")), "find");
+  assertEquals(staticValue(a("tail -\\f")), "-f");
+  assertEquals(staticValue(a("echo \\*")), "*");      // 跳脫的 * 是字面、仍靜態
+  assertEquals(staticValue(a("echo *.txt")), null);   // 未跳脫 glob → 動態
+  assertEquals(isStatic(a("echo \\*")), true);
+  assertEquals(isStatic(a("echo *.txt")), false);
+});
