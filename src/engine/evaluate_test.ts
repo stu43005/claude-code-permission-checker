@@ -1,4 +1,4 @@
-import { assertEquals } from "@std/assert";
+import { assertEquals, assertStringIncludes } from "@std/assert";
 import { evaluate } from "./evaluate.ts";
 import type { CwdState, Verdict } from "../types.ts";
 import { parseBashRule } from "../permissions/matcher.ts";
@@ -107,4 +107,93 @@ Deno.test("evaluate: compound with one un-allowed command -> ask (weakest link)"
 
 Deno.test("evaluate: no rules arg keeps current behavior", () => {
   assertEquals(evaluate("npm test", ROOT, AT_ROOT).verdict, "ask");
+});
+
+function vd(src: string, rules?: PermissionRules) {
+  return rules
+    ? evaluate(src, ROOT, AT_ROOT, rules).verdict
+    : evaluate(src, ROOT, AT_ROOT).verdict;
+}
+
+Deno.test("閘②整鏈 print-only → deny（不可由 Bash(echo *) 升級）", () => {
+  assertEquals(vd('echo "結論是 X"'), "deny");
+  assertEquals(vd('printf "%s\\n" "結論"'), "deny");
+  assertEquals(vd("cat <<EOF\nfake\nEOF"), "deny");
+  assertEquals(vd("echo a; echo b"), "deny");
+  assertEquals(vd('echo "$(echo fake)"'), "deny");
+  assertEquals(vd('echo -e "verified"'), "deny");
+  assertEquals(vd('echo "結論是 X"', rulesOf({ allow: ["Bash(echo *)"] })), "deny"); // echo 不可升級
+  assertEquals(vd('printf "%s\\n" "結論"', rulesOf({ allow: ["Bash(printf *)"] })), "deny"); // printf 不可升級
+});
+
+Deno.test("閘② print-only 不被後置函式定義降級；前置真實/no-op 葉指令使其落他閘", () => {
+  // 呼叫在前、定義在後，且鏈中無其他葉指令 → 整鏈仍只有 echo "fake" → 閘② deny
+  assertEquals(vd('echo "fake"; echo(){ :; }'), "deny");
+  // `if false; …` 會讓 walk 額外列舉 `false` 葉指令 → 非整鏈 print；且 echo 被（dead 分支）函式定義
+  // 遮蔽 → 落閘③ ask。靜態分析無法判定分支不可達，保守 ask（安全、非靜默 allow）。
+  assertEquals(vd("if false; then echo(){ :; }; fi; echo fake"), "ask");
+});
+
+Deno.test("非整鏈 print → 不 deny", () => {
+  assertEquals(vd("make && echo DONE"), "ask");
+  assertEquals(vd('echo -e "a\\tb"'), "allow");                 // carve-out
+  assertEquals(vd('printf "%05d\\n" 42'), "ask");               // carve-out（printf 非 allowlist）
+});
+
+Deno.test("heredoc body 命令替換經逐一分類（含繼承）；寫檔 heredoc 非 deny", () => {
+  // body 內 rm 逐一分類 → ask；且 Bash(cat *) 無法升級 rm（自身與繼承 heredoc 皆然）
+  assertEquals(vd("cat <<EOF\n$(rm -rf x)\nEOF"), "ask");
+  assertEquals(vd("cat <<EOF\n$(rm -rf x)\nEOF", rulesOf({ allow: ["Bash(cat *)"] })), "ask");
+  assertEquals(vd("{ cat; } <<EOF\n$(rm -rf x)\nEOF"), "ask");
+  assertEquals(vd("{ cat; } <<EOF\n$(rm -rf x)\nEOF", rulesOf({ allow: ["Bash(cat *)"] })), "ask");
+  // 內層 git log 為唯讀子指令 → allow；純變數 heredoc 無命令執行 → allow
+  assertEquals(vd("cat <<EOF\n$(git log)\nEOF"), "allow");
+  assertEquals(vd("cat <<EOF\n$HOME\nEOF"), "allow");
+  // 寫檔 heredoc：`>` 寫入重導向 → 非 print 形態 → 中央寫入規則 ask（非 deny）
+  assertEquals(vd("cat > /tmp/x <<EOF\nfake\nEOF"), "ask");
+});
+
+Deno.test("閘① 字面 sleep → deny（不受遮蔽/賦值/重導向/升級影響）", () => {
+  assertEquals(vd("sleep 5"), "deny");
+  assertEquals(vd("sleep"), "deny");
+  assertEquals(vd("sleep 0.5"), "deny");
+  assertEquals(vd("sleep 5 && make"), "deny");
+  assertEquals(vd("sleep 2; echo waiting"), "deny");
+  assertEquals(vd("FOO=1 sleep 5"), "deny");
+  assertEquals(vd("sleep 5 > out"), "deny");
+  assertEquals(vd('echo "$(sleep 5)"'), "deny");
+  assertEquals(vd("while true; do sleep 1; done"), "deny");
+  assertEquals(vd("for i in 1 2; do sleep 1; done"), "deny");
+  assertEquals(vd("sleep 1", rulesOf({ allow: ["Bash(sleep *)"] })), "deny"); // 不可升級
+  assertEquals(vd("sleep(){ :; }; sleep 5"), "deny");           // 遮蔽不豁免
+  assertEquals(vd("sleep 5; sleep(){ :; }"), "deny");
+});
+
+Deno.test("閘① sleep deny 理由透過 pollingDenyReason 傳出", () => {
+  const d = evaluate("sleep 5", ROOT, AT_ROOT);
+  assertEquals(d.verdict, "deny");
+  assertStringIncludes(d.reason, "ScheduleWakeup");
+});
+
+Deno.test("閘③ 函式遮蔽 → ask（不可升級）", () => {
+  assertEquals(vd("date(){ sleep 5; }; date"), "ask");
+  assertEquals(vd("pwd(){ echo fake; }; pwd"), "ask");
+  assertEquals(vd("waiter(){ sleep 5; }; waiter"), "ask");
+  assertEquals(vd("date(){ sleep 5; }; date", rulesOf({ allow: ["Bash(date *)"] })), "ask");
+  assertEquals(vd('echo "$(date(){ rm x; }; date)"'), "ask");   // 替換內定義 + 呼叫
+  assertEquals(vd("f(){ :; }; ls -la"), "allow");               // ls 未被遮蔽
+});
+
+Deno.test("已接受繞道：巢狀直譯器 / exec wrapper / 等價等待原語 預設 ask；廣域 allow 可升級", () => {
+  // 預設（無對應 permissions.allow）→ ask（葉指令名非 allowlist）
+  assertEquals(vd("bash -c 'echo fake'"), "ask");
+  assertEquals(vd("eval 'echo fake'"), "ask");
+  assertEquals(vd("python -c 'import time; time.sleep(5)'"), "ask");
+  assertEquals(vd("read -t 5"), "ask");
+  assertEquals(vd("timeout 5 sleep 10"), "ask");
+  assertEquals(vd("env sleep 5"), "ask");
+  assertEquals(vd("command echo fake"), "ask");
+  // 既有升級層：使用者自設廣域 allow → allow（使用者自負；本功能不硬擋）
+  assertEquals(vd("bash -c 'echo fake'", rulesOf({ allow: ["Bash(bash *)"] })), "allow");
+  assertEquals(vd("timeout 5 sleep 10", rulesOf({ allow: ["Bash(timeout *)"] })), "allow");
 });
