@@ -15,6 +15,21 @@ function classifyBuiltin(inv: CommandInvocation, scope: ScopeConfig, webFetch: W
   const rule = lookupRule(inv.name);
   if (!rule) return ask(`未列入 allowlist 的指令：${inv.name}`);
 
+  // 先評估指令規則：其硬 deny（遞迴遍歷磁碟根/家目錄根）必須優先於任何中央前置 ask，
+  // 否則前置 ask 會在 classify() 升級層被 Bash(...) 升級為 allow、繞過不可解除的 deny。
+  const verdict = rule.evaluate({
+    name: inv.name,
+    argv: inv.argv,
+    redirects: inv.redirects,
+    assignments: inv.assignments,
+    cwd: inv.cwd,
+    resolvePath: (w) => resolvePath(w, inv.cwd, scope),
+    resolvePathValue: (v) => resolvePathValue(v, inv.cwd, scope),
+    resolveUrl: (v) => resolveUrl(v, webFetch),
+    isDangerousRoot: (w) => dangerousRoot(w, inv.cwd, scope.home),
+  });
+  if (verdict.kind === "deny") return verdict; // 命令規則硬 deny 優先，不被前置 ask 遮蔽
+
   // 中央前置規則之一：cwd 範圍（known 但不在「專案 ∪ 外部允許唯讀範圍」）
   if (inv.cwd.kind === "known" && !isReadScoped(normalizeAbsolute(inv.cwd.path), scope)) {
     return ask(`工作目錄超出允許範圍：${inv.cwd.path}`);
@@ -36,17 +51,7 @@ function classifyBuiltin(inv: CommandInvocation, scope: ScopeConfig, webFetch: W
     }
   }
 
-  return rule.evaluate({
-    name: inv.name,
-    argv: inv.argv,
-    redirects: inv.redirects,
-    assignments: inv.assignments,
-    cwd: inv.cwd,
-    resolvePath: (w) => resolvePath(w, inv.cwd, scope),
-    resolvePathValue: (v) => resolvePathValue(v, inv.cwd, scope),
-    resolveUrl: (v) => resolveUrl(v, webFetch),
-    isDangerousRoot: (w) => dangerousRoot(w, inv.cwd, scope.home),
-  });
+  return verdict;
 }
 
 /** 對單一指令呼叫判定 allow / ask；builtin 判 ask 時，命中 settings allow（未被 deny/ask 命中）則升級。 */

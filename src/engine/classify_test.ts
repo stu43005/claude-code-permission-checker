@@ -266,3 +266,13 @@ Deno.test("輸入重導向 ask 可被 Read() 讀取範圍放寬升級", () => {
   // rulesWithRead 為 classify_test.ts 既有 helper（將 Read(...) 規則轉成 readScope.allow）
   assertEquals(onlyWith("cat < /etc/passwd", rulesWithRead(["Read(//etc/passwd)"])).kind, "allow");
 });
+
+Deno.test("命令規則硬 deny 不被中央前置 ask 遮蔽，且不可由 Bash() 升級", () => {
+  // 遞迴根掃描 → 硬 deny；即使疊加寫入重導向 / 輸入重導向 / 賦值前綴，deny 仍優先
+  assertEquals(only("find / > out.txt").kind, "deny");
+  assertEquals(only("find / < /etc/passwd").kind, "deny");
+  assertEquals(only("FOO=1 find /").kind, "deny");
+  // 不可由廣域 Bash(find *) 升級（硬 deny 短路、不經升級層）
+  assertEquals(onlyWith("find / > out.txt", rulesOf({ allow: ["Bash(find *)"] })).kind, "deny");
+  assertEquals(onlyWith("find / < /etc/passwd", rulesOf({ allow: ["Bash(find *)"] })).kind, "deny");
+});
