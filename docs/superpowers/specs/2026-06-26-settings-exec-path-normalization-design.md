@@ -67,42 +67,49 @@ canonicalizeExecPath(token: string, home: string | null): string
 6. **絕對路徑**（posix 單一 `/`、Windows `X:/`、Windows 單一 `\` 經 toPosix，且無 `..` 段）→ `normalizeAbsolute`（折疊中段 `//`、移除 `.` 段、Windows 磁碟正規化）。**因規則 3 已先攔截 `..`，此處 `normalizeAbsolute` 實際只會折疊 `//`/`.`、不會發生 `..` 上溯。**
 7. **`~user`**（波浪號接使用者名、無法判定他人家目錄）：不符合規則 4（非 `~`、非 `~/` 開頭）；若含 `/`（如 `~user/x`）落入規則 5 當相對處理（`~user` 為一具名段）；若不含 `/`（如 `~user`）落入規則 1 原樣返回。**本層不嘗試解析他人家目錄**。
 
-**零段／塌根 fail-closed**：規則 5/6 正規化後，若結果**塌成空字串、或塌成裸根（`/`、`X:/`）而原 token 並非該裸根本身**（例如 `./` → 空、`/.` → `/`、`a/.` 等只剩 `.` 段的退化形）→ **改原樣返回 token（literal）**，絕不產生空 / 裸根 prefix。理由見 §4.5 不變量 6：空 prefix 會使 `prefix-loose` 的 `startsWith("")` 命中**所有**指令；裸根 `/` 會誤配所有絕對路徑。此舉維持 `parseBashRule` 的「prefix 非空」不變量。
+**零段／塌根 fail-closed**：規則 5/6 正規化後，若結果**塌成空字串、或塌成裸根（`/`、`X:/`）而原 token 並非該裸根本身**（例如 `./` → 空、`/.` → `/`）→ **改原樣返回 token（literal）**，絕不產生空 / 裸根 prefix。（`a/.` → `a` 仍有具名段，不觸發此 fail-closed。）理由見 §4.5 不變量 6：空 prefix 會使 `prefix-loose` 的 `startsWith("")` 命中**所有**指令；裸根 `/` 會誤配所有絕對路徑。此舉維持 `parseBashRule` 的「prefix 非空」不變量。
 
 **尾斜線保留**：規則 5/6 的正規化會剝除尾斜線。若**原 token 以 `/`（或 `\`）結尾且 token 非單一根 `/`**，而正規化結果未以 `/` 結尾，則補回單一尾斜線（理由見 §4.5 不變量 2）。「零段／塌根 fail-closed」優先於本規則（已返回 literal 者不再加尾斜線）。
 
 `canonicalizeExecPath` 為純詞法、不碰檔案系統、不依賴 cwd、idempotent（已正規化字串再跑一次結果不變）。`lexicalNormalizeRelative` 為 `src/engine/scope.ts` 新增的相對路徑詞法正規化 helper（只折疊 `//`、移除 `.` 段、不解析 `..`、不加前導 `/`；`normalizeAbsolute` 假設絕對、會強制加前導 `/`，不可用於相對路徑）。
 
-### 4.3 指令側接點
+### 4.3 指令側接點（保留原始 + 另構正規化，供 union 比對）
 
-`reconstructCommand` 改為 `reconstructCommand(inv: CommandInvocation, home: string | null)`：
+**核心安全設計：比對採 union（見 §4.4 / §4.5 不變量 1）——指令與 pattern 各保留「原始（raw）」與「正規化（canon）」兩種形式，命中 = `(rawCmd vs rawPat)` ∨ `(canonCmd vs canonPat)`。raw 對 raw 完整重現現行行為，canon 對 canon 額外加入等價命中。如此正規化只增不減命中、永不破壞既有 deny/ask 規則。**
+
+`reconstructCommand(inv: CommandInvocation)` **維持回傳原始字串、簽名不變**（無 `home` 參數，**不**正規化）：
 
 - `inv.name === null` → `null`（不變）。
 - `inv.assignments.length > 0` → `null`（不變）。
 - 任一 argv `staticValue` 為 `null` → `null`（不變）。
-- 否則：`name = canonicalizeExecPath(inv.name, home)`，回 `[name, ...argv 靜態值].join(" ")`。argv **不**正規化。
+- 否則回 `[inv.name, ...argv 靜態值].join(" ")`（**原始 inv.name，不正規化**）。
 
-### 4.4 Pattern 側接點
+**正規化指令字串 `canonCmd`** 由 `settingsAllows` 另行構造：`[canonicalizeExecPath(inv.name, home), ...argv 靜態值].join(" ")`。注意 `inv.name` 是 parser 給的**單一 token**（即使是引號路徑含空白，也是完整一段、不需切割），故指令側正規化涵蓋整個執行檔路徑、無 head-split 問題。argv 兩種形式皆不正規化。`reconstructCommand` 回 `null` 時 `canonCmd` 不構造（直接 `false`）。
+
+### 4.4 Pattern 側接點 + union 比對
 
 `settingsAllows` 改為 `settingsAllows(inv: CommandInvocation, rules: PermissionRules, home: string | null)`：
 
-1. `cmd = reconstructCommand(inv, home)`；`null` → `false`（不變）。
-2. 對 `rules.bash.deny`、`rules.bash.ask`、`rules.bash.allow` **三組** pattern 各自先以**同一正規化**轉換 head token，再 `matchesAny`：
-   - 取 pattern 的**第一個空白前 token**（`exact` 用 `text`、`prefix-boundary` / `prefix-loose` 用 `prefix`）。
-   - 對該 head token 套 `canonicalizeExecPath(head, home)`（尾斜線保留已內含於該函式）；其餘字串（第一個空白起之後）原樣保留，組回同 `kind` 的新 `BashPattern`。
-   - 第一個空白前無內容或 pattern 無空白（prefix-loose 常態）→ 整個 `text`/`prefix` 視為 head token。
-3. 優先序不變：`matchesAny(cmd, deny')` → `false`；`matchesAny(cmd, ask')` → `false`；回 `matchesAny(cmd, allow')`。
+1. `rawCmd = reconstructCommand(inv)`；`null` → `false`（不變）。
+2. `canonCmd = [canonicalizeExecPath(inv.name, home), ...argv 靜態值].join(" ")`（§4.3）。
+3. **pattern 正規化 `canonicalizePattern(pat, home)`**（產生 canonPat，原 pat 即 rawPat）：
+   - 取 pattern 的**第一個空白前 token**（`exact` 用 `text`、`prefix-boundary` / `prefix-loose` 用 `prefix`）為 head。
+   - 對 head 套 `canonicalizeExecPath(head, home)`（尾斜線保留已內含）；其餘字串（第一個空白起之後）原樣保留，組回同 `kind` 的新 `BashPattern`。
+   - 第一個空白前無內容或 pattern 無空白（prefix-loose 常態）→ 整個 `text`/`prefix` 視為 head。
+   - **head-split 僅影響 pattern 側、且受 union 保護**：若 pattern 的執行檔路徑含空白（引號/跳脫），head-split 可能只正規化空白前段——但因 union 仍比對 `(rawCmd vs rawPat)`，原始字面行為完整保留，最壞情況只是「該 pattern 拿不到正規化加成、回退 raw」，**絕不**破壞或弱化原規則（見 §4.5 不變量 1）。
+4. **union 命中函式**：對某組 patterns，命中 ⟺ `∃pat: matchesPattern(rawCmd, pat) ∨ matchesPattern(canonCmd, canonicalizePattern(pat, home))`。
+5. 優先序不變：deny union 命中 → `false`；ask union 命中 → `false`；回 allow union 命中。
 
-`parseBashRule` 已保證 prefix 不含 `*`，故 head token 必無 glob 字元，正規化安全。
+`parseBashRule` 已保證 prefix 不含 `*`，故 head 必無 glob 字元，正規化安全。
 
 ### 4.5 安全不變量（不可違反）
 
-1. **三組對稱**：deny / ask / allow 必須套用**完全相同**的正規化。否則對 allow 正規化、對 deny 不正規化會弱化 deny。對稱套用下，正規化只會讓 deny 配到「僅差中段 `//` / `~` / `.` 段」的**更多**等價形式（強化保護），且 `deny > ask > allow` 短路順序不變。
+1. **union 非回歸 + 三組對稱**：比對採 union `(rawCmd vs rawPat) ∨ (canonCmd vs canonPat)`，且 deny / ask / allow **三組施加完全相同的 union 規則**。由此得兩個保證：(a) **非回歸**——`(rawCmd vs rawPat)` 分支完整重現現行字面比對，凡現行會命中者必仍命中，正規化**只增不減**命中（徹底化解 head-split 對含空白 deny 規則的破壞風險：raw 永遠保留）；(b) **deny 不被弱化**——deny/ask 的命中集合是現行的超集（強化保護），且 `deny > ask > allow` 短路順序不變。若只對單側正規化（如只正規化 cmd 卻拿 rawPat 比、或反之），則可能讓 raw-deny 對 canon-cmd 失配而漏擋——故**嚴禁跨形式比對**，只允許 raw↔raw 與 canon↔canon 兩條同形式分支。
 2. **尾斜線保留**：`prefix-loose` 若 pattern 為 `Bash(/a/scripts/*)`（prefix=`/a/scripts/`），`normalizeAbsolute` 會剝成 `/a/scripts`，使 `cmd.startsWith("/a/scripts")` 誤配 `/a/scriptsEVIL`。補回尾斜線維持目錄邊界，避免本正規化引入新的誤放。指令側 `inv.name` 通常不以 `/` 結尾，不受影響；對稱套用無妨。
 3. **相對路徑不跨信任邊界**：相對執行檔 token **不對 cwd 解析**，只做維持相對形式的詞法正規化。故相對 pattern（如 `Bash(scripts/review.sh *)`）**永不被 cwd 改寫成絕對路徑、不依賴 invocation 的 cwd**——它只配相對指令 `scripts/review.sh`（modulo `//`/`./..`），等價類廣度與既有字面比對相同，**不**因 cwd 不同而擴張授權面（避免 reviewer 指出的 cwd-tautology：「同一相對 allow 規則在任意 cwd 升級不同的 `scripts/review.sh`」）。絕對／`~` 展開後的絕對路徑才做絕對正規化。
 4. **UNC / 前導 `//` fail-closed**：前導雙斜線（potential UNC）的 token 一律**原樣保留、不折疊、不 toPosix**。本層**不對 UNC 做語義正規化**（不解析 UNC 根、不折疊前導 `//`）；保留字面使 UNC token **仍可與字面相同的 pattern 命中**，但不會因折疊前導 `//` 而與本機絕對路徑規則（`/server/share/...`）誤撞。結果至多配不到 → 維持 `ask`，**絕不誤放**。
 5. **`..` 不解析、留字面（symlink/junction 安全）**：詞法折疊 `..` 並非真語義等價——`/allowed/link/../tool` 詞法為 `/allowed/tool`，但 `link` 為 symlink/junction 時實際解析到別處。若折疊後拿去比對 allow，會把「另一個磁碟上執行檔」誤升級為 allow（且因 matcher 只看正規化字串而靜默）。故含 `..` 段的 token **一律留字面**（§4.2 規則 3），只配相同字面 pattern（至多 ask）。本層**不**做 realpath 解析（不碰檔案系統），因此唯一安全選擇就是不折疊 `..`。註：對 prefix-loose 的「`..` 字面 startsWith 既有 prefix」這類**既存**比對行為，與官方 `*`→`.*` 字面比對一致、非本層新增，故不在本層處理範圍。
-6. **零段／塌根 fail-closed（prefix 非空不變量）**：正規化**永不**把一個非空 token 縮成空字串或裸根（`/`、`X:/`）。退化形（`./`、`/.`、`a/.` 等只剩 `.` 段者）一律回原 token literal（§4.2「零段／塌根 fail-closed」）。否則空 prefix 會讓 `prefix-loose` 的 `startsWith("")` 命中所有指令、裸根 `/` 會誤配所有絕對路徑，違反 `parseBashRule` 既有的「prefix 非空」保證。
+6. **零段／塌根 fail-closed（prefix 非空不變量）**：正規化**永不**把一個非空 token 縮成空字串或裸根（`/`、`X:/`）。**判定以「正規化後結果」為準**：結果為空（如相對 `./` → 空）或為裸根而原 token 並非該裸根本身（如絕對 `/.` → `/`）→ 回原 token literal（§4.2「零段／塌根 fail-closed」）。**注意**：`a/.` 正規化為 `a`（仍有具名段 `a`），屬正常 `.` 移除、**不**觸發本 fail-closed。否則空 prefix 會讓 `prefix-loose` 的 `startsWith("")` 命中所有指令、裸根 `/` 會誤配所有絕對路徑，違反 `parseBashRule` 既有的「prefix 非空」保證。
 7. **fail-safe 方向（`home === null` 僅影響 `~`）**：`home === null` 時**只**令 `~`/`~/` 開頭的 token 原樣返回（規則 4，因無家目錄可展開）；**不依賴 home 的路徑（絕對 `/a//b`、相對 `x/y`）照常正規化**——它們的等價變換與 home 無關。與 §4.2 規則 4 一致：home 缺失不是「全域停用正規化」，只是「停用 `~` 展開」。任何停用情形至多配不到 → 維持 `ask`，**絕不誤放**。
 8. **不擴大放寬面**：本層只改變「字串比對的等價類」，不新增任何可被升級的指令類型；動態名 / 賦值前綴 / 動態 argv 仍回 `null`、不升級。
 
@@ -114,10 +121,10 @@ canonicalizeExecPath(token: string, home: string | null): string
 - `home = /Users/stu43005`（cwd 與本層無關：執行檔為絕對路徑，正規化不涉及 cwd）
 - allow pattern：`Bash(~/Sources/superpowers-codex/scripts/review-brainstorm.sh *)` → `prefix-boundary`，prefix=`~/Sources/superpowers-codex/scripts/review-brainstorm.sh`
 
-流程：
-- 指令側：`canonicalizeExecPath` 折疊 `//` → `/Users/stu43005/Sources/superpowers-codex/scripts/review-brainstorm.sh`；`cmd = "…review-brainstorm.sh --spec docs/... --base <sha>"`。
-- pattern 側：head `~/Sources/…/review-brainstorm.sh` 展開 `~` → `/Users/stu43005/Sources/superpowers-codex/scripts/review-brainstorm.sh`。
-- `matchesPattern`（prefix-boundary）：`cmd.startsWith(prefix + " ")` → 命中 → 升級 `allow`。✅
+流程（命中發生在 union 的 **canon↔canon** 分支；raw↔raw 分支此例不命中）：
+- `canonCmd`：`canonicalizeExecPath(inv.name)` 折疊 `//` → `/Users/stu43005/Sources/superpowers-codex/scripts/review-brainstorm.sh`；`canonCmd = "…review-brainstorm.sh --spec docs/... --base <sha>"`。
+- `canonPat`：head `~/Sources/…/review-brainstorm.sh` 展開 `~` → `/Users/stu43005/Sources/superpowers-codex/scripts/review-brainstorm.sh`（prefix-boundary）。
+- `matchesPattern(canonCmd, canonPat)`：`canonCmd.startsWith(canonPrefix + " ")` → 命中。deny/ask union 皆不命中 → allow union 命中 → 升級 `allow`。✅
 
 ## 5. 呼叫端串接
 
@@ -130,16 +137,16 @@ canonicalizeExecPath(token: string, home: string | null): string
 3. **不碰檔案系統**：純詞法正規化，不解析 symlink / junction / 真實 inode。
 4. **不解析他人家目錄**：`~user` 形式不展開。
 5. **argv 內路徑不正規化**：僅執行檔 token。
-6. **執行檔路徑含空白不支援**：pattern 與 reconstructed command 皆以空白切第一個 token 當執行檔；若執行檔路徑本身含空白（如 `/Users/me/My Tools/x.sh`），head 切割會落在空白處、無法正確正規化整段路徑。此類路徑維持原樣字面比對（至多配不到 → ask，不誤放）。此為既有 `reconstructCommand` 以空白 join 的延續限制，非本層新增風險。
+6. **執行檔路徑含空白：pattern 側不享正規化加成，但安全（union 保護）**：指令側 `inv.name` 是 parser 的單一 token，含空白也完整、正規化涵蓋全路徑、無切割問題。pattern 側則以第一個空白切 head，若 pattern 的執行檔路徑含空白（引號/跳脫），head-split 只會正規化空白前段。因比對採 union（§4.4 / §4.5 不變量 1）仍保留 `(rawCmd vs rawPat)`，**現行字面行為完整保留**：含空白的 deny/ask/allow 規則一律照舊生效，最壞只是該 pattern 拿不到 `//`/`~`/`.` 正規化加成（回退 raw 字面比對）。**不**會破壞規則、**不**會弱化 deny。
 7. **UNC / 前導 `//` 路徑不做語義正規化**：前導雙斜線 token 原樣保留（§4.2 規則 2 / §4.5 不變量 4），不解析 UNC 根、不折疊前導 `//`；字面相同的 pattern 仍可命中，但無語義等價放寬。
 8. **含 `..` 段的執行檔路徑不正規化**：`/a/../b`、`x/../y` 等含獨立 `..` 段者一律留字面（§4.2 規則 3 / §4.5 不變量 5），symlink 安全；只配相同字面 pattern（至多 ask）。**僅**折疊中段 `//` 與移除 `.` 段為支援的正規化。
-9. **退化路徑（只剩 `.` 段）留字面**：`./`、`/.`、`a/.` 等正規化後會塌成空/裸根者，改回原 token literal（§4.2 零段 fail-closed / §4.5 不變量 6），不產生過廣 prefix。
+9. **退化路徑（塌成空/裸根）留字面**：`./`（→空）、`/.`（→`/`）等正規化後會塌成空/裸根者，改回原 token literal（§4.2 零段 fail-closed / §4.5 不變量 6），不產生過廣 prefix。（`a/.` → `a` 不在此列、屬正常正規化。）
 
 ## 7. 測試計畫
 
 ### 7.1 `src/permissions/matcher_test.ts`
 
-既有測試補上 `home` 參數（`reconstructCommand` / `settingsAllows` 簽名變更）。新增**allow 與 ask 兩面 + 邊界**：
+既有測試補上 `home` 參數（**僅** `settingsAllows` 簽名新增 `home`；`reconstructCommand` 簽名不變、仍回原始字串）。新增**allow 與 ask 兩面 + 邊界**：
 
 - `~` / `~/` 展開命中（home 已知）；`home === null` 時不展開 → 不升級（ask）。
 - `//` 折疊命中（含核可用例）；中段 `.` 段移除（`/a/./b` → `/a/b`）命中。
@@ -160,9 +167,12 @@ canonicalizeExecPath(token: string, home: string | null): string
   - pattern `Bash(//server/share/tool *)` 與指令 `//server/share/tool ...` 皆原樣 → 命中（字面相同）。
   - 本機 allow `Bash(/server/share/tool *)` **不**命中 UNC 指令 `//server/share/tool ...`（前導 `//` 未折疊、不誤撞）。
   - 中段 `//`（`/a//b`）仍正常折疊（與前導 `//` 區隔）。
-- **執行檔路徑含空白**：`/Users/me/My Tools/x.sh` 形式維持字面、不誤放（至多 ask）。
+- **含空白執行檔路徑 + union 非回歸**（finding round-4-#1 回歸測試）：
+  - deny `Bash(/Users/me/My Tools/x.sh *)`（路徑含空白）對指令 `/Users/me/My Tools/x.sh ...` → 仍命中 deny（raw 分支保留）→ **不**升級。即使該 deny 含 `//`（`/Users/me//My Tools/x.sh`）也至少由 raw 比對擋下。
+  - allow 含空白且**無** `//`/`~`/`.` 的 pattern → 經 raw 分支照常命中（行為與現行一致）。
 - 裸指令名（`cat` / `git`）不被當路徑、行為不變。
-- **deny / ask 對稱不弱化**：原本命中 deny 的指令，正規化後仍命中 deny（不升級）；deny pattern 僅差 `//` / `~` 的等價形式也命中。
+- **union 非回歸總則**：抽樣既有「現行會命中」案例，加入正規化層後**全部仍命中**（raw↔raw 分支保證）；正規化只新增命中、不移除。
+- **deny / ask 不被弱化**：原本命中 deny 的指令，加入正規化後仍命中 deny（不升級）；deny pattern 僅差中段 `//` / `~` / `.` 的等價形式**額外**也命中（canon 分支，強化保護）。
 - 動態名 / 賦值前綴 / 動態 argv → 仍 `null`、不升級。
 
 ### 7.2 `src/engine/classify_test.ts` 與 e2e
@@ -179,7 +189,7 @@ canonicalizeExecPath(token: string, home: string | null): string
 | 檔案 | 變更 |
 |------|------|
 | `src/engine/scope.ts` | 新增 export `canonicalizeExecPath(token, home)`（不接 cwd；含前導 `//`、`..`-段、零段／塌根三道 fail-closed guard）+ 私有 `lexicalNormalizeRelative` helper（折疊 `//`、移除 `.`、不解析 `..`） |
-| `src/permissions/matcher.ts` | `reconstructCommand`、`settingsAllows` 加 `home` 參數；新增 pattern head 正規化 |
+| `src/permissions/matcher.ts` | `settingsAllows` 加 `home` 參數、改 union 比對（raw↔raw ∨ canon↔canon）；新增 `canonicalizePattern`（pattern head 正規化）；`reconstructCommand` 簽名不變（仍回原始字串） |
 | `src/engine/classify.ts` | `settingsAllows(inv, rules, scope.home)` |
 | `src/permissions/matcher_test.ts` | 補 `home` 參數 + 新案例 |
 | `src/engine/classify_test.ts` | 端到端升級案例 |
