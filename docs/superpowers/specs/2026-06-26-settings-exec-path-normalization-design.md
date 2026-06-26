@@ -47,27 +47,26 @@
 
 ### 4.2 核心函式 `canonicalizeExecPath`
 
-於 `src/engine/scope.ts` 新增並 export（複用既有 `toPosix` / `isAbsolute` / `normalizeAbsolute` / 私有 `resolveAgainst`）：
+於 `src/engine/scope.ts` 新增並 export（複用既有 `toPosix` / `isAbsolute` / `normalizeAbsolute`）：
 
 ```
-canonicalizeExecPath(token: string, cwd: CwdState, home: string | null): string
+canonicalizeExecPath(token: string, home: string | null): string
 ```
 
-對**單一執行檔 token** 正規化，指令側與 pattern 側**對稱套用同一函式**。規則依序：
+**刻意不接受 `cwd` 參數**：相對路徑**不對 cwd 解析**（見規則 4 與 §4.5 不變量 3 的信任邊界理由），故本函式對 cwd 無依賴。對**單一執行檔 token** 正規化，指令側與 pattern 側**對稱套用同一函式**。規則依序（先判先套，命中即返回）：
 
 1. **裸指令名**：token 不含 `/` 且不含 `\` 且非 `~`、非 `~/` 開頭 → **原樣返回**（`cat`、`git` 不得被當成路徑）。
-2. **`~` 或 `~/` 開頭**：
+2. **前導雙斜線（UNC / 歧義絕對）**：`toPosix(token)` 以 `//` 開頭（涵蓋 posix `//x`、Windows UNC `\\server\share`）→ **本層不支援、原樣返回 token（不 toPosix、不折疊、fail-closed）**。理由見 §4.5 不變量 4：折疊前導 `//` 會把 UNC 根改寫成不同路徑、可能與本機路徑規則誤撞；原樣保留使其只配相同字面、絕不誤放。**注意**：此規則只攔**前導** `//`；路徑**中段**的 `//`（如核可用例 `superpowers-codex//scripts`）不受影響、照常折疊。
+3. **`~` 或 `~/` 開頭**：
    - `home === null` → **原樣返回，不展開**（fail-safe）。
-   - 否則 `~` → `home`、`~/x` → `home` + `/x`，再 `normalizeAbsolute`。
-3. **絕對路徑**（posix `/`、Windows `X:/`、UNC、Windows `\`）→ `normalizeAbsolute`（折疊 `//`、解析 `./..`、Windows 磁碟正規化）。
-4. **相對路徑**：
-   - `cwd.kind === "known"` → `resolveAgainst(cwd.path, token)`（解析成絕對 posix）。
-   - `cwd.kind === "unknown"` → **原樣返回**（fail-safe，只配相同字面）。
-5. **`~user`**（波浪號接使用者名、其後非 `/`、無法判定他人家目錄）：不符合規則 2（非 `~`、非 `~/` 開頭），若含 `/`（如 `~user/x`）落入規則 3/4 被當相對/絕對處理；若不含 `/`（如 `~user`）落入規則 1 原樣返回。**本層不嘗試解析他人家目錄**。
+   - 否則 `~` → `home`、`~/x` → `home` + `/x`（此時已是絕對路徑）→ 落規則 5 的絕對分支 `normalizeAbsolute`。
+4. **相對路徑**（非絕對、非 UNC）→ **純詞法相對正規化 `lexicalNormalizeRelative`（不對 cwd 解析、維持相對形式）**：`toPosix` 後折疊 `//`、移除 `.` 段、解析內部 `..`（當前無可上溯的具名段時**保留前導 `..`**，不得越過起點）。**相對 token 永不被轉成絕對**，故相對 pattern 永不命中絕對指令、且與 cwd 完全無關（等價類廣度 = 既有字面比對 + `//`/`./..` 折疊）。
+5. **絕對路徑**（posix 單一 `/`、Windows `X:/`、Windows 單一 `\` 經 toPosix）→ `normalizeAbsolute`（折疊中段 `//`、解析 `./..`、Windows 磁碟正規化）。
+6. **`~user`**（波浪號接使用者名、無法判定他人家目錄）：不符合規則 3（非 `~`、非 `~/` 開頭）；若含 `/`（如 `~user/x`）落入規則 4 當相對處理（`~user` 為一具名段）；若不含 `/`（如 `~user`）落入規則 1 原樣返回。**本層不嘗試解析他人家目錄**。
 
-**尾斜線保留**：規則 2-4 經 `normalizeAbsolute` 會剝除尾斜線。若**原 token 以 `/` 結尾且 token !== `/`**，而正規化結果未以 `/` 結尾，則補回單一尾斜線（理由見 §4.5 安全不變量第 2 點）。
+**尾斜線保留**：規則 4-5 的正規化會剝除尾斜線。若**原 token 以 `/`（或 `\`）結尾且 token 非單一根 `/`**，而正規化結果未以 `/` 結尾，則補回單一尾斜線（理由見 §4.5 不變量 2）。
 
-`canonicalizeExecPath` 為純詞法、不碰檔案系統、idempotent（已正規化字串再跑一次結果不變）。
+`canonicalizeExecPath` 為純詞法、不碰檔案系統、不依賴 cwd、idempotent（已正規化字串再跑一次結果不變）。`lexicalNormalizeRelative` 為 `src/engine/scope.ts` 新增的相對路徑詞法正規化 helper（`normalizeAbsolute` 假設絕對、會強制加前導 `/`，不可用於相對路徑）。
 
 ### 4.3 指令側接點
 
@@ -76,7 +75,7 @@ canonicalizeExecPath(token: string, cwd: CwdState, home: string | null): string
 - `inv.name === null` → `null`（不變）。
 - `inv.assignments.length > 0` → `null`（不變）。
 - 任一 argv `staticValue` 為 `null` → `null`（不變）。
-- 否則：`name = canonicalizeExecPath(inv.name, inv.cwd, home)`，回 `[name, ...argv 靜態值].join(" ")`。argv **不**正規化。
+- 否則：`name = canonicalizeExecPath(inv.name, home)`，回 `[name, ...argv 靜態值].join(" ")`。argv **不**正規化。
 
 ### 4.4 Pattern 側接點
 
@@ -85,7 +84,7 @@ canonicalizeExecPath(token: string, cwd: CwdState, home: string | null): string
 1. `cmd = reconstructCommand(inv, home)`；`null` → `false`（不變）。
 2. 對 `rules.bash.deny`、`rules.bash.ask`、`rules.bash.allow` **三組** pattern 各自先以**同一正規化**轉換 head token，再 `matchesAny`：
    - 取 pattern 的**第一個空白前 token**（`exact` 用 `text`、`prefix-boundary` / `prefix-loose` 用 `prefix`）。
-   - 對該 head token 套 `canonicalizeExecPath(head, inv.cwd, home)`，並依 §4.2 尾斜線規則保留；其餘字串（第一個空白起之後）原樣保留，組回同 `kind` 的新 `BashPattern`。
+   - 對該 head token 套 `canonicalizeExecPath(head, home)`（尾斜線保留已內含於該函式）；其餘字串（第一個空白起之後）原樣保留，組回同 `kind` 的新 `BashPattern`。
    - 第一個空白前無內容或 pattern 無空白（prefix-loose 常態）→ 整個 `text`/`prefix` 視為 head token。
 3. 優先序不變：`matchesAny(cmd, deny')` → `false`；`matchesAny(cmd, ask')` → `false`；回 `matchesAny(cmd, allow')`。
 
@@ -95,15 +94,17 @@ canonicalizeExecPath(token: string, cwd: CwdState, home: string | null): string
 
 1. **三組對稱**：deny / ask / allow 必須套用**完全相同**的正規化。否則對 allow 正規化、對 deny 不正規化會弱化 deny。對稱套用下，正規化只會讓 deny 配到「僅差 `//` / `~` / `./..`」的**更多**等價形式（強化保護），且 `deny > ask > allow` 短路順序不變。
 2. **尾斜線保留**：`prefix-loose` 若 pattern 為 `Bash(/a/scripts/*)`（prefix=`/a/scripts/`），`normalizeAbsolute` 會剝成 `/a/scripts`，使 `cmd.startsWith("/a/scripts")` 誤配 `/a/scriptsEVIL`。補回尾斜線維持目錄邊界，避免本正規化引入新的誤放。指令側 `inv.name` 通常不以 `/` 結尾，不受影響；對稱套用無妨。
-3. **fail-safe 方向**：`home === null`（無法展開 `~`）與 `cwd.kind === "unknown"`（無法解析相對路徑）一律**原樣不正規化**。結果至多是配不到 → 維持 `ask`，**絕不誤放**。
-4. **不擴大放寬面**：本層只改變「字串比對的等價類」，不新增任何可被升級的指令類型；動態名 / 賦值前綴 / 動態 argv 仍回 `null`、不升級。
+3. **相對路徑不跨信任邊界**：相對執行檔 token **不對 cwd 解析**，只做維持相對形式的詞法正規化。故相對 pattern（如 `Bash(scripts/review.sh *)`）**永不被 cwd 改寫成絕對路徑、不依賴 invocation 的 cwd**——它只配相對指令 `scripts/review.sh`（modulo `//`/`./..`），等價類廣度與既有字面比對相同，**不**因 cwd 不同而擴張授權面（避免 reviewer 指出的 cwd-tautology：「同一相對 allow 規則在任意 cwd 升級不同的 `scripts/review.sh`」）。絕對／`~` 展開後的絕對路徑才做絕對正規化。
+4. **UNC / 前導 `//` fail-closed**：前導雙斜線（potential UNC）的 token 一律**原樣保留、不折疊、不 toPosix**。本層**明確不支援 UNC 精確比對**；保留字面使 UNC token 只配相同字面 pattern，且不會因折疊前導 `//` 而與本機絕對路徑規則（`/server/share/...`）誤撞。結果至多配不到 → 維持 `ask`，**絕不誤放**。
+5. **fail-safe 方向**：`home === null`（無法展開 `~`）一律**原樣不正規化**。結果至多是配不到 → 維持 `ask`，**絕不誤放**。
+6. **不擴大放寬面**：本層只改變「字串比對的等價類」，不新增任何可被升級的指令類型；動態名 / 賦值前綴 / 動態 argv 仍回 `null`、不升級。
 
 ### 4.6 端到端驗證（核可用例）
 
 輸入：
 - `inv.name = /Users/stu43005/Sources/superpowers-codex//scripts/review-brainstorm.sh`
 - argv = `["--spec", "docs/...", "--base", "<sha>"]`（皆靜態）
-- `home = /Users/stu43005`、`cwd.kind = "known"`
+- `home = /Users/stu43005`（cwd 與本層無關：執行檔為絕對路徑，正規化不涉及 cwd）
 - allow pattern：`Bash(~/Sources/superpowers-codex/scripts/review-brainstorm.sh *)` → `prefix-boundary`，prefix=`~/Sources/superpowers-codex/scripts/review-brainstorm.sh`
 
 流程：
@@ -113,7 +114,7 @@ canonicalizeExecPath(token: string, cwd: CwdState, home: string | null): string
 
 ## 5. 呼叫端串接
 
-`classify.ts` 第 76 行 `if (settingsAllows(inv, rules)) return allow();` 改為傳入 `scope.home`：`settingsAllows(inv, rules, scope.home)`。`home` 已由 `evaluate.ts` → `classify(inv, root, rules, home, trustedReadRoots)` 帶入，`inv.cwd` 已在 invocation 上，無需新增資料流。
+`classify.ts` 第 76 行 `if (settingsAllows(inv, rules)) return allow();` 改為傳入 `scope.home`：`settingsAllows(inv, rules, scope.home)`。`home` 已由 `evaluate.ts` → `classify(inv, root, rules, home, trustedReadRoots)` 帶入，無需新增資料流。本層**不使用** `inv.cwd`（相對路徑刻意不對 cwd 解析，見 §4.5 不變量 3）。
 
 ## 6. 已知限制（明確不做，YAGNI）
 
@@ -122,6 +123,8 @@ canonicalizeExecPath(token: string, cwd: CwdState, home: string | null): string
 3. **不碰檔案系統**：純詞法正規化，不解析 symlink / junction / 真實 inode。
 4. **不解析他人家目錄**：`~user` 形式不展開。
 5. **argv 內路徑不正規化**：僅執行檔 token。
+6. **執行檔路徑含空白不支援**：pattern 與 reconstructed command 皆以空白切第一個 token 當執行檔；若執行檔路徑本身含空白（如 `/Users/me/My Tools/x.sh`），head 切割會落在空白處、無法正確正規化整段路徑。此類路徑維持原樣字面比對（至多配不到 → ask，不誤放）。此為既有 `reconstructCommand` 以空白 join 的延續限制，非本層新增風險。
+7. **UNC / 前導 `//` 路徑不支援精確比對**：前導雙斜線 token 原樣保留（§4.2 規則 2 / §4.5 不變量 4），不嘗試 UNC 語義正規化；只配相同字面。
 
 ## 7. 測試計畫
 
@@ -131,9 +134,16 @@ canonicalizeExecPath(token: string, cwd: CwdState, home: string | null): string
 
 - `~` / `~/` 展開命中（home 已知）；`home === null` 時不展開 → 不升級（ask）。
 - `//` 折疊命中（含核可用例）。
-- `./` 與 `../` 解析：`../` 跳出 prefix → **不**命中（安全正向）。
+- `./` 與 `../` 解析：`../` 跳出 prefix → **不**命中（安全正向）；相對 `scripts/../bin/x` 詞法解析。
 - 尾斜線保留：`Bash(/a/scripts/*)` 命中 `/a/scripts/x` 但**不**命中 `/a/scriptsEVIL`。
-- `cwd.kind === "unknown"` + 相對路徑 → 原樣、只配相同字面。
+- **相對 pattern 不跨邊界、cwd 無關**（finding 1 回歸測試）：
+  - 相對 pattern `Bash(scripts/review.sh *)` **不**命中絕對指令 `/home/me/proj/scripts/review.sh ...`（相對永不被解析成絕對）。
+  - 同一相對 pattern 對相對指令 `scripts//review.sh ...` 的判定**與傳入 cwd 無關**（折疊 `//` 後命中；改變 cwd 不影響結果）。
+- **UNC / 前導 `//` fail-closed**（finding 2 回歸測試）：
+  - pattern `Bash(//server/share/tool *)` 與指令 `//server/share/tool ...` 皆原樣 → 命中（字面相同）。
+  - 本機 allow `Bash(/server/share/tool *)` **不**命中 UNC 指令 `//server/share/tool ...`（前導 `//` 未折疊、不誤撞）。
+  - 中段 `//`（`/a//b`）仍正常折疊（與前導 `//` 區隔）。
+- **執行檔路徑含空白**：`/Users/me/My Tools/x.sh` 形式維持字面、不誤放（至多 ask）。
 - 裸指令名（`cat` / `git`）不被當路徑、行為不變。
 - **deny / ask 對稱不弱化**：原本命中 deny 的指令，正規化後仍命中 deny（不升級）；deny pattern 僅差 `//` / `~` 的等價形式也命中。
 - 動態名 / 賦值前綴 / 動態 argv → 仍 `null`、不升級。
@@ -151,7 +161,7 @@ canonicalizeExecPath(token: string, cwd: CwdState, home: string | null): string
 
 | 檔案 | 變更 |
 |------|------|
-| `src/engine/scope.ts` | 新增 export `canonicalizeExecPath`，匯出或內用 `resolveAgainst` |
+| `src/engine/scope.ts` | 新增 export `canonicalizeExecPath(token, home)`（不接 cwd）+ 私有 `lexicalNormalizeRelative` helper |
 | `src/permissions/matcher.ts` | `reconstructCommand`、`settingsAllows` 加 `home` 參數；新增 pattern head 正規化 |
 | `src/engine/classify.ts` | `settingsAllows(inv, rules, scope.home)` |
 | `src/permissions/matcher_test.ts` | 補 `home` 參數 + 新案例 |
