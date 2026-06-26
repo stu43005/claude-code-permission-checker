@@ -37,7 +37,7 @@
 
 1. **方向**：加入路徑正規化層（比官方寬），以使用者意圖為準。
 2. **轉換項目**：展開 pattern 的 `~` / `~/`、折疊 `//` 雙斜線、移除 `.` 段。**不**對齊大小寫。
-   - **設計審查觸發的收窄**：原核可決策含「解析 `../`」，但 design-soundness 審查指出**詞法折疊 `..` 在 symlink/junction 下不等於真實解析路徑**（`/allowed/link/../tool` 可指向 `/allowed/tool` 以外的磁碟上執行檔），會造成誤放。故改為**不解析 `..`**：含 `..` 路徑段的 token 一律留字面、fail-closed（見 §4.2 規則 3、§4.5 不變量 5）。此收窄待使用者於 spec 審查關卡確認。
+   - **設計審查觸發的收窄（已採納）**：原核可決策含「解析 `../`」，但 design-soundness 審查指出**詞法折疊 `..` 在 symlink/junction 下不等於真實解析路徑**（`/allowed/link/../tool` 可指向 `/allowed/tool` 以外的磁碟上執行檔），會造成誤放。故本 spec **已採納改為不解析 `..`**：含 `..` 路徑段的 token 一律留字面、fail-closed（見 §4.2 規則 3、§4.5 不變量 5）。此為本 spec 的最終設計，無待決項；依 brainstorming 流程會在 spec 審查關卡向使用者明示此收窄（屬告知，不阻擋實作規劃）。
 3. **套用範圍**：只正規化**執行檔路徑**（指令的第一個 token / pattern 的第一個空白前 token），argv 與 pattern 其餘部分不動。
 
 ## 4. 設計
@@ -57,7 +57,7 @@ canonicalizeExecPath(token: string, home: string | null): string
 **刻意不接受 `cwd` 參數**：相對路徑**不對 cwd 解析**（見規則 5 與 §4.5 不變量 3 的信任邊界理由），故本函式對 cwd 無依賴。**轉換限定為「折疊中段 `//` + 移除 `.` 段」這兩種真語義等價變換**（兩者在任何 symlink 拓樸下都不改變路徑解析結果），外加 `~`/`~/` 展開。**不解析 `..`**。對**單一執行檔 token** 正規化，指令側與 pattern 側**對稱套用同一函式**。規則依序（先判先套，命中即返回）：
 
 1. **裸指令名**：token 不含 `/` 且不含 `\` 且非 `~`、非 `~/` 開頭 → **原樣返回**（`cat`、`git` 不得被當成路徑）。
-2. **前導雙斜線（UNC / 歧義絕對）**：`toPosix(token)` 以 `//` 開頭（涵蓋 posix `//x`、Windows UNC `\\server\share`）→ **本層不支援、原樣返回 token（不 toPosix、不折疊、fail-closed）**。理由見 §4.5 不變量 4。**注意**：此規則只攔**前導** `//`；路徑**中段**的 `//`（如核可用例 `superpowers-codex//scripts`）不受影響、照常折疊。
+2. **前導雙斜線（UNC / 歧義絕對）**：`toPosix(token)` 以 `//` 開頭（涵蓋 posix `//x`、Windows UNC `\\server\share`）→ **不做語義正規化、原樣返回 token（不 toPosix、不折疊、fail-closed；字面相同的 pattern 仍可命中）**。理由見 §4.5 不變量 4。**注意**：此規則只攔**前導** `//`；路徑**中段**的 `//`（如核可用例 `superpowers-codex//scripts`）不受影響、照常折疊。
 3. **含 `..` 路徑段 → 原樣返回（fail-closed）**：`toPosix(token)` 以 `/` 切段後，**任一段恰為 `..`** → **不正規化、原樣返回 token**。理由見 §4.5 不變量 5：詞法折疊 `..` 在 symlink/junction 下不等於真實解析路徑，可能放行不同的磁碟上執行檔。留字面使其只配相同字面 pattern（至多 ask）。注意以段為單位判定——檔名內含 `..`（如 `foo..bar`，非獨立 `..` 段）不受影響、照常正規化。
 4. **`~` 或 `~/` 開頭**：
    - `home === null` → **原樣返回，不展開**（fail-safe）。
@@ -100,10 +100,10 @@ canonicalizeExecPath(token: string, home: string | null): string
 1. **三組對稱**：deny / ask / allow 必須套用**完全相同**的正規化。否則對 allow 正規化、對 deny 不正規化會弱化 deny。對稱套用下，正規化只會讓 deny 配到「僅差中段 `//` / `~` / `.` 段」的**更多**等價形式（強化保護），且 `deny > ask > allow` 短路順序不變。
 2. **尾斜線保留**：`prefix-loose` 若 pattern 為 `Bash(/a/scripts/*)`（prefix=`/a/scripts/`），`normalizeAbsolute` 會剝成 `/a/scripts`，使 `cmd.startsWith("/a/scripts")` 誤配 `/a/scriptsEVIL`。補回尾斜線維持目錄邊界，避免本正規化引入新的誤放。指令側 `inv.name` 通常不以 `/` 結尾，不受影響；對稱套用無妨。
 3. **相對路徑不跨信任邊界**：相對執行檔 token **不對 cwd 解析**，只做維持相對形式的詞法正規化。故相對 pattern（如 `Bash(scripts/review.sh *)`）**永不被 cwd 改寫成絕對路徑、不依賴 invocation 的 cwd**——它只配相對指令 `scripts/review.sh`（modulo `//`/`./..`），等價類廣度與既有字面比對相同，**不**因 cwd 不同而擴張授權面（避免 reviewer 指出的 cwd-tautology：「同一相對 allow 規則在任意 cwd 升級不同的 `scripts/review.sh`」）。絕對／`~` 展開後的絕對路徑才做絕對正規化。
-4. **UNC / 前導 `//` fail-closed**：前導雙斜線（potential UNC）的 token 一律**原樣保留、不折疊、不 toPosix**。本層**明確不支援 UNC 精確比對**；保留字面使 UNC token 只配相同字面 pattern，且不會因折疊前導 `//` 而與本機絕對路徑規則（`/server/share/...`）誤撞。結果至多配不到 → 維持 `ask`，**絕不誤放**。
+4. **UNC / 前導 `//` fail-closed**：前導雙斜線（potential UNC）的 token 一律**原樣保留、不折疊、不 toPosix**。本層**不對 UNC 做語義正規化**（不解析 UNC 根、不折疊前導 `//`）；保留字面使 UNC token **仍可與字面相同的 pattern 命中**，但不會因折疊前導 `//` 而與本機絕對路徑規則（`/server/share/...`）誤撞。結果至多配不到 → 維持 `ask`，**絕不誤放**。
 5. **`..` 不解析、留字面（symlink/junction 安全）**：詞法折疊 `..` 並非真語義等價——`/allowed/link/../tool` 詞法為 `/allowed/tool`，但 `link` 為 symlink/junction 時實際解析到別處。若折疊後拿去比對 allow，會把「另一個磁碟上執行檔」誤升級為 allow（且因 matcher 只看正規化字串而靜默）。故含 `..` 段的 token **一律留字面**（§4.2 規則 3），只配相同字面 pattern（至多 ask）。本層**不**做 realpath 解析（不碰檔案系統），因此唯一安全選擇就是不折疊 `..`。註：對 prefix-loose 的「`..` 字面 startsWith 既有 prefix」這類**既存**比對行為，與官方 `*`→`.*` 字面比對一致、非本層新增，故不在本層處理範圍。
 6. **零段／塌根 fail-closed（prefix 非空不變量）**：正規化**永不**把一個非空 token 縮成空字串或裸根（`/`、`X:/`）。退化形（`./`、`/.`、`a/.` 等只剩 `.` 段者）一律回原 token literal（§4.2「零段／塌根 fail-closed」）。否則空 prefix 會讓 `prefix-loose` 的 `startsWith("")` 命中所有指令、裸根 `/` 會誤配所有絕對路徑，違反 `parseBashRule` 既有的「prefix 非空」保證。
-7. **fail-safe 方向**：`home === null`（無法展開 `~`）一律**原樣不正規化**。結果至多是配不到 → 維持 `ask`，**絕不誤放**。
+7. **fail-safe 方向（`home === null` 僅影響 `~`）**：`home === null` 時**只**令 `~`/`~/` 開頭的 token 原樣返回（規則 4，因無家目錄可展開）；**不依賴 home 的路徑（絕對 `/a//b`、相對 `x/y`）照常正規化**——它們的等價變換與 home 無關。與 §4.2 規則 4 一致：home 缺失不是「全域停用正規化」，只是「停用 `~` 展開」。任何停用情形至多配不到 → 維持 `ask`，**絕不誤放**。
 8. **不擴大放寬面**：本層只改變「字串比對的等價類」，不新增任何可被升級的指令類型；動態名 / 賦值前綴 / 動態 argv 仍回 `null`、不升級。
 
 ### 4.6 端到端驗證（核可用例）
@@ -131,7 +131,7 @@ canonicalizeExecPath(token: string, home: string | null): string
 4. **不解析他人家目錄**：`~user` 形式不展開。
 5. **argv 內路徑不正規化**：僅執行檔 token。
 6. **執行檔路徑含空白不支援**：pattern 與 reconstructed command 皆以空白切第一個 token 當執行檔；若執行檔路徑本身含空白（如 `/Users/me/My Tools/x.sh`），head 切割會落在空白處、無法正確正規化整段路徑。此類路徑維持原樣字面比對（至多配不到 → ask，不誤放）。此為既有 `reconstructCommand` 以空白 join 的延續限制，非本層新增風險。
-7. **UNC / 前導 `//` 路徑不支援精確比對**：前導雙斜線 token 原樣保留（§4.2 規則 2 / §4.5 不變量 4），不嘗試 UNC 語義正規化；只配相同字面。
+7. **UNC / 前導 `//` 路徑不做語義正規化**：前導雙斜線 token 原樣保留（§4.2 規則 2 / §4.5 不變量 4），不解析 UNC 根、不折疊前導 `//`；字面相同的 pattern 仍可命中，但無語義等價放寬。
 8. **含 `..` 段的執行檔路徑不正規化**：`/a/../b`、`x/../y` 等含獨立 `..` 段者一律留字面（§4.2 規則 3 / §4.5 不變量 5），symlink 安全；只配相同字面 pattern（至多 ask）。**僅**折疊中段 `//` 與移除 `.` 段為支援的正規化。
 9. **退化路徑（只剩 `.` 段）留字面**：`./`、`/.`、`a/.` 等正規化後會塌成空/裸根者，改回原 token literal（§4.2 零段 fail-closed / §4.5 不變量 6），不產生過廣 prefix。
 
