@@ -310,7 +310,7 @@ Deno.test("settingsAllows: case mismatch is not aligned -> no upgrade (case-sens
   );
 });
 
-// --- spec §7.1 matcher 層驗收（不只 canonicalizeExecPath 單元層）---
+// --- matcher-level acceptance for path normalization (not only the unit-level function) ---
 
 Deno.test("settingsAllows: middle . segment removal matches at matcher level", () => {
   assertEquals(
@@ -485,12 +485,26 @@ export function settingsAllows(
 
 - [ ] **Step 4: 更新既有 `settingsAllows` 呼叫端補 `home` 參數**
 
-`src/permissions/matcher_test.ts` 既有 5 處 `settingsAllows(...)` 呼叫（搜尋 `settingsAllows(firstInv` 找到原本兩參數者）一律補第三參數 `, null`，例如：
+`src/permissions/matcher_test.ts` 既有 5 處兩參數 `settingsAllows(...)` 呼叫一律補第三參數 `, null`。確切編輯如下（逐行取代）：
 
 ```ts
-// 原：settingsAllows(firstInv("npm test --silent"), rulesOf({ allow: ["Bash(npm test:*)"] }))
-settingsAllows(firstInv("npm test --silent"), rulesOf({ allow: ["Bash(npm test:*)"] }), null);
+// 既有測試 "settingsAllows: allow match -> true"
+assertEquals(settingsAllows(firstInv("npm test --silent"), rulesOf({ allow: ["Bash(npm test:*)"] }), null), true);
+
+// 既有測試 "settingsAllows: also denied -> false"
+assertEquals(settingsAllows(firstInv("npm test"), rules, null), false);
+
+// 既有測試 "settingsAllows: also asked -> false"
+assertEquals(settingsAllows(firstInv("npm test"), rules, null), false);
+
+// 既有測試 "settingsAllows: no allow match -> false"
+assertEquals(settingsAllows(firstInv("npm run build"), rulesOf({ allow: ["Bash(npm test:*)"] }), null), false);
+
+// 既有測試 "settingsAllows: non-reconstructable (dynamic) -> false"
+assertEquals(settingsAllows(firstInv("cat $FILE"), rulesOf({ allow: ["Bash(cat:*)"] }), null), false);
 ```
+
+（其中兩處 `settingsAllows(firstInv("npm test"), rules)` 文字相同，分屬 "also denied" 與 "also asked" 兩個測試，兩處都要補 `, null`。）
 
 同步把 `src/engine/classify.ts` 第 76 行的唯一生產呼叫端改為傳入 `scope.home`：
 
@@ -590,13 +604,14 @@ git commit -m "test(classify): integration tests for ~ and // exec-path upgrades
     "allow": [
       "Bash(npm test:*)",
       "Bash(/opt/tools/run.sh *)",
-      "Bash(~/tools/run.sh *)",
+      "Bash(~/Sources/superpowers-codex/scripts/review-brainstorm.sh *)",
       "Bash(/allowed/tool *)"
     ]
   }
 }
 ```
 
+> `Bash(~/Sources/superpowers-codex/scripts/review-brainstorm.sh *)` 即 spec §4.6 的**核可真實用例** pattern，供 Step 2 / Step 4 端到端驗證 `~` 展開 + `//` 折疊。
 > `Bash(/allowed/tool *)` 專供 Step 4(c) 的 `..` fail-closed 反向驗證：若詞法折疊了 `..`，`/allowed/link/../tool` 會折成 `/allowed/tool` 並命中此規則；因本層**不**折疊 `..`，故維持 `ask`、未誤放。
 
 - [ ] **Step 2: 新增 e2e 測試（重用既有 helpers）**
@@ -612,24 +627,38 @@ Deno.test("e2e: absolute allow + // in command -> allow (normalization wired)", 
   assertEquals(JSON.parse(out).hookSpecificOutput.permissionDecision, "allow");
 });
 
-Deno.test("e2e: ~ allow + // in command -> allow (HOME expands)", async () => {
+Deno.test("e2e: approved real case - ~ allow + // command -> allow (HOME expands)", async () => {
+  // spec §4.6 核可用例：pattern Bash(~/Sources/superpowers-codex/scripts/review-brainstorm.sh *)
   const out = await runHookWithEnv(
-    { tool_name: "Bash", tool_input: { command: "/home/e2e/tools//run.sh --x" }, cwd: SETTINGS_FIXTURE },
-    { CLAUDE_PROJECT_DIR: SETTINGS_FIXTURE, HOME: "/home/e2e" },
+    {
+      tool_name: "Bash",
+      tool_input: {
+        command: "/Users/stu43005/Sources/superpowers-codex//scripts/review-brainstorm.sh --spec docs/x --base abc",
+      },
+      cwd: SETTINGS_FIXTURE,
+    },
+    { CLAUDE_PROJECT_DIR: SETTINGS_FIXTURE, HOME: "/Users/stu43005" },
   );
   assertEquals(JSON.parse(out).hookSpecificOutput.permissionDecision, "allow");
 });
 
-Deno.test("e2e: ~ allow but HOME unset -> ask (no expansion)", async () => {
+Deno.test("e2e: approved real case but HOME unset -> ask (no ~ expansion)", async () => {
   const out = await runHook(
-    { tool_name: "Bash", tool_input: { command: "/home/e2e/tools//run.sh --x" }, cwd: SETTINGS_FIXTURE },
+    {
+      tool_name: "Bash",
+      tool_input: {
+        command: "/Users/stu43005/Sources/superpowers-codex//scripts/review-brainstorm.sh --spec docs/x --base abc",
+      },
+      cwd: SETTINGS_FIXTURE,
+    },
     SETTINGS_FIXTURE,
   );
   assertEquals(JSON.parse(out).hookSpecificOutput.permissionDecision, "ask");
 });
 ```
 
-> `/home/e2e` 與 `/opt/tools` 為純詞法比對對象，binary 不碰檔案系統，本機是否真有該路徑無關。
+> 所有路徑為純詞法比對對象，binary 不碰檔案系統，本機是否真有 `/Users/stu43005/...` 或 `/opt/tools` 無關。
+> `runHook`（line 6）以 `clearEnv: true` 只帶 `CLAUDE_PROJECT_DIR`，故 `HOME` 在該情境天然未設定。
 
 - [ ] **Step 3: 跑測試確認通過**
 
@@ -648,25 +677,25 @@ echo '{"tool_name":"Bash","tool_input":{"command":"/opt/tools//run.sh --x"},"cwd
 Expected: JSON 含 `"permissionDecision":"allow"`、exit 0（`//` 折疊命中 `Bash(/opt/tools/run.sh *)`）。
 
 ```bash
-# (b) ~ 展開 + // 折疊命中（HOME 設定）
-echo '{"tool_name":"Bash","tool_input":{"command":"/home/e2e/tools//run.sh --x"},"cwd":"'"$FIX"'"}' \
-  | CLAUDE_PROJECT_DIR="$FIX" HOME="/home/e2e" ./dist/permission-checker
+# (b) approved real case: ~ expand + // fold (HOME set)
+echo '{"tool_name":"Bash","tool_input":{"command":"/Users/stu43005/Sources/superpowers-codex//scripts/review-brainstorm.sh --spec docs/x --base abc"},"cwd":"'"$FIX"'"}' \
+  | CLAUDE_PROJECT_DIR="$FIX" HOME="/Users/stu43005" ./dist/permission-checker
 ```
-Expected: `"permissionDecision":"allow"`（`~/tools/run.sh` 展開為 `/home/e2e/tools/run.sh`，命中含 `//` 的指令）。
+Expected: `"permissionDecision":"allow"`（`~/Sources/superpowers-codex/scripts/review-brainstorm.sh` 展開 + `//` 折疊後命中核可用例）。
 
 ```bash
-# (c) .. fail-closed：即使有折疊等價的 allow Bash(/allowed/tool *)，含 .. 指令仍 ask（未折疊、未誤放）
+# (c) .. fail-closed: even with a fold-equivalent allow Bash(/allowed/tool *), a .. command stays ask
 echo '{"tool_name":"Bash","tool_input":{"command":"/allowed/link/../tool x"},"cwd":"'"$FIX"'"}' \
   | CLAUDE_PROJECT_DIR="$FIX" ./dist/permission-checker
 ```
 Expected: `"permissionDecision":"ask"`（`..` 段留字面、未折成 `/allowed/tool`、未誤放）。
 
 ```bash
-# (d) §7.3 home-unset：~ 規則無家目錄可展開 -> 不命中 -> ask（確認無意外 allow）
-echo '{"tool_name":"Bash","tool_input":{"command":"/home/e2e/tools//run.sh --x"},"cwd":"'"$FIX"'"}' \
-  | CLAUDE_PROJECT_DIR="$FIX" ./dist/permission-checker
+# (d) HOME unavailable: the ~ rule cannot expand -> no match -> ask (confirm no accidental allow)
+echo '{"tool_name":"Bash","tool_input":{"command":"/Users/stu43005/Sources/superpowers-codex//scripts/review-brainstorm.sh --spec docs/x --base abc"},"cwd":"'"$FIX"'"}' \
+  | env -u HOME -u USERPROFILE CLAUDE_PROJECT_DIR="$FIX" ./dist/permission-checker
 ```
-Expected: `"permissionDecision":"ask"`（未設 `HOME` → `Bash(~/tools/run.sh *)` 的 `~` 不展開 → 不命中 → 維持 ask）。
+Expected: `"permissionDecision":"ask"`（以 `env -u HOME -u USERPROFILE` 確實清掉家目錄 env → `~` 無法展開 → 不命中 → ask）。
 
 - [ ] **Step 5: Commit**
 
@@ -707,5 +736,5 @@ git commit -m "docs(CLAUDE): document exec-path normalization upgrade layer"
 ## 完成準則（最終驗證）
 
 - [ ] `deno task check && deno task lint && deno task test` 全綠。
-- [ ] `deno task build` 成功，operational verification（Task 4 Step 4）三例符合預期（`//` → allow、`~`+`//`（HOME 設定）→ allow、`..` → ask）。
+- [ ] `deno task build` 成功，operational verification（Task 4 Step 4）四例符合預期：(a) `//` → allow、(b) 核可真實用例 `~`+`//`（HOME 設定）→ allow、(c) `..` → ask、(d) HOME 清空 → ask。
 - [ ] 既有測試零回歸（union raw↔raw 分支保證）；`settingsAllows` 所有呼叫端皆顯式傳 `home`（必填）。
