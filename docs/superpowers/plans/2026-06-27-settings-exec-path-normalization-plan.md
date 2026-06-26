@@ -616,7 +616,7 @@ git commit -m "test(classify): integration tests for ~ and // exec-path upgrades
 
 - [ ] **Step 2: 新增 e2e 測試（重用既有 helpers）**
 
-`src/main_test.ts` 已有模組層 helper `runHook(payload, projectDir)`（line 6）與 `runHookWithEnv(payload, env)`（line 133，`env` 為完整環境記錄、已帶 `--allow-sys=uid`），以及 `SETTINGS_FIXTURE` 常數。**不要**重新定義任何 helper——直接重用。在檔末新增三個 e2e：
+`src/main_test.ts` 已有模組層 helper `runHook(payload, projectDir)`（line 6）與 `runHookWithEnv(payload, env)`（line 133，`env` 為完整環境記錄、已帶 `--allow-sys=uid`），以及 `SETTINGS_FIXTURE` 常數。**不要**重新定義任何 helper——直接重用。在檔末新增四個 e2e：
 
 ```ts
 Deno.test("e2e: absolute allow + // in command -> allow (normalization wired)", async () => {
@@ -628,7 +628,7 @@ Deno.test("e2e: absolute allow + // in command -> allow (normalization wired)", 
 });
 
 Deno.test("e2e: approved real case - ~ allow + // command -> allow (HOME expands)", async () => {
-  // spec §4.6 核可用例：pattern Bash(~/Sources/superpowers-codex/scripts/review-brainstorm.sh *)
+  // ~ rule expands to the user home and folds // in the command's exec path
   const out = await runHookWithEnv(
     {
       tool_name: "Bash",
@@ -655,6 +655,15 @@ Deno.test("e2e: approved real case but HOME unset -> ask (no ~ expansion)", asyn
   );
   assertEquals(JSON.parse(out).hookSpecificOutput.permissionDecision, "ask");
 });
+
+Deno.test("e2e: .. in command stays literal -> ask despite fold-equivalent allow", async () => {
+  // fixture has Bash(/allowed/tool *); a .. command must NOT fold into it
+  const out = await runHook(
+    { tool_name: "Bash", tool_input: { command: "/allowed/link/../tool x" }, cwd: SETTINGS_FIXTURE },
+    SETTINGS_FIXTURE,
+  );
+  assertEquals(JSON.parse(out).hookSpecificOutput.permissionDecision, "ask");
+});
 ```
 
 > 所有路徑為純詞法比對對象，binary 不碰檔案系統，本機是否真有 `/Users/stu43005/...` 或 `/opt/tools` 無關。
@@ -663,7 +672,7 @@ Deno.test("e2e: approved real case but HOME unset -> ask (no ~ expansion)", asyn
 - [ ] **Step 3: 跑測試確認通過**
 
 Run: `deno test --allow-run --allow-env --allow-read --allow-sys=uid src/main_test.ts`
-Expected: PASS（三個新 e2e + 既有 e2e 全綠）。**本 Task 在 Task 1-3 之後執行，正規化已串接**，故新 e2e 直接通過；若在 Task 1-3 之前單獨跑，前兩個會是 `ask`（作為迴歸守門的反向驗證）。**注意**：本檔為子行程 e2e，必帶 `--allow-run --allow-env --allow-read --allow-sys=uid`（與 `deno task test` 一致；`main.ts` 經 `Deno.uid()` 需 `--allow-sys=uid`）。
+Expected: PASS（四個新 e2e + 既有 e2e 全綠）。**本 Task 在 Task 1-3 之後執行，正規化已串接**，故新 e2e 直接通過；若在 Task 1-3 之前單獨跑，`//` 折疊與 `~` 展開兩個 allow 案例會回退為 `ask`（作為迴歸守門的反向驗證）。**注意**：本檔為子行程 e2e，必帶 `--allow-run --allow-env --allow-read --allow-sys=uid`（與 `deno task test` 一致；`main.ts` 經 `Deno.uid()` 需 `--allow-sys=uid`）。
 
 - [ ] **Step 4: Build 後 operational verification（餵真實 JSON 給 binary）**
 
