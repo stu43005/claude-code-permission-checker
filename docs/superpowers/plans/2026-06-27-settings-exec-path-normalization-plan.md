@@ -309,12 +309,83 @@ Deno.test("settingsAllows: case mismatch is not aligned -> no upgrade (case-sens
     false,
   );
 });
+
+// --- spec §7.1 matcher 層驗收（不只 canonicalizeExecPath 單元層）---
+
+Deno.test("settingsAllows: middle . segment removal matches at matcher level", () => {
+  assertEquals(
+    settingsAllows(firstInv("/a/./b x"), rulesOf({ allow: ["Bash(/a/b *)"] }), null),
+    true,
+  );
+});
+
+Deno.test("settingsAllows: identical .. literal on both sides matches", () => {
+  assertEquals(
+    settingsAllows(
+      firstInv("/allowed/link/../tool x"),
+      rulesOf({ allow: ["Bash(/allowed/link/../tool *)"] }),
+      null,
+    ),
+    true,
+  );
+});
+
+Deno.test("settingsAllows: '..' inside filename does not trigger guard, // still folds", () => {
+  assertEquals(
+    settingsAllows(firstInv("/a//foo..bar x"), rulesOf({ allow: ["Bash(/a/foo..bar *)"] }), null),
+    true,
+  );
+});
+
+Deno.test("settingsAllows: prefix-loose with .. stays literal (a/..*), not overbroad", () => {
+  assertEquals(
+    settingsAllows(firstInv("a/../b x"), rulesOf({ allow: ["Bash(a/..*)"] }), null),
+    true,
+  );
+  assertEquals(
+    settingsAllows(firstInv("a/b x"), rulesOf({ allow: ["Bash(a/..*)"] }), null),
+    false,
+  );
+});
+
+Deno.test("settingsAllows: trailing-slash prefix boundary - matches child, not sibling", () => {
+  const rules = rulesOf({ allow: ["Bash(/a/scripts/*)"] });
+  assertEquals(settingsAllows(firstInv("/a/scripts/x y"), rules, null), true);
+  assertEquals(settingsAllows(firstInv("/a/scriptsEVIL y"), rules, null), false);
+});
+
+Deno.test("settingsAllows: relative pattern does not match absolute command", () => {
+  assertEquals(
+    settingsAllows(firstInv("/proj/scripts/run.sh x"), rulesOf({ allow: ["Bash(scripts/run.sh *)"] }), null),
+    false,
+  );
+});
+
+Deno.test("settingsAllows: relative pattern matches relative command (// folded)", () => {
+  assertEquals(
+    settingsAllows(firstInv("scripts//run.sh x"), rulesOf({ allow: ["Bash(scripts/run.sh *)"] }), null),
+    true,
+  );
+});
+
+Deno.test("settingsAllows: degenerate deny pattern ./ does not over-block unrelated allow", () => {
+  const rules = rulesOf({ allow: ["Bash(npm test:*)"], deny: ["Bash(./*)"] });
+  assertEquals(settingsAllows(firstInv("npm test x"), rules, null), true);
+});
+
+Deno.test("settingsAllows: spaced deny containing // still blocks via raw branch", () => {
+  const rules = rulesOf({
+    allow: ["Bash(/o/My App//run.sh *)"],
+    deny: ["Bash(/o/My App//run.sh *)"],
+  });
+  assertEquals(settingsAllows(firstInv('"/o/My App//run.sh" x'), rules, null), false);
+});
 ```
 
 - [ ] **Step 2: 跑測試確認失敗**
 
 Run: `deno test --allow-env src/permissions/matcher_test.ts`
-Expected: FAIL（整檔編譯失敗：`settingsAllows` 簽名變更為必填三參數，既有兩參數呼叫與本檔新測試需第三參數；且尚未 union → `~`、`//`、UNC 案例不符）
+Expected: FAIL。在 Step 3 實作前，`settingsAllows` 仍是舊的**兩參數**簽名，本檔新測試的**三參數呼叫**對舊簽名造成編譯錯誤（`Expected 2 arguments, but got 3`），整檔無法編譯。（Step 3 改簽名 + union、Step 4 補既有呼叫端後才會通過。）
 
 - [ ] **Step 3: 實作 union 比對**
 
@@ -516,10 +587,17 @@ git commit -m "test(classify): integration tests for ~ and // exec-path upgrades
 ```json
 {
   "permissions": {
-    "allow": ["Bash(npm test:*)", "Bash(/opt/tools/run.sh *)", "Bash(~/tools/run.sh *)"]
+    "allow": [
+      "Bash(npm test:*)",
+      "Bash(/opt/tools/run.sh *)",
+      "Bash(~/tools/run.sh *)",
+      "Bash(/allowed/tool *)"
+    ]
   }
 }
 ```
+
+> `Bash(/allowed/tool *)` 專供 Step 4(c) 的 `..` fail-closed 反向驗證：若詞法折疊了 `..`，`/allowed/link/../tool` 會折成 `/allowed/tool` 並命中此規則；因本層**不**折疊 `..`，故維持 `ask`、未誤放。
 
 - [ ] **Step 2: 新增 e2e 測試（重用既有 helpers）**
 
@@ -577,11 +655,18 @@ echo '{"tool_name":"Bash","tool_input":{"command":"/home/e2e/tools//run.sh --x"}
 Expected: `"permissionDecision":"allow"`（`~/tools/run.sh` 展開為 `/home/e2e/tools/run.sh`，命中含 `//` 的指令）。
 
 ```bash
-# (c) .. 段留字面 -> 不被 allow 命中 -> ask（未誤放）
+# (c) .. fail-closed：即使有折疊等價的 allow Bash(/allowed/tool *)，含 .. 指令仍 ask（未折疊、未誤放）
 echo '{"tool_name":"Bash","tool_input":{"command":"/allowed/link/../tool x"},"cwd":"'"$FIX"'"}' \
   | CLAUDE_PROJECT_DIR="$FIX" ./dist/permission-checker
 ```
-Expected: `"permissionDecision":"ask"`（含 `..` 段留字面、不被任何 allow 命中、未誤放）。
+Expected: `"permissionDecision":"ask"`（`..` 段留字面、未折成 `/allowed/tool`、未誤放）。
+
+```bash
+# (d) §7.3 home-unset：~ 規則無家目錄可展開 -> 不命中 -> ask（確認無意外 allow）
+echo '{"tool_name":"Bash","tool_input":{"command":"/home/e2e/tools//run.sh --x"},"cwd":"'"$FIX"'"}' \
+  | CLAUDE_PROJECT_DIR="$FIX" ./dist/permission-checker
+```
+Expected: `"permissionDecision":"ask"`（未設 `HOME` → `Bash(~/tools/run.sh *)` 的 `~` 不展開 → 不命中 → 維持 ask）。
 
 - [ ] **Step 5: Commit**
 
