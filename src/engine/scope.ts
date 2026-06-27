@@ -108,6 +108,10 @@ export function canonicalizeExecPath(token: string, home: string | null): string
   } else {
     // 規則 5：相対 → 維持相對的詞法正規化
     normalized = lexicalNormalizeRelative(posix);
+    // 類別保留 fail-closed：相對 token 原含 "/"（→ 以路徑執行、非 PATH 查找）卻塌成
+    // 無 "/" 的裸名（→ PATH 查找）時，兩者 shell 語義不同（如 ./npm vs npm），
+    // 正規化跨越此邊界會造成誤升級 → 原樣返回 token。
+    if (posix.includes("/") && !normalized.includes("/")) return token;
   }
 
   // 零段／塌根 fail-closed：結果塌成空、或塌成裸根而原非該裸根 → 原樣 token

@@ -260,8 +260,8 @@ Deno.test("canonicalizeExecPath: zero-segment / bare-root collapse left literal"
   assertEquals(canonicalizeExecPath("/.", null), "/.");
 });
 
-Deno.test("canonicalizeExecPath: a/. normalizes to a (named segment remains)", () => {
-  assertEquals(canonicalizeExecPath("a/.", null), "a");
+Deno.test("canonicalizeExecPath: slash token collapsing to bare name is left literal (category safety)", () => {
+  assertEquals(canonicalizeExecPath("a/.", null), "a/.");
 });
 
 Deno.test("canonicalizeExecPath: relative stays relative, folds //", () => {
@@ -271,6 +271,16 @@ Deno.test("canonicalizeExecPath: relative stays relative, folds //", () => {
 
 Deno.test("canonicalizeExecPath: preserves trailing slash (directory boundary)", () => {
   assertEquals(canonicalizeExecPath("/a/scripts/", null), "/a/scripts/");
+});
+
+Deno.test("canonicalizeExecPath: leading ./ kept literal (path-exec vs PATH-lookup)", () => {
+  assertEquals(canonicalizeExecPath("./npm", null), "./npm");
+  assertEquals(canonicalizeExecPath("./tool", null), "./tool");
+});
+
+Deno.test("canonicalizeExecPath: deeper ./a/b still normalizes (stays a path)", () => {
+  assertEquals(canonicalizeExecPath("./a/b", null), "a/b");
+  assertEquals(canonicalizeExecPath("./a//b", null), "a/b");
 });
 
 Deno.test("isReadScoped: trusted root grants read; root-first and deny/ask override", () => {

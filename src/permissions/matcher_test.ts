@@ -309,3 +309,24 @@ Deno.test("settingsAllows: spaced deny containing // still blocks via raw branch
   });
   assertEquals(settingsAllows(firstInv('"/o/My App//run.sh" x'), rules, null), false);
 });
+
+Deno.test("settingsAllows: ./local exec is NOT upgraded by a PATH allow rule (no bypass)", () => {
+  assertEquals(
+    settingsAllows(firstInv("./npm install"), rulesOf({ allow: ["Bash(npm *)"] }), null),
+    false,
+  );
+});
+
+Deno.test("settingsAllows: ./tool pattern does NOT match a bare PATH tool command", () => {
+  assertEquals(
+    settingsAllows(firstInv("tool x"), rulesOf({ allow: ["Bash(./tool *)"] }), null),
+    false,
+  );
+});
+
+Deno.test("settingsAllows: deeper ./a/b command still matches relative a/b allow (legit equivalence)", () => {
+  assertEquals(
+    settingsAllows(firstInv("./a/b x"), rulesOf({ allow: ["Bash(a/b *)"] }), null),
+    true,
+  );
+});
