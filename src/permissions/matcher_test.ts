@@ -377,3 +377,43 @@ Deno.test("settingsAllows: quoted-tilde command is NOT expanded -> home-absolute
     false,
   );
 });
+
+Deno.test("settingsAllows: spaced-path allow not matched across exec/argv boundary by a // command (no bypass)", () => {
+  // command executes /tmp//My (== /tmp/My), with argv "App/run.sh"; the spaced allow targets a
+  // DIFFERENT executable /tmp/My App/run.sh. The canon exec-boundary gate must reject this.
+  assertEquals(
+    settingsAllows(
+      firstInv('"/tmp//My" "App/run.sh" evil'),
+      rulesOf({ allow: ["Bash(/tmp/My App/run.sh *)"] }),
+      null,
+    ),
+    false,
+  );
+});
+
+Deno.test("settingsAllows: exec-boundary gate does not over-block deny either (canon precision)", () => {
+  // Symmetric to the allow case: a // command whose real exec is /tmp/My must NOT be canon-matched
+  // by a spaced deny meant for the different exec /tmp/My App/run.sh. Official (raw) does not match
+  // it; with only this deny and no allow, the result is no-upgrade (false) regardless, but this
+  // locks that the gate applies symmetrically.
+  assertEquals(
+    settingsAllows(
+      firstInv('"/tmp//My" "App/run.sh" evil'),
+      rulesOf({ deny: ["Bash(/tmp/My App/run.sh *)"] }),
+      null,
+    ),
+    false,
+  );
+});
+
+Deno.test("settingsAllows: exec-only pattern still upgrades a // command (gate allows in-exec match)", () => {
+  // The motivating shape: pattern's exec-path == command's exec token (lengths equal after folding).
+  assertEquals(
+    settingsAllows(
+      firstInv("/opt/t//run.sh --x"),
+      rulesOf({ allow: ["Bash(/opt/t/run.sh *)"] }),
+      null,
+    ),
+    true,
+  );
+});

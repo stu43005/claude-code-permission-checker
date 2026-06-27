@@ -106,22 +106,38 @@ function canonicalizePattern(pat: BashPattern, home: string | null): BashPattern
   }
 }
 
-/** union 命中：(rawCmd vs rawPat) ∨ (canonCmd vs canonPat)，跨整組 patterns。 */
+/** canonPat 的「執行檔比對長度」：exact 取 text、prefix 類取 prefix 的長度。 */
+function patternMatchLen(pat: BashPattern): number {
+  return pat.kind === "exact" ? pat.text.length : pat.prefix.length;
+}
+
+/**
+ * union 命中：(rawCmd vs rawPat) ∨ (canonCmd vs canonPat)，跨整組 patterns。
+ * canon 分支加「執行檔邊界閘」：canonPat 的比對長度不得超過 canon 執行檔名長度
+ * （canonExecLen），使 canon 匹配侷限於 exec token、不跨入 argv。否則 exec 名的 `//`
+ * 折疊後與後續 argv 拼接，會讓含空白的執行檔路徑 pattern 跨越 exec/argv 邊界誤配
+ * （指令實際執行的是較短的 exec）。raw 分支不受閘影響、完整保留；閘對 deny/ask/allow
+ * 對稱施加，只移除 canon 跨界匹配，相對官方 baseline 既不弱化 deny 也不放寬 allow。
+ */
 function matchesRuleSet(
   rawCmd: string,
   canonCmd: string,
+  canonExecLen: number,
   pats: BashPattern[],
   home: string | null,
 ): boolean {
-  return pats.some((p) =>
-    matchesPattern(rawCmd, p) || matchesPattern(canonCmd, canonicalizePattern(p, home))
-  );
+  return pats.some((p) => {
+    if (matchesPattern(rawCmd, p)) return true;
+    const cp = canonicalizePattern(p, home);
+    return patternMatchLen(cp) <= canonExecLen && matchesPattern(canonCmd, cp);
+  });
 }
 
 /**
  * 綜合判定：此 invocation 是否應依 settings 升級為 allow。
  * union 比對：指令與 pattern 各保留 raw / canon 兩形式，命中 ⟺ (rawCmd vs rawPat) ∨ (canonCmd vs canonPat)。
  * 三組 deny/ask/allow 對稱套用；raw↔raw 完整重現現行行為，正規化只增不減命中，故不弱化任何 deny/ask。
+ * canon 分支加「執行檔邊界閘」：canonPat 長度不得超過 canonExecLen，使 canon 匹配侷限於 exec token。
  */
 export function settingsAllows(
   inv: CommandInvocation,
@@ -130,9 +146,11 @@ export function settingsAllows(
 ): boolean {
   const rawCmd = reconstructCommand(inv);
   if (rawCmd === null) return false;
+  if (inv.name === null) return false; // rawCmd 非 null 已蘊含，但讓 canonExecName 取值型別安全
   const canonCmd = reconstructCanonical(inv);
   if (canonCmd === null) return false; // 與 rawCmd 同步，理論上不會發生
-  if (matchesRuleSet(rawCmd, canonCmd, rules.bash.deny, home)) return false;
-  if (matchesRuleSet(rawCmd, canonCmd, rules.bash.ask, home)) return false;
-  return matchesRuleSet(rawCmd, canonCmd, rules.bash.allow, home);
+  const canonExecLen = canonicalizeExecPath(inv.name, null).length;
+  if (matchesRuleSet(rawCmd, canonCmd, canonExecLen, rules.bash.deny, home)) return false;
+  if (matchesRuleSet(rawCmd, canonCmd, canonExecLen, rules.bash.ask, home)) return false;
+  return matchesRuleSet(rawCmd, canonCmd, canonExecLen, rules.bash.allow, home);
 }
