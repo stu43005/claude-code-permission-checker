@@ -355,3 +355,49 @@ Deno.test("e2e: tail -f -> ask", async () => {
   );
   assertEquals(JSON.parse(out).hookSpecificOutput.permissionDecision, "ask");
 });
+
+Deno.test("e2e: absolute allow + // in command -> allow (normalization wired)", async () => {
+  const out = await runHook(
+    { tool_name: "Bash", tool_input: { command: "/opt/tools//run.sh --x" }, cwd: SETTINGS_FIXTURE },
+    SETTINGS_FIXTURE,
+  );
+  assertEquals(JSON.parse(out).hookSpecificOutput.permissionDecision, "allow");
+});
+
+Deno.test("e2e: approved real case - ~ allow + // command -> allow (HOME expands)", async () => {
+  // ~ rule expands to the user home and folds // in the command's exec path
+  const out = await runHookWithEnv(
+    {
+      tool_name: "Bash",
+      tool_input: {
+        command: "/Users/stu43005/Sources/superpowers-codex//scripts/review-brainstorm.sh --spec docs/x --base abc",
+      },
+      cwd: SETTINGS_FIXTURE,
+    },
+    { CLAUDE_PROJECT_DIR: SETTINGS_FIXTURE, HOME: "/Users/stu43005" },
+  );
+  assertEquals(JSON.parse(out).hookSpecificOutput.permissionDecision, "allow");
+});
+
+Deno.test("e2e: approved real case but HOME unset -> ask (no ~ expansion)", async () => {
+  const out = await runHook(
+    {
+      tool_name: "Bash",
+      tool_input: {
+        command: "/Users/stu43005/Sources/superpowers-codex//scripts/review-brainstorm.sh --spec docs/x --base abc",
+      },
+      cwd: SETTINGS_FIXTURE,
+    },
+    SETTINGS_FIXTURE,
+  );
+  assertEquals(JSON.parse(out).hookSpecificOutput.permissionDecision, "ask");
+});
+
+Deno.test("e2e: .. in command stays literal -> ask despite fold-equivalent allow", async () => {
+  // fixture has Bash(/allowed/tool *); a .. command must NOT fold into it
+  const out = await runHook(
+    { tool_name: "Bash", tool_input: { command: "/allowed/link/../tool x" }, cwd: SETTINGS_FIXTURE },
+    SETTINGS_FIXTURE,
+  );
+  assertEquals(JSON.parse(out).hookSpecificOutput.permissionDecision, "ask");
+});

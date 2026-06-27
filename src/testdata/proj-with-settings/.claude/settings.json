@@ -1,5 +1,10 @@
 {
   "permissions": {
-    "allow": ["Bash(npm test:*)"]
+    "allow": [
+      "Bash(npm test:*)",
+      "Bash(/opt/tools/run.sh *)",
+      "Bash(~/Sources/superpowers-codex/scripts/review-brainstorm.sh *)",
+      "Bash(/allowed/tool *)"
+    ]
   }
 }
