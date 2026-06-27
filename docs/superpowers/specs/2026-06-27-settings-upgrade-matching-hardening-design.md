@@ -97,7 +97,7 @@ return verdict
 - 步驟 2 建構 `RuleContext`（`resolvePath`/`resolvePathValue`/`resolveUrl`/`isDangerousRoot` 綁定 `inv.cwd` 與 `scope`/`webFetch`），與現行 `classifyBuiltin` 完全相同。
 - 步驟 3 四條中央前置所需資料皆與 rule 無關，對非-allowlist 指令同樣可計算；建議抽成一個純函式
   `centralPreflightAsk(inv, scope): RuleVerdict | null`（命中回不可升級的 `ask`，否則 `null`），讓重構標的可獨立測試：
-  - cwd：`isReadScoped(normalizeAbsolute(inv.cwd.path), scope)`（既有 import）。
+  - cwd：**僅在 `inv.cwd.kind === "known"` 時**讀 `inv.cwd.path` 並 `isReadScoped(normalizeAbsolute(inv.cwd.path), scope)`（既有 import）；`kind !== "known"` 時此條不觸發（與 §4.2 步驟 3a 一致）。
   - 寫入重導向：`hasWriteRedirect(inv.redirects)`（既有 import）。
   - 賦值前綴：`inv.assignments.length`。
   - 範圍外 `<`：`resolvePath(r.target, inv.cwd, scope)`（既有 import）。
@@ -147,7 +147,19 @@ return verdict
 1. **rule 的非-deny 輸出一律被覆寫**：`rule.evaluate` 回的 `allow`/`ask` 在步驟 3 之後才被消費；只要任一中央前置命中，步驟 3 立即 return 不可升級的 ask，rule 的 allow/ask **永不生效**。唯一能在中央前置前返回的是 rule 的 `deny`（更嚴格、安全方向）。因此即使未來某指令規則在 out-of-scope cwd 下因特例回 `allow`，仍被中央前置覆寫成 ask。
 2. **rule.evaluate 為純函式（契約）**：無副作用、不碰 FS、`resolvePath` 純詞法且不丟例外；上游 `evaluate` 另有 try/catch → ask 的 fail-safe。故「在危險情境下呼叫它」沒有 runtime 危害。
 
-**為何不採用 two-phase CommandRule API**（把 evaluate 拆成「純 hard-deny prepass」+「verdict pass」，讓中央前置插在兩者之間）：該拆分需改動 `CommandRule` 介面與**所有**指令規則檔，屬本 spec「只動 `classify.ts`」範圍外的大改；且在不變量 8、9 成立下，它**不帶來額外安全性**（rule 的 allow/ask 本就被覆寫、evaluate 本就純）。故**刻意不採用**，改以明文不變量 + 測試（§5 第 5 點）鎖定既有順序的安全性。
+**為何不採用 two-phase CommandRule API**（把 evaluate 拆成「純 hard-deny prepass」+「verdict pass」，讓中央前置插在兩者之間）：該拆分需改動 `CommandRule` 介面與 deny 來源檔，屬本 spec「只動 `classify.ts`」範圍外的改動；且在不變量 8、9 成立下，它**不帶來額外安全性**（rule 的 allow/ask 本就被覆寫、evaluate 本就純）。故**刻意不採用**，改以明文不變量 + 測試（§5 第 5、6 點）鎖定既有順序的安全性。
+
+#### 4.6.1 已接受的 residual（design-soundness 審查 needs-attention，由 spec owner 拍板接受）
+
+spec 審查的 design-soundness reviewer 連續兩輪回 `needs-attention`，主張「universal gate 卻讓 command-specific code 先在被守的危險狀態下執行，且僅靠**未經結構性強制**的純函式契約」，要求改採 two-phase（`hardDenyPrecheck` + `evaluate`）或把中央前置移到完整 rule 評估前。
+
+**取證後的決策（接受 residual、不採 two-phase）**，依據：
+
+- **零當前漏洞**：以 `grep` 稽核確認**唯二**會回 `deny` 的來源是 `src/rules/commands/find.ts:31` 與 `src/rules/factory.ts:75-76`（皆為「遞迴指令 + `isDangerousRoot`」），其餘所有指令規則皆無 deny、且均為純函式（回 verdict、不碰 FS、不執行指令）。故 reviewer 的疑慮在**現行程式碼上不對應任何實際漏洞**，純屬 future-proofing。
+- **安全性不依賴 rule 內部行為**：不變量 8 保證 rule 的 `allow`/`ask` 一律被中央前置覆寫，唯一越過的 rule 輸出是 `deny`（安全方向）。即使未來新增的 rule 在 out-of-scope 情境回 allow，仍被覆寫成 ask。
+- **two-phase 不增安全、卻擴大 scope**：在不變量 8、9 下，two-phase 與現設計的**最終判定完全相同**；它改動 `CommandRule` 介面屬 spec owner 明確排除的範圍擴張。
+
+**緩解（取代結構性強制）**：以「純函式契約」明文化（不變量 9）＋ **實作計畫納入一次性稽核**（§5 第 6 點：審查全部現存指令規則確認無副作用）＋ 測試鎖定不變量 8（§5 第 5 點）。此 residual 為 spec owner 知情後的取捨：**接受 future-proofing 風險、不接受 scope 擴張**，與本專案「誤 ask 可接受、誤 allow 不可接受」並不衝突（殘留風險不會造成誤 allow——任何契約違反最多讓某 rule 在危險情境被呼叫，其 allow/ask 仍被覆寫，deny 仍安全方向）。
 
 ## 5. 測試計畫
 
@@ -160,6 +172,7 @@ return verdict
    - 指令規則自身範圍外讀取 ask + 對應 `Bash()`/`Read()` 規則 → allow。
 4. **deny 優先**：遞迴根掃描 + 寫入重導向 + 命中 `Bash(...)` → 仍 deny（不被中央 ask 或升級遮蔽）。
 5. **中央前置覆寫 rule allow（不變量 8 鎖定）**：取一個指令規則本身會回 `allow` 的代表案例（如 `cat README.md`），分別加上每一條中央前置觸發條件（寫入重導向 `cat README.md > out.txt`、專案外 cwd、範圍外 `<`），即使配上會命中的 `Bash(cat:*)` allow 規則，斷言**結果為 ask**——證明 rule 的 allow 被中央前置覆寫、不因 rule 自身邏輯而洩漏成 allow。
+6. **指令規則純函式稽核（一次性、緩解 §4.6.1 residual）**：實作時逐一審查 `src/rules/commands/*.ts` 與 `src/rules/factory.ts` 的 `evaluate`，確認無副作用（不寫檔、不執行指令、不依賴可變外部狀態），並在實作計畫記錄稽核結果；唯二 deny 來源（`find.ts`、`factory.ts`）維持現行 `isDangerousRoot` 判定不變。此為文件/稽核層緩解，非結構性強制（見 §4.6.1 決策）。
 
 ## 6. Operational verification（改規則後必做）
 
