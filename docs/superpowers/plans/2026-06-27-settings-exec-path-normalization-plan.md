@@ -205,6 +205,9 @@ git commit -m "feat(scope): add canonicalizeExecPath for exec-path lexical norma
 - Modify: `src/engine/scope.ts`（把 `canonicalizeExecPath` 接入 matcher 後浮現的兩道比對專屬安全 hardening，見下「安全 hardening」）
 - Test: `src/permissions/matcher_test.ts`（含更新既有 5 處 `settingsAllows(inv, rules)` 呼叫補 `, null`）
 - Test: `src/engine/scope_test.ts`（類別保留 fail-closed 的單元回歸測試）
+- Test: `src/main_test.ts`（**e2e 綠燈前置**：見下「e2e 綠燈前置」）
+
+> **e2e 綠燈前置（為何 main_test.ts 屬本 Task）**：CLAUDE.md 強制每個 Task 完成前 `deno task test` 全綠。在本 Task 跑全套時，浮現 11 個**既有** e2e 失敗（與本功能無關）：`runHookWithEnv` 為測試家目錄路徑邏輯而以 `clearEnv` 覆寫 `HOME`，但 Deno 模組快取（DENO_DIR）預設在 `$HOME` 之下，假 HOME 導致子行程找不到 `npm:unbash` 而啟動失敗、stdout 為空。修法：把父行程真實 `DENO_DIR` 顯式帶入子行程 env（與 hook 的 `HOME`/`USERPROFILE` 判定正交，不影響測試語義）。此為 Task 2 達成「全套綠燈」驗收的必要前置，故歸於本 Task。
 
 > **為何多檔同一 Task**：`settingsAllows` 的 `home` 改為**必填**（依 spec §4.4，避免預設值掩蓋漏接線）。改簽名會使其唯一生產呼叫端 `classify.ts:76` 的 2 參數呼叫編譯失敗，故簽名變更與呼叫端更新必須同屬一個原子變更以維持綠燈。
 
