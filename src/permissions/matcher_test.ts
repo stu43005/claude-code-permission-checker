@@ -310,6 +310,40 @@ Deno.test("settingsAllows: spaced deny containing // still blocks via raw branch
   assertEquals(settingsAllows(firstInv('"/o/My App//run.sh" x'), rules, null), false);
 });
 
+// Spaced-exec-path deny-precedence safety net. The pattern head-split only normalizes the
+// pattern's first whitespace-delimited token, so a `//` in a spaced pattern path after the
+// first space is not folded. This never weakens deny vs. the official (raw-literal) baseline:
+// whenever the COMMAND carries `//` (the only case our normalization could add an allow), the
+// path-equivalent deny still blocks — via the raw branch for a `//`-deny, or via the canon
+// branch for a `/`-deny. A `//`-deny against a `/`-command does not match under official
+// literal semantics either, so matching that is out of scope (not a regression).
+Deno.test("settingsAllows: spaced // command blocked by single-/ deny via canon branch", () => {
+  const rules = rulesOf({
+    allow: ["Bash(/o/My App/run.sh *)"],
+    deny: ["Bash(/o/My App/run.sh *)"],
+  });
+  assertEquals(settingsAllows(firstInv('"/o/My App//run.sh" x'), rules, null), false);
+});
+
+Deno.test("settingsAllows: spaced // command blocked by // deny even when allow is single-/", () => {
+  const rules = rulesOf({
+    allow: ["Bash(/o/My App/run.sh *)"],
+    deny: ["Bash(/o/My App//run.sh *)"],
+  });
+  assertEquals(settingsAllows(firstInv('"/o/My App//run.sh" x'), rules, null), false);
+});
+
+Deno.test("settingsAllows: spaced / command + // deny matches official (deny // does not apply to / cmd)", () => {
+  // Official Claude Code (raw literal) would allow this: allow '/o/My App/run.sh *' matches the
+  // '/'-command, and deny '/o/My App//run.sh *' does NOT match a '/'-command. We reproduce that
+  // exactly via the raw branch — no normalization-induced upgrade, hence no deny weakening.
+  const rules = rulesOf({
+    allow: ["Bash(/o/My App/run.sh *)"],
+    deny: ["Bash(/o/My App//run.sh *)"],
+  });
+  assertEquals(settingsAllows(firstInv('"/o/My App/run.sh" x'), rules, null), true);
+});
+
 Deno.test("settingsAllows: ./local exec is NOT upgraded by a PATH allow rule (no bypass)", () => {
   assertEquals(
     settingsAllows(firstInv("./npm install"), rulesOf({ allow: ["Bash(npm *)"] }), null),
