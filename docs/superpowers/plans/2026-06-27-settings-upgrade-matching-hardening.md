@@ -21,17 +21,31 @@
 
 ---
 
-## 前置稽核（撰寫計畫時已完成，無需於實作時重跑）
+## 前置稽核（撰寫計畫時已完成；Task 4 於實作後再驗證一次）
 
-設計接受的 residual（指令規則純函式契約）所需的稽核**已在撰寫本計畫時完成**：對 `src/rules/` 執行
+設計接受的 residual（指令規則純函式契約）所需的稽核**已在撰寫本計畫時完成**，三項皆通過：
 
-```bash
-grep -rnE "Deno\.(write|run|Command|create|remove|mkdir|open|truncate|copy|rename|symlink|link|chmod|chown|makeTemp)" src/rules/
-```
+1. **無副作用 API**：
+   ```bash
+   grep -rnE "Deno\.(write|run|Command|create|remove|mkdir|open|truncate|copy|rename|symlink|link|chmod|chown|makeTemp)" src/rules/
+   ```
+   結果**無輸出（exit 1）** → `src/rules/`（含 `commands/*.ts` 與 `factory.ts`）所有 `evaluate` 皆未呼叫
+   檔案系統 / 子行程 API。
 
-結果**無任何輸出（exit code 1）**，確認 `src/rules/`（含 `commands/*.ts` 與 `factory.ts`）所有規則 `evaluate`
-皆未呼叫檔案系統 / 子行程 API、為純函式。此結論已自足地寫入 `classify.ts` 的 `centralPreflightAsk` doc 註解
-（Task 1 Step 5），不另立稽核任務。**若實作期間任何規則新增了上述 API，須停止並回報**（residual 假設破口）。
+2. **無模組層可變狀態**：
+   ```bash
+   grep -rnE "^(let|var) " src/rules/
+   ```
+   結果**無輸出（exit 1）** → 無頂層（模組層）可變綁定；所有 `let` 皆為函式內區域變數（純函式內部
+   運算，不依賴可變外部狀態）。
+
+3. **唯二 deny 來源未受本次變更影響**：deny 僅出自 `src/rules/commands/find.ts`（`isDangerousRoot` → `deny`）
+   與 `src/rules/factory.ts`（`flagGatedReader` 的 `isDangerousRoot` → `deny`）；本計畫**不修改** `src/rules/**`，
+   故其遞迴根 deny 判定維持不變。
+
+此結論已自足地寫入 `classify.ts` 的 `centralPreflightAsk` doc 註解（Task 1 Step 5）。Task 4 會於實作後再跑
+第 1、2 項 grep，並以 `git diff --name-only` 確認 `src/rules/` 未被改動，作為實作時驗證。**任一檢查未通過
+須停止並回報**（residual 假設破口）。
 
 ---
 
@@ -115,6 +129,11 @@ Deno.test("可升級不退化：指令規則自身範圍外讀取 ask 仍可由 
 ```
 
 > 「非-allowlist 無中央前置仍可升級」已由既有測試 `settings allow upgrades ask -> allow`（`npm test x` + `Bash(npm test:*)` → allow，約 line 68-70）覆蓋，不重複新增。
+>
+> **以下情境由 `classify_test.ts` 既有測試覆蓋，重構後須續綠（不新增；Step 6 全套執行時驗證）：**
+> - `命令規則硬 deny 不被中央前置 ask 遮蔽，且不可由 Bash() 升級`（同檔既有，約 line 270-278）：含 `find / > out.txt` + `Bash(find *)` → **deny**，覆蓋「遞迴根 deny + 寫入重導向 + 命中 Bash() → 仍 deny」（deny 優先於中央 ask 與升級層）。
+> - `external Read() allow widens read-only command -> allow`（同檔既有，約 line 104-107）：`grep needle /srv/pkg/a.ts` + `Read(//srv/pkg/**)` → **allow**，覆蓋「指令規則自身範圍外讀取 ask 可由 `Read()` 讀取範圍放寬升級」。
+> - `輸入重導向 ask 可被 Read() 讀取範圍放寬升級`（同檔既有，約 line 265-268）：`<` 目標經 `Read()` 放寬後落 in-project、中央前置 d 不觸發 → allow，重構後不變。
 
 - [ ] **Step 4: 執行新增/翻轉測試，確認在現行程式碼上 FAIL（紅燈）**
 
@@ -306,7 +325,7 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 ## Task 3: 更新 `CLAUDE.md` 架構說明 + 標注 DRAFT（發現 A 已解、發現 B 為已知限制）
 
 **Files:**
-- Modify: `CLAUDE.md`（「架構（評估管線）」的 `classify.ts` 條目 + 「四條中央前置規則」段落）
+- Modify: `CLAUDE.md`（四處：「架構（評估管線）」的 `classify.ts` 條目、「四條中央前置規則」段落、「核心不變量」的「deny 為硬性」條目、「hook 決策 vs settings.json 權限的優先序」段落）
 - Modify: `docs/superpowers/specs/2026-06-27-settings-upgrade-matching-hardening-DRAFT.md`（頂端狀態區塊加更新註）
 
 - [ ] **Step 1: 更新「架構（評估管線）」的 `classify.ts` 條目**
@@ -335,18 +354,43 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 
 > 同段落下方「1. cwd 範圍 / 2. 寫入型重導向 / 3. 環境變數賦值前綴 / 4. 輸入重導向」四條列舉**保持不變**（規則內容未變，僅套用範圍由「allowlisted」擴及「所有指令」、且改為不可升級）。
 
-- [ ] **Step 3: 標注 DRAFT — 發現 A 已解、發現 B 維持已知限制**
+- [ ] **Step 3: 更新「核心不變量」的「deny 為硬性」條目（移除 `classifyBuiltin`、補中央前置不可升級）**
 
-於 `docs/superpowers/specs/2026-06-27-settings-upgrade-matching-hardening-DRAFT.md` 頂端狀態引言區塊（以 `> **狀態：草稿（DRAFT）**` 開頭的整段引言）之後，新增一段更新註（原檔其餘內容保持不動）：
+於 `CLAUDE.md` 找到以 `- **deny 為硬性**：` 開頭的整條 bullet（其中含 `classifyBuiltin` 與舊「前置 ask 會被升級層升級」措辭），整條替換為：
 
 ```markdown
-> **更新（2026-06-27）**：**發現 A 已解**——由設計 `2026-06-27-settings-upgrade-matching-hardening-design.md`
-> 及其實作計畫承接（中央前置規則升級為「通用不可升級硬 ask」）。**發現 B 維持已知限制**：exec/argv 去引號
-> 扁平化的跨界匹配未在本次處理，沿用現行 deny 對稱守護（admin 加 path-equivalent deny 即可一致擋下），
-> 留待日後「結構化比對模型」設計；其嚴重度低（需使用者本就有含空白執行檔路徑的 allow 規則、無資料遺失語義）。
+- **deny 為硬性**：`classify` 對 builtin `deny` 短路，**不經** `permissions.allow` 升級層（升級層只把 `ask`
+  變 `allow`，永遠碰不到 `deny`）。`classify` 先評估指令規則：其硬 deny 優先於任何中央前置 ask。**四條中央
+  前置 ask 亦為硬性**——對所有指令通用、命中即不可升級（升級層只套用於「未列入 allowlist」與「指令規則
+  自身」的 ask），故寫入重導向 / cwd 超範圍 / 範圍外 `<` / 賦值前綴永不被 `Bash(...)` 升級。deny 漏判
+  （遞迴/根偵測未覆蓋、home env 缺失）只退回 `ask`，絕不誤放行。
 ```
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 4: 更新「hook 決策 vs settings.json 權限的優先序」段落（補中央前置不可升級的界線）**
+
+於 `CLAUDE.md` 的 `### hook 決策 vs settings.json 權限的優先序（重要）` 段落，找到以 `為解決此痛點，本檢查器在 runtime 讀取使用者的 `permissions.allow`：` 開頭、到 `那格從詢問改為放行（見 `permissions/` 與 `classify.ts` 的升級層）。` 結束的整段，替換為：
+
+```markdown
+為解決此痛點，本檢查器在 runtime 讀取使用者的 `permissions.allow`：當 builtin 判 `ask`、但該指令命中
+`permissions.allow`（且未被 `permissions.deny`/`ask` 命中）時，檢查器**自己回 `allow`**——等效把矩陣中
+`(hook=ask, settings=allow)` 那格從詢問改為放行（見 `permissions/` 與 `classify.ts` 的升級層）。**惟升級只
+套用於「可升級 ask」**：未列入 allowlist 的 ask、或指令規則自身的 ask；**四條中央前置安全 ask**（cwd 超範圍 /
+寫入重導向 / 賦值前綴 / 範圍外 `<`）對所有指令通用且**不可升級**，永不進升級層。
+```
+
+- [ ] **Step 5: 標注 DRAFT — 發現 A 已解、發現 B 維持已知限制**
+
+於 `docs/superpowers/specs/2026-06-27-settings-upgrade-matching-hardening-DRAFT.md` 頂端狀態引言區塊（以 `> **狀態：草稿（DRAFT）**` 開頭的整段引言）之後，新增一段更新註（原檔其餘內容保持不動；措辭自足、不引用其他 spec/plan 檔名）：
+
+```markdown
+> **更新（2026-06-27）**：**發現 A 已解**——中央前置規則已改為「對所有指令通用、不可由 `permissions.allow`
+> 升級」的硬 ask，升級層只套用於「未列入 allowlist」與「指令規則自身」的 ask。**發現 B 維持已知限制**：
+> exec/argv 去引號扁平化的跨界匹配未處理，沿用現行 deny 對稱守護（admin 加 path-equivalent deny 即可一致
+> 擋下），留待日後「結構化比對模型」設計；嚴重度低（需使用者本就有含空白執行檔路徑的 allow 規則、無資料
+> 遺失語義）。
+```
+
+- [ ] **Step 6: Commit**
 
 ```bash
 git add CLAUDE.md docs/superpowers/specs/2026-06-27-settings-upgrade-matching-hardening-DRAFT.md
@@ -399,6 +443,22 @@ Expected: `permissionDecision` 為 **`ask`**、exit 0。
 - [ ] **Step 5: 確認三項 operational verification 結果與預期一致**
 
 若 Step 2 或 Step 4 回 `allow`（未被擋下），代表中央前置未生效 → 回頭檢查 Task 1 的 classify.ts 重構。若 Step 3 回 `ask`，代表可升級路徑被誤收緊 → 同樣回頭檢查。三項皆符合預期才算完成。
+
+- [ ] **Step 6: 實作時純函式稽核再驗證（緩解 residual）**
+
+重跑前置稽核的兩項 grep，確認結果仍為「無輸出」：
+```bash
+grep -rnE "Deno\.(write|run|Command|create|remove|mkdir|open|truncate|copy|rename|symlink|link|chmod|chown|makeTemp)" src/rules/ ; echo "exit=$?"
+grep -rnE "^(let|var) " src/rules/ ; echo "exit=$?"
+```
+Expected: 兩者皆無輸出、`exit=1`（指令規則仍無副作用 API、無模組層可變狀態）。
+
+接著確認本次變更**未改動** `src/rules/`（唯二 deny 來源 `find.ts`/`factory.ts` 維持不變）。以「最後一次改動本計畫檔的 commit」（即實作前的最終計畫 commit）為基準，不受實作 commit 數影響：
+```bash
+PLAN_COMMIT=$(git rev-list -1 HEAD -- docs/superpowers/plans/2026-06-27-settings-upgrade-matching-hardening.md)
+git diff --name-only "$PLAN_COMMIT"..HEAD -- src/rules/
+```
+Expected: **無輸出**（`src/rules/` 下無任何檔案被改）。若有輸出 → 違反「只動 classify.ts」前提，停止並回報。
 
 ---
 
