@@ -73,6 +73,6 @@ export function classify(
   const v = classifyBuiltin(inv, scope, rules.webFetch);
   if (v.kind === "deny") return v; // 硬 deny：不經 settingsAllows 升級層
   if (v.kind === "allow") return v;
-  if (settingsAllows(inv, rules)) return allow();
+  if (settingsAllows(inv, rules, scope.home)) return allow();
   return v;
 }

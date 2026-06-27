@@ -119,23 +119,193 @@ function rulesOf(spec: { allow?: string[]; deny?: string[]; ask?: string[] }): P
 }
 
 Deno.test("settingsAllows: allow match -> true", () => {
-  assertEquals(settingsAllows(firstInv("npm test --silent"), rulesOf({ allow: ["Bash(npm test:*)"] })), true);
+  assertEquals(settingsAllows(firstInv("npm test --silent"), rulesOf({ allow: ["Bash(npm test:*)"] }), null), true);
 });
 
 Deno.test("settingsAllows: also denied -> false", () => {
   const rules = rulesOf({ allow: ["Bash(npm test:*)"], deny: ["Bash(npm test:*)"] });
-  assertEquals(settingsAllows(firstInv("npm test"), rules), false);
+  assertEquals(settingsAllows(firstInv("npm test"), rules, null), false);
 });
 
 Deno.test("settingsAllows: also asked -> false", () => {
   const rules = rulesOf({ allow: ["Bash(npm test:*)"], ask: ["Bash(npm test:*)"] });
-  assertEquals(settingsAllows(firstInv("npm test"), rules), false);
+  assertEquals(settingsAllows(firstInv("npm test"), rules, null), false);
 });
 
 Deno.test("settingsAllows: no allow match -> false", () => {
-  assertEquals(settingsAllows(firstInv("npm run build"), rulesOf({ allow: ["Bash(npm test:*)"] })), false);
+  assertEquals(settingsAllows(firstInv("npm run build"), rulesOf({ allow: ["Bash(npm test:*)"] }), null), false);
 });
 
 Deno.test("settingsAllows: non-reconstructable (dynamic) -> false", () => {
-  assertEquals(settingsAllows(firstInv("cat $FILE"), rulesOf({ allow: ["Bash(cat:*)"] })), false);
+  assertEquals(settingsAllows(firstInv("cat $FILE"), rulesOf({ allow: ["Bash(cat:*)"] }), null), false);
+});
+
+Deno.test("settingsAllows: ~ pattern + // command upgrades (the motivating case)", () => {
+  assertEquals(
+    settingsAllows(
+      firstInv("/home/me/proj//tool.sh --x"),
+      rulesOf({ allow: ["Bash(~/proj/tool.sh *)"] }),
+      "/home/me",
+    ),
+    true,
+  );
+});
+
+Deno.test("settingsAllows: ~ pattern not expanded when home is null -> no upgrade", () => {
+  assertEquals(
+    settingsAllows(
+      firstInv("/home/me/proj/tool.sh --x"),
+      rulesOf({ allow: ["Bash(~/proj/tool.sh *)"] }),
+      null,
+    ),
+    false,
+  );
+});
+
+Deno.test("settingsAllows: // folding upgrades without ~ (home irrelevant)", () => {
+  assertEquals(
+    settingsAllows(firstInv("/opt/t//run.sh --x"), rulesOf({ allow: ["Bash(/opt/t/run.sh *)"] }), null),
+    true,
+  );
+});
+
+Deno.test("settingsAllows: union non-regression - existing literal allow still matches", () => {
+  assertEquals(
+    settingsAllows(firstInv("npm test --silent"), rulesOf({ allow: ["Bash(npm test:*)"] }), null),
+    true,
+  );
+});
+
+Deno.test("settingsAllows: spaced exec path deny preserved via raw branch (not bypassed)", () => {
+  const rules = rulesOf({
+    allow: ["Bash(/o/My App/run.sh *)"],
+    deny: ["Bash(/o/My App/run.sh *)"],
+  });
+  assertEquals(settingsAllows(firstInv('"/o/My App/run.sh" x'), rules, null), false);
+});
+
+Deno.test("settingsAllows: spaced exec path allow matches via raw branch", () => {
+  assertEquals(
+    settingsAllows(firstInv('"/o/My App/run.sh" x'), rulesOf({ allow: ["Bash(/o/My App/run.sh *)"] }), null),
+    true,
+  );
+});
+
+Deno.test("settingsAllows: .. in command stays literal -> folded allow does not match", () => {
+  assertEquals(
+    settingsAllows(firstInv("/allowed/link/../tool x"), rulesOf({ allow: ["Bash(/allowed/tool *)"] }), null),
+    false,
+  );
+});
+
+Deno.test("settingsAllows: UNC fail-closed - local allow does not match UNC command", () => {
+  assertEquals(
+    settingsAllows(firstInv("//server/share/tool x"), rulesOf({ allow: ["Bash(/server/share/tool *)"] }), null),
+    false,
+  );
+});
+
+Deno.test("settingsAllows: identical UNC literal matches", () => {
+  assertEquals(
+    settingsAllows(firstInv("//server/share/tool x"), rulesOf({ allow: ["Bash(//server/share/tool *)"] }), null),
+    true,
+  );
+});
+
+Deno.test("settingsAllows: zero-segment pattern ./ does not match everything", () => {
+  assertEquals(settingsAllows(firstInv("rm -rf /"), rulesOf({ allow: ["Bash(./*)"] }), null), false);
+});
+
+Deno.test("settingsAllows: deny equivalent (only differs by //) blocks upgrade", () => {
+  const rules = rulesOf({
+    allow: ["Bash(/opt/t/run.sh *)"],
+    deny: ["Bash(/opt//t/run.sh *)"],
+  });
+  assertEquals(settingsAllows(firstInv("/opt/t/run.sh x"), rules, null), false);
+});
+
+Deno.test("settingsAllows: ask equivalent (only differs by //) blocks upgrade", () => {
+  const rules = rulesOf({
+    allow: ["Bash(/opt/t/run.sh *)"],
+    ask: ["Bash(/opt//t/run.sh *)"],
+  });
+  assertEquals(settingsAllows(firstInv("/opt/t/run.sh x"), rules, null), false);
+});
+
+Deno.test("settingsAllows: case mismatch is not aligned -> no upgrade (case-sensitive)", () => {
+  assertEquals(
+    settingsAllows(firstInv("/opt/t/run.sh x"), rulesOf({ allow: ["Bash(/Opt/T/run.sh *)"] }), null),
+    false,
+  );
+});
+
+// --- matcher-level acceptance for path normalization (not only the unit-level function) ---
+
+Deno.test("settingsAllows: middle . segment removal matches at matcher level", () => {
+  assertEquals(
+    settingsAllows(firstInv("/a/./b x"), rulesOf({ allow: ["Bash(/a/b *)"] }), null),
+    true,
+  );
+});
+
+Deno.test("settingsAllows: identical .. literal on both sides matches", () => {
+  assertEquals(
+    settingsAllows(
+      firstInv("/allowed/link/../tool x"),
+      rulesOf({ allow: ["Bash(/allowed/link/../tool *)"] }),
+      null,
+    ),
+    true,
+  );
+});
+
+Deno.test("settingsAllows: '..' inside filename does not trigger guard, // still folds", () => {
+  assertEquals(
+    settingsAllows(firstInv("/a//foo..bar x"), rulesOf({ allow: ["Bash(/a/foo..bar *)"] }), null),
+    true,
+  );
+});
+
+Deno.test("settingsAllows: prefix-loose with .. stays literal (a/..*), not overbroad", () => {
+  assertEquals(
+    settingsAllows(firstInv("a/../b x"), rulesOf({ allow: ["Bash(a/..*)"] }), null),
+    true,
+  );
+  assertEquals(
+    settingsAllows(firstInv("a/b x"), rulesOf({ allow: ["Bash(a/..*)"] }), null),
+    false,
+  );
+});
+
+Deno.test("settingsAllows: trailing-slash prefix boundary - matches child, not sibling", () => {
+  const rules = rulesOf({ allow: ["Bash(/a/scripts/*)"] });
+  assertEquals(settingsAllows(firstInv("/a/scripts/x y"), rules, null), true);
+  assertEquals(settingsAllows(firstInv("/a/scriptsEVIL y"), rules, null), false);
+});
+
+Deno.test("settingsAllows: relative pattern does not match absolute command", () => {
+  assertEquals(
+    settingsAllows(firstInv("/proj/scripts/run.sh x"), rulesOf({ allow: ["Bash(scripts/run.sh *)"] }), null),
+    false,
+  );
+});
+
+Deno.test("settingsAllows: relative pattern matches relative command (// folded)", () => {
+  assertEquals(
+    settingsAllows(firstInv("scripts//run.sh x"), rulesOf({ allow: ["Bash(scripts/run.sh *)"] }), null),
+    true,
+  );
+});
+
+Deno.test("settingsAllows: degenerate deny pattern ./ does not over-block unrelated allow", () => {
+  const rules = rulesOf({ allow: ["Bash(npm test:*)"], deny: ["Bash(./*)"] });
+  assertEquals(settingsAllows(firstInv("npm test x"), rules, null), true);
+});
+
+Deno.test("settingsAllows: spaced deny containing // still blocks via raw branch", () => {
+  const rules = rulesOf({
+    allow: ["Bash(/o/My App//run.sh *)"],
+    deny: ["Bash(/o/My App//run.sh *)"],
+  });
+  assertEquals(settingsAllows(firstInv('"/o/My App//run.sh" x'), rules, null), false);
 });

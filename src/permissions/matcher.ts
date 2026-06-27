@@ -1,5 +1,6 @@
 import type { CommandInvocation } from "../types.ts";
 import { staticValue } from "../engine/word.ts";
+import { canonicalizeExecPath } from "../engine/scope.ts";
 import type { PermissionRules } from "./settings.ts";
 
 /** 解析後的 Bash(...) 規則。prefix / text 經 parseBashRule 保證非空。 */
@@ -52,17 +53,11 @@ export function matchesAny(cmd: string, pats: BashPattern[]): boolean {
   return pats.some((p) => matchesPattern(cmd, p));
 }
 
-/**
- * 把 invocation 還原成單一可比對指令字串。
- * - name === null（動態指令名）→ null
- * - 有賦值前綴（VAR=val）→ null（env 前綴可改變行為，且 Claude Code 字面比對亦不會命中 cmd:*）
- * - 任一 argv 動態（變數 / $() / 未引號 glob，staticValue 回 null）→ null
- * 否則回 [name, ...argv 靜態值].join(" ")。引號值已去引號、不重新加引號；不含重導向。
- */
-export function reconstructCommand(inv: CommandInvocation): string | null {
+/** 以 nameOf 轉換執行檔名後還原指令字串；null 條件與原 reconstructCommand 相同。 */
+function reconstructWith(inv: CommandInvocation, nameOf: (name: string) => string): string | null {
   if (inv.name === null) return null;
   if (inv.assignments.length > 0) return null;
-  const parts: string[] = [inv.name];
+  const parts: string[] = [nameOf(inv.name)];
   for (const w of inv.argv) {
     const v = staticValue(w);
     if (v === null) return null;
@@ -72,15 +67,67 @@ export function reconstructCommand(inv: CommandInvocation): string | null {
 }
 
 /**
- * 綜合判定：此 invocation 是否應依 settings 升級為 allow。
- *   cmd = reconstructCommand(inv)；null → false
- *   matchesAny(cmd, deny) 或 matchesAny(cmd, ask) → false（完整優先序）
- *   matchesAny(cmd, allow) → true；否則 false
+ * 把 invocation 還原成單一可比對指令字串。
+ * - name === null（動態指令名）→ null
+ * - 有賦值前綴（VAR=val）→ null（env 前綴可改變行為，且 Claude Code 字面比對亦不會命中 cmd:*）
+ * - 任一 argv 動態（變數 / $() / 未引號 glob，staticValue 回 null）→ null
+ * 否則回 [name, ...argv 靜態值].join(" ")。引號值已去引號、不重新加引號；不含重導向。
  */
-export function settingsAllows(inv: CommandInvocation, rules: PermissionRules): boolean {
-  const cmd = reconstructCommand(inv);
-  if (cmd === null) return false;
-  if (matchesAny(cmd, rules.bash.deny)) return false;
-  if (matchesAny(cmd, rules.bash.ask)) return false;
-  return matchesAny(cmd, rules.bash.allow);
+export function reconstructCommand(inv: CommandInvocation): string | null {
+  return reconstructWith(inv, (name) => name);
+}
+
+/** 正規化執行檔名後的指令字串（canonCmd）。argv 不正規化。 */
+function reconstructCanonical(inv: CommandInvocation, home: string | null): string | null {
+  return reconstructWith(inv, (name) => canonicalizeExecPath(name, home));
+}
+
+/** 對 pattern 的第一個空白前 head token 套 canonicalizeExecPath，其餘原樣。 */
+function canonicalizeHead(s: string, home: string | null): string {
+  const sp = s.indexOf(" ");
+  if (sp === -1) return canonicalizeExecPath(s, home);
+  return canonicalizeExecPath(s.slice(0, sp), home) + s.slice(sp);
+}
+
+/** 產生 pattern 的正規化版本（canonPat），head token 正規化、其餘原樣。 */
+function canonicalizePattern(pat: BashPattern, home: string | null): BashPattern {
+  switch (pat.kind) {
+    case "exact":
+      return { kind: "exact", text: canonicalizeHead(pat.text, home) };
+    case "prefix-boundary":
+      return { kind: "prefix-boundary", prefix: canonicalizeHead(pat.prefix, home) };
+    case "prefix-loose":
+      return { kind: "prefix-loose", prefix: canonicalizeHead(pat.prefix, home) };
+  }
+}
+
+/** union 命中：(rawCmd vs rawPat) ∨ (canonCmd vs canonPat)，跨整組 patterns。 */
+function matchesRuleSet(
+  rawCmd: string,
+  canonCmd: string,
+  pats: BashPattern[],
+  home: string | null,
+): boolean {
+  return pats.some((p) =>
+    matchesPattern(rawCmd, p) || matchesPattern(canonCmd, canonicalizePattern(p, home))
+  );
+}
+
+/**
+ * 綜合判定：此 invocation 是否應依 settings 升級為 allow。
+ * union 比對：指令與 pattern 各保留 raw / canon 兩形式，命中 ⟺ (rawCmd vs rawPat) ∨ (canonCmd vs canonPat)。
+ * 三組 deny/ask/allow 對稱套用；raw↔raw 完整重現現行行為，正規化只增不減命中，故不弱化任何 deny/ask。
+ */
+export function settingsAllows(
+  inv: CommandInvocation,
+  rules: PermissionRules,
+  home: string | null,
+): boolean {
+  const rawCmd = reconstructCommand(inv);
+  if (rawCmd === null) return false;
+  const canonCmd = reconstructCanonical(inv, home);
+  if (canonCmd === null) return false; // 與 rawCmd 同步，理論上不會發生
+  if (matchesRuleSet(rawCmd, canonCmd, rules.bash.deny, home)) return false;
+  if (matchesRuleSet(rawCmd, canonCmd, rules.bash.ask, home)) return false;
+  return matchesRuleSet(rawCmd, canonCmd, rules.bash.allow, home);
 }
