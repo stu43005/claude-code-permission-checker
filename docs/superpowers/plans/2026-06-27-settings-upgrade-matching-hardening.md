@@ -328,20 +328,20 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 ## Task 3: 更新 `CLAUDE.md` 架構說明 + 標注 DRAFT（發現 A 已解、發現 B 為已知限制）
 
 **Files:**
-- Modify: `CLAUDE.md`（五處：「架構（評估管線）」的 `classify.ts` 條目、「四條中央前置規則」段落、「核心不變量」的「deny 為硬性」條目、「hook 決策 vs settings.json 權限的優先序」段落、「新增 / 修改指令規則」的「不要重複處理」指引）
+- Modify: `CLAUDE.md`（七處：開頭「這是什麼」的 runtime 升級簡介、operational verification 的「binary 回 allow…功能正常」警告、「架構（評估管線）」的 `classify.ts` 條目、「四條中央前置規則」段落、「核心不變量」的「deny 為硬性」條目、「hook 決策 vs settings.json 權限的優先序」段落、「新增 / 修改指令規則」的「不要重複處理」指引）
 - Modify: `docs/superpowers/specs/2026-06-27-settings-upgrade-matching-hardening-DRAFT.md`（頂端狀態區塊加更新註）
 
 - [ ] **Step 1: 更新「架構（評估管線）」的 `classify.ts` 條目**
 
-於 `CLAUDE.md` 找到描述 `classify.ts` 「分兩層」的那條 bullet（以 `**`classify.ts`** 分兩層` 開頭），整條替換為反映新流程的描述（自足、不引用 spec/plan 文件）：
+於 `CLAUDE.md` 找到描述 `classify.ts` 「分兩層」的那條 bullet（以 `**`classify.ts`** 分兩層` 開頭）。**只替換**該 bullet 從 `**`classify.ts`** 分兩層：` 起、到 `不受 rules 影響）。` 為止的部分；**保留其後**「此外，builtin 回 `deny`（遞迴遍歷磁碟根/家目錄根…）時**先於升級層短路返回**…故 `permissions.allow` 無法解除此 deny。」整句不動。被替換部分改為（自足、不引用 spec/plan 文件）：
 
 ```markdown
 - **`classify.ts`** 單一有序流程：① `name` 為 null（動態）→ 不可升級 ask；② 評估指令規則，其硬 `deny`
   （遞迴遍歷磁碟根/家目錄根）最優先短路、不經中央前置與升級層；③ **四條中央前置規則**（見下）對
   **所有指令**（含未列入 allowlist 者）通用、命中即回**不可升級** ask；④ 可升級 ask（未列入 allowlist、
   或指令規則自身 ask）才呼叫 `settingsAllows` 嘗試以 `permissions.allow` 升級為 `allow`（命中 allow 且未被
-  deny/ask 命中才升級）；⑤ 指令規則 `allow` → allow。純函式 `centralPreflightAsk` 封裝步驟 ③。
-  **中央前置 ask 永不進升級層。**
+  deny/ask 命中才升級；builtin 已判 `allow` 者原樣返回，不受 rules 影響）；⑤ 指令規則 `allow` → allow。
+  純函式 `centralPreflightAsk` 封裝步驟 ③。**中央前置 ask 永不進升級層。**
 ```
 
 - [ ] **Step 2: 更新「四條中央前置規則」段落開頭描述**
@@ -391,7 +391,26 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 故規則無論回什麼都不影響這四項的最終結果。
 ```
 
-- [ ] **Step 6: 標注 DRAFT — 發現 A 已解、發現 B 維持已知限制**
+- [ ] **Step 6: 更新檔案頂端「runtime 讀 `permissions.allow`」簡介（限定為「可升級 ask」）**
+
+於 `CLAUDE.md` 開頭「這是什麼」段落，找到以 `此外，會在 runtime 讀取使用者的 `permissions.allow`：原本會 `ask`` 開頭、到 `（見「hook 決策 vs settings.json 權限的優先序」）。` 結束的句子（跨兩行），整句替換為：
+
+```markdown
+此外，會在 runtime 讀取使用者的 `permissions.allow`：對**可升級 ask**（未列入 allowlist、或指令規則自身的
+ask）——已被使用者在 settings.json 明確放行（且未被 `deny`/`ask` 命中）者，升級為 `allow`；**四條中央前置
+安全 ask**（cwd 超範圍／寫入重導向／賦值前綴／範圍外 `<`）對所有指令通用且**不可升級**（見「hook 決策 vs
+settings.json 權限的優先序」）。
+```
+
+- [ ] **Step 7: 更新 operational verification 的「binary 回 allow…功能正常」警告（加中央前置例外）**
+
+於 `CLAUDE.md` 找到以 `**⚠️ binary 回 `allow` 但 builtin 應為 `ask` 時` 開頭的整段警告（到 `…或在不含對應 `permissions.allow` 的環境下餵 JSON。` 結束，跨數行），在該段**末尾**（`…餵 JSON。` 之後）補一句界線提醒（其餘文字保持不動）：
+
+```markdown
+但此「合法升級」**僅限可升級 ask**：若 binary 對帶**寫入重導向／cwd 超範圍／賦值前綴／範圍外 `<`** 的指令回 `allow`，那**是 regression、不是功能正常**——這四條中央前置安全 ask 對所有指令通用且不可由 `permissions.allow` 升級（例：`npm test --x > /etc/passwd` 即使命中 `Bash(npm test:*)` 仍須 `ask`）。
+```
+
+- [ ] **Step 8: 標注 DRAFT — 發現 A 已解、發現 B 維持已知限制**
 
 於 `docs/superpowers/specs/2026-06-27-settings-upgrade-matching-hardening-DRAFT.md` 頂端狀態引言區塊（以 `> **狀態：草稿（DRAFT）**` 開頭的整段引言）之後，新增一段更新註（原檔其餘內容保持不動；措辭自足、不引用其他 spec/plan 檔名）：
 
@@ -403,7 +422,7 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 > 遺失語義）。
 ```
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 9: Commit**
 
 ```bash
 git add CLAUDE.md docs/superpowers/specs/2026-06-27-settings-upgrade-matching-hardening-DRAFT.md
