@@ -95,12 +95,14 @@ return verdict
 ### 4.3 `ctx` 與中央前置的相依
 
 - 步驟 2 建構 `RuleContext`（`resolvePath`/`resolvePathValue`/`resolveUrl`/`isDangerousRoot` 綁定 `inv.cwd` 與 `scope`/`webFetch`），與現行 `classifyBuiltin` 完全相同。
-- 步驟 3 四條中央前置所需資料皆與 rule 無關，對非-allowlist 指令同樣可計算：
+- 步驟 3 四條中央前置所需資料皆與 rule 無關，對非-allowlist 指令同樣可計算；建議抽成一個純函式
+  `centralPreflightAsk(inv, scope): RuleVerdict | null`（命中回不可升級的 `ask`，否則 `null`），讓重構標的可獨立測試：
   - cwd：`isReadScoped(normalizeAbsolute(inv.cwd.path), scope)`（既有 import）。
   - 寫入重導向：`hasWriteRedirect(inv.redirects)`（既有 import）。
   - 賦值前綴：`inv.assignments.length`。
   - 範圍外 `<`：`resolvePath(r.target, inv.cwd, scope)`（既有 import）。
 - 四條的 `ask` 理由字串沿用現行文案（`classify.ts:35,39,43,50`），不新增/不改寫。
+- 步驟 4 **只**處理兩種可升級 ask（無 rule、或 `ruleVerdict.kind === "ask"`）；in-project 的 `<` 輸入重導向本身**不**強制走升級路徑（中央前置 d 不命中時，最終判定退回該指令既有 verdict）。
 
 ### 4.4 行為變更矩陣
 
@@ -122,7 +124,7 @@ return verdict
 | `cat README.md` | `Bash(cat:*)` | allow | 指令規則 allow（無中央前置） |
 | 指令規則自身範圍外讀取 ask | `Bash(<cmd> <path>)` / `Read(...)` | 可升級 | 非中央前置，仍可由 settings/Read 放寬 |
 | `FOO=bar <cmd>`（賦值前綴） | 任意 | ask | 本就不升級（reconstruct 回 null），無變化 |
-| `<cmd> < projfile`（target 在專案內，或 Read() 已放寬） | 任意 | 走可升級區 | 中央前置 d 看的是放寬後 scope，不命中 |
+| `<cmd> < projfile`（target 在專案內，或 Read() 已放寬） | 任意 | 同無 redirect 時的判定 | 中央前置 d 看的是放寬後 scope、不命中，故**不**自身觸發升級；最終判定退回該指令既有結果（rule allow → allow；rule ask 或未列入 allowlist → 才依步驟 4 嘗試升級）。in-project `<` 本身不是升級候選 |
 
 ### 4.5 不變量（不可違反）
 
