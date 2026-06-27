@@ -97,7 +97,7 @@ canonicalizeExecPath(token: string, home: string | null): string
    - 對 head 套 `canonicalizeExecPath(head, home)`（尾斜線保留已內含）；其餘字串（第一個空白起之後）原樣保留，組回同 `kind` 的新 `BashPattern`。
    - 第一個空白前無內容或 pattern 無空白（prefix-loose 常態）→ 整個 `text`/`prefix` 視為 head。
    - **head-split 僅影響 pattern 側、且受 union 保護**：若 pattern 的執行檔路徑含空白（引號/跳脫），head-split 可能只正規化空白前段——但因 union 仍比對 `(rawCmd vs rawPat)`，原始字面行為完整保留，最壞情況只是「該 pattern 拿不到正規化加成、回退 raw」，**絕不**破壞或弱化原規則（見 §4.5 不變量 1）。
-4. **union 命中函式（含執行檔邊界閘）**：對某組 patterns，命中 ⟺ `∃pat: matchesPattern(rawCmd, pat) ∨ (canonLen(canonicalizePattern(pat, home)) ≤ canonExecLen ∧ matchesPattern(canonCmd, canonicalizePattern(pat, home)))`，其中 `canonExecLen = canonicalizeExecPath(inv.name, null).length`、`canonLen` 取 canonPat 的 `text`/`prefix` 長度。**執行檔邊界閘**確保 canon 分支的匹配侷限在 canon 執行檔 token 內、不跨入 argv（見 §4.5 不變量 11）。raw 分支不受閘影響。
+4. **union 命中函式**：對某組 patterns，命中 ⟺ `∃pat: matchesPattern(rawCmd, pat) ∨ matchesPattern(canonCmd, canonicalizePattern(pat, home))`。canon 對 deny / ask / allow **三組以同一條 `canonCmd` 一致扁平比對**；此一致性即關鍵安全性質（見 §4.5 不變量 11）：argv-specific 的更具體 deny/ask 與 exec-only allow 走同一條 canonCmd，且 deny/ask 先評估，故凡 allow 會命中者其 path-equivalent 的 deny/ask 也由 canon 命中而擋下。
 5. 優先序不變：deny union 命中 → `false`；ask union 命中 → `false`；回 allow union 命中。
 
 `parseBashRule` 已保證 prefix 不含 `*`，故 head 必無 glob 字元，正規化安全。
@@ -114,7 +114,7 @@ canonicalizeExecPath(token: string, home: string | null): string
 8. **不擴大放寬面**：本層只改變「字串比對的等價類」，不新增任何可被升級的指令類型；動態名 / 賦值前綴 / 動態 argv 仍回 `null`、不升級。
 9. **類別保留 fail-closed（path-exec vs PATH-lookup）**：shell 中「含 `/` 的 token」一律以路徑執行該檔，「不含 `/` 的 token」走 `PATH` 查找——兩者語義不同檔。相對正規化（折疊 `//`、移除 `.` 段）**不得跨越此邊界**：若 token 原含 `/` 卻塌成無 `/` 的裸名（`./npm` → `npm`、`a/.` → `a`），會把本機相對檔 `./npm` 誤升級為受信任的 PATH 規則 `Bash(npm *)`（或令 `Bash(./tool *)` 誤配裸 `tool`）。故此類 token **原樣留字面**（§4.2 規則 5），只配相同字面 pattern（至多 ask）。深層相對 `./a/b` → `a/b` 仍含 `/`、指向同一檔，屬合法等價、照常正規化。
 10. **指令側不展開 `~`（quoted-tilde 安全）+ 不破壞 union 同形式**：指令側 `canonCmd` 以 `canonicalizeExecPath(inv.name, null)` 構造，**永不展開指令側 `~`**。`inv.name` 已去引號，無法區分原 token 帶不帶引號；bash 對引號 `"~/x"` **不**展開 `~`，若指令側展開會把字面 `~` 檔名誤當家目錄絕對路徑而誤升級。pattern 側仍以真實 `home` 展開（settings pattern 由使用者撰寫、本意即展開）。此「指令側 null、pattern 側 home」的**不對稱**仍屬 canon↔canon 同形式比對（不違反不變量 1 的「禁止跨形式」）：raw↔raw 分支完整保留；canon 分支對 allow 只在「指令本就是該絕對家目錄路徑」時命中（真語義等價、正確），對 deny/ask 仍是現行命中的超集（只增不減）。代價：未引號的 `~/x` 指令對「絕對 home pattern」拿不到正規化加成（回退 raw），屬**安全方向**（至多 ask、絕不誤放）。
-11. **執行檔邊界閘（canon 匹配不得跨 exec/argv 邊界）**：`canonCmd` 由 `canonicalizeExecPath(inv.name)` 折疊後與 argv 以空白拼接而成；若不設限，含空白的執行檔路徑 pattern 可能跨越指令的 exec/argv 邊界誤配——例如指令執行 `/tmp//My`（exec 折疊為 `/tmp/My`）、argv 為 `App/run.sh`，拼成 `canonCmd = "/tmp/My App/run.sh …"` 會誤配 allow `Bash(/tmp/My App/run.sh *)`（該規則針對的是**另一個**執行檔）。故 canon 分支加閘：canonPat 的比對長度（`text`/`prefix` 長度）**不得超過 canon 執行檔名長度** `canonExecLen`，使匹配侷限在 exec token、不溢入 argv。**對稱性與安全**：閘對 deny/ask/allow 同樣施加，只移除 canon 跨界匹配；raw 分支不受影響、完整保留，故 deny 命中集合仍 ⊇ 官方（不弱化）、allow 只縮小（更安全）。motivating case（pattern 的執行檔路徑 == 指令 exec token，長度相等）`≤` 成立、照常命中。代價：含 `//` 的指令搭配「把 argv 寫進 prefix」的 pattern 拿不到 canon 加成（回退 raw），屬安全方向。
+11. **canon 三組一致扁平 → deny 對稱（不得對 deny/ask 設「執行檔長度閘」）**：`canonCmd` 由 `canonicalizeExecPath(inv.name, null)` 折疊後與 argv 以空白拼接而成。deny / ask / allow 三組**必須用同一條 `canonCmd` 一致比對**，不可對某組（如僅 allow）施加「pattern 比對長度 ≤ canon 執行檔名長度」之類的閘。**理由（安全）**：若對 canon 比對加「執行檔長度閘」，會把**較長的 argv-specific deny/ask**（長度 > 執行檔名）排除在 canon 之外，卻保留**較短的 exec-only allow**（長度 == 執行檔名）→ 指令 `/opt/t//run.sh --danger x` 在 allow `Bash(/opt/t/run.sh *)` + deny `Bash(/opt/t/run.sh --danger:*)` 下會被升級（deny 被閘跳過、allow 命中），**真實 deny-bypass**。一致扁平則保證：argv-specific deny/ask 與 exec-only allow 走同一條 canonCmd，deny/ask 先評估，凡 allow 會命中者其 path-equivalent deny/ask 也命中而擋下。**已知代價**：`reconstructCommand` 對 exec+argv 去引號後以空白拼接（**既有行為、與本正規化無關**：raw 經單斜線拼寫亦如此），故含空白執行檔路徑的 pattern 可能跨 exec/argv 邊界匹配（如 `Bash(/tmp/My App/run.sh *)` 命中執行 `/tmp//My`、argv `App/run.sh` 的指令）。此屬 `reconstructCommand` 既存扁平化歧義（見 §6 限制 10）、非本層新增能力；canon 與 raw 一致，且 path-equivalent 的 deny 仍由對稱性擋下。
 
 ### 4.6 端到端驗證（核可用例）
 
@@ -146,6 +146,7 @@ canonicalizeExecPath(token: string, home: string | null): string
 9. **退化路徑（塌成空/裸根）留字面**：`./`（→空）、`/.`（→`/`）等正規化後會塌成空/裸根者，改回原 token literal（§4.2 零段 fail-closed / §4.5 不變量 6），不產生過廣 prefix。
 10. **含 `/` 塌成裸名的相對 token 留字面（類別保留）**：`./npm`、`a/.` 等原含 `/` 卻會塌成無 `/` 裸名者一律留字面（§4.2 規則 5 / §4.5 不變量 9），避免 path-exec 與 PATH-lookup 混淆。`./a/b` → `a/b`（仍含 `/`）屬合法等價、不在此列。
 11. **指令側 `~` 不展開**：`canonCmd` 以 `home = null` 構造，未引號或引號的 `~/x` 指令一律不展開 `~`（§4.5 不變量 10）；只有 pattern 側的 `~` 會展開。代價是「未引號 `~/x` 指令 × 絕對 home pattern」拿不到加成（回退 raw、至多 ask），換取 quoted-tilde 不被誤升級。
+12. **exec+argv 扁平化歧義（`reconstructCommand` 既有、非本層引入）**：`reconstructCommand` 把 exec 與 argv 去引號後以單一空白拼接成一條字串供比對。因此含空白的執行檔路徑 pattern 可能跨越 exec/argv 邊界匹配——例如 allow `Bash(/tmp/My App/run.sh *)` 會命中「執行 `/tmp/My`、首個 argv 為 `App/run.sh`」的指令。**此為 `reconstructCommand` 的既存性質、與本正規化層無關**：raw 經單斜線拼寫（`"/tmp/My" "App/run.sh"`）即已如此，本層只是讓 `//` 拼寫也走同一路徑、**未新增能力**。canon 與 raw 對此一致；且因 deny/ask 與 allow 一致扁平比對（§4.5 不變量 11），path-equivalent 的 deny 仍會擋下。修正 `reconstructCommand` 的扁平化（保留 exec/argv 邊界）屬獨立議題，不在本層範圍。
 
 ## 7. 測試計畫
 

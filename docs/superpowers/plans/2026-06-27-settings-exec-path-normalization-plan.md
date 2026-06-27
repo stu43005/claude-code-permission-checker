@@ -214,7 +214,7 @@ git commit -m "feat(scope): add canonicalizeExecPath for exec-path lexical norma
 > **安全 hardening（把 `canonicalizeExecPath` 接入比對後才浮現的三道比對專屬安全性質，故歸於本 Task）**：
 > 1. **類別保留 fail-closed（scope.ts，spec §4.5 不變量 9）**：相對正規化不得把「含 `/` 的路徑 token」（bash 以路徑執行）塌成「無 `/` 的裸名」（PATH 查找）——否則 `./npm install` 會被 `Bash(npm *)` 誤升級。在 `canonicalizeExecPath` 相對分支加守門：`posix.includes("/") && !normalized.includes("/")` → 原樣返回 token。`./a/b` → `a/b`（仍含 `/`）屬合法等價、不受影響。
 > 2. **指令側不展開 `~`（matcher.ts，spec §4.5 不變量 10）**：`reconstructCanonical` 指令側固定以 `canonicalizeExecPath(inv.name, null)` 構造 `canonCmd`，**永不展開指令側 `~`**（引號 `"~/x"` 在 bash 不展開，而 `inv.name` 已去引號無法區分，展開會誤升級）。pattern 側仍以真實 `home` 展開。`//` 折疊與 `.` 移除不需 `home`、照常運作。
-> 3. **執行檔邊界閘（matcher.ts，spec §4.5 不變量 11）**：canon 分支加閘——canonPat 的比對長度（`patternMatchLen`）不得超過 canon 執行檔名長度 `canonExecLen`，使 canon 匹配侷限於 exec token、不跨入 argv。否則 `//` 折疊後 exec 與 argv 拼接，會讓含空白執行檔路徑的 pattern（如 `Bash(/tmp/My App/run.sh *)`）跨界誤配執行 `/tmp//My` 的指令。raw 不受閘影響；閘對 deny/ask/allow 對稱、相對官方不弱化 deny、不放寬 allow。
+> 3. **canon 三組一致扁平 → deny 對稱（matcher.ts，spec §4.5 不變量 11）**：deny/ask/allow 三組以同一條 `canonCmd` 一致扁平比對，**不可**對某組施加「pattern 長度 ≤ 執行檔名長度」之類閘。一致性即安全性質：argv-specific 的 canon deny/ask 與 exec-only canon allow 走同一條 canonCmd、deny/ask 先評估，故凡 allow 會命中者其 path-equivalent deny/ask 也擋下（指令 `/opt/t//run.sh --danger x` 在 allow `Bash(/opt/t/run.sh *)`＋deny `Bash(/opt/t/run.sh --danger:*)` 下被擋）。曾試以「執行檔長度閘」修 exec+argv 扁平化跨界匹配，反而排除較長的 argv deny、保留較短 exec-only allow → 真實 deny-bypass，故撤除。exec+argv 扁平化歧義屬 `reconstructCommand` 既有性質（spec §6 限制 12）、非本層引入，由 deny 對稱保護。
 
 - [ ] **Step 1: 寫失敗測試（union / ~ / // / fail-closed / ask / case）**
 
@@ -460,29 +460,23 @@ function canonicalizePattern(pat: BashPattern, home: string | null): BashPattern
   }
 }
 
-/** canonPat 的「執行檔比對長度」：exact 取 text、prefix 類取 prefix 的長度。 */
-function patternMatchLen(pat: BashPattern): number {
-  return pat.kind === "exact" ? pat.text.length : pat.prefix.length;
-}
-
 /**
  * union 命中：(rawCmd vs rawPat) ∨ (canonCmd vs canonPat)，跨整組 patterns。
- * canon 分支加「執行檔邊界閘」：canonPat 的比對長度不得超過 canon 執行檔名長度 canonExecLen，
- * 使 canon 匹配侷限於 exec token、不跨入 argv（防 // 折疊後 exec 與 argv 拼接誤配含空白執行檔路徑 pattern）。
- * raw 分支不受閘影響；閘對 deny/ask/allow 對稱施加，相對官方 baseline 不弱化 deny、不放寬 allow。
+ * canon 對 deny/ask/allow 三組「一致扁平」比對（皆 canonCmd vs canonPat）。一致性即關鍵安全性質
+ * （spec §4.5 不變量 11）：argv-specific 的 canon deny/ask 與 exec-only 的 canon allow 走同一條
+ * canonCmd，deny/ask 先評估，故凡 exec-only allow 會命中的指令、其 path-equivalent 更具體 deny/ask
+ * 也由 canon 命中而擋下。**不可**對某組施加「pattern 長度 ≤ 執行檔名長度」之類閘——否則較長的 argv
+ * deny 被排除、較短的 exec-only allow 仍命中 → 真實 deny-bypass。
  */
 function matchesRuleSet(
   rawCmd: string,
   canonCmd: string,
-  canonExecLen: number,
   pats: BashPattern[],
   home: string | null,
 ): boolean {
-  return pats.some((p) => {
-    if (matchesPattern(rawCmd, p)) return true;
-    const cp = canonicalizePattern(p, home);
-    return patternMatchLen(cp) <= canonExecLen && matchesPattern(canonCmd, cp);
-  });
+  return pats.some((p) =>
+    matchesPattern(rawCmd, p) || matchesPattern(canonCmd, canonicalizePattern(p, home))
+  );
 }
 ```
 
@@ -501,13 +495,11 @@ export function settingsAllows(
 ): boolean {
   const rawCmd = reconstructCommand(inv);
   if (rawCmd === null) return false;
-  if (inv.name === null) return false; // rawCmd 非 null 已蘊含，但讓 canonExecName 取值型別安全
   const canonCmd = reconstructCanonical(inv);
   if (canonCmd === null) return false; // 與 rawCmd 同步，理論上不會發生
-  const canonExecLen = canonicalizeExecPath(inv.name, null).length;
-  if (matchesRuleSet(rawCmd, canonCmd, canonExecLen, rules.bash.deny, home)) return false;
-  if (matchesRuleSet(rawCmd, canonCmd, canonExecLen, rules.bash.ask, home)) return false;
-  return matchesRuleSet(rawCmd, canonCmd, canonExecLen, rules.bash.allow, home);
+  if (matchesRuleSet(rawCmd, canonCmd, rules.bash.deny, home)) return false;
+  if (matchesRuleSet(rawCmd, canonCmd, rules.bash.ask, home)) return false;
+  return matchesRuleSet(rawCmd, canonCmd, rules.bash.allow, home);
 }
 ```
 
