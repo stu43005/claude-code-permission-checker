@@ -73,6 +73,14 @@ Deno.test("e2e: command matching settings allow -> allow (upgrade)", async () =>
   assertEquals(JSON.parse(out).hookSpecificOutput.permissionDecision, "allow");
 });
 
+Deno.test("e2e: settings allow + 寫入重導向 -> ask（中央前置不可升級）", async () => {
+  const out = await runHook(
+    { tool_name: "Bash", tool_input: { command: "npm test --x > /etc/passwd" }, cwd: SETTINGS_FIXTURE },
+    SETTINGS_FIXTURE,
+  );
+  assertEquals(JSON.parse(out).hookSpecificOutput.permissionDecision, "ask");
+});
+
 Deno.test("e2e: command not in settings allow -> ask", async () => {
   const out = await runHook(
     { tool_name: "Bash", tool_input: { command: "npm run build" }, cwd: SETTINGS_FIXTURE },
