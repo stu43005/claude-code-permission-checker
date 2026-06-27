@@ -5,6 +5,12 @@
 > 供日後**另起** brainstorming → spec → writing-plans → implementation 流程處理。兩者皆**非**本次正規化
 > feature 新增的能力（單斜線拼寫早已觸發），故當時刻意未在該 feature 內修。
 
+> **更新（2026-06-27）**：**發現 A 已解**——中央前置規則已改為「對所有指令通用、不可由 `permissions.allow`
+> 升級」的硬 ask，升級層只套用於「未列入 allowlist」與「指令規則自身」的 ask。**發現 B 維持已知限制**：
+> exec/argv 去引號扁平化的跨界匹配未處理，沿用現行 deny 對稱守護（admin 加 path-equivalent deny 即可一致
+> 擋下），留待日後「結構化比對模型」設計；嚴重度低（需使用者本就有含空白執行檔路徑的 allow 規則、無資料
+> 遺失語義）。
+
 ## 0. 共同根因
 
 `settingsAllows`（`src/permissions/matcher.ts`）判定「是否依 `permissions.allow` 把 builtin 的 `ask` 升級為
