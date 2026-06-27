@@ -283,6 +283,19 @@ Deno.test("canonicalizeExecPath: deeper ./a/b still normalizes (stays a path)", 
   assertEquals(canonicalizeExecPath("./a//b", null), "a/b");
 });
 
+Deno.test("canonicalizeExecPath: ~ expansion into a UNC home is declined (fail-closed)", () => {
+  assertEquals(canonicalizeExecPath("~/tool", "//server/share/user"), "~/tool");
+  assertEquals(canonicalizeExecPath("~", "//server/share/user"), "~");
+});
+
+Deno.test("canonicalizeExecPath: ~ expansion into a home with a .. segment is declined", () => {
+  assertEquals(canonicalizeExecPath("~/tool", "/home/../etc"), "~/tool");
+});
+
+Deno.test("canonicalizeExecPath: ~ expansion into a normal absolute home still works", () => {
+  assertEquals(canonicalizeExecPath("~/tool", "/home/me"), "/home/me/tool");
+});
+
 Deno.test("isReadScoped: trusted root grants read; root-first and deny/ask override", () => {
   const SID = "/home/me/.claude/projects/-proj/115826ef-e830-461f-8101-edac56694d2b";
   const scope: ScopeConfig = { ...rootScope("/proj"), trusted: [SID] };

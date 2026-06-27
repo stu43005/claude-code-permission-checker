@@ -424,6 +424,17 @@ Deno.test("settingsAllows: path-equivalent deny blocks the exec/argv flattening 
   assertEquals(settingsAllows(firstInv('"/tmp//My" "App/run.sh" evil'), rules, null), false);
 });
 
+Deno.test("settingsAllows: ~ pattern with UNC home does not allow the rewritten local path (fail-closed)", () => {
+  assertEquals(
+    settingsAllows(
+      firstInv("/server/share/user/tool x"),
+      rulesOf({ allow: ["Bash(~/tool *)"] }),
+      "//server/share/user",
+    ),
+    false,
+  );
+});
+
 Deno.test("settingsAllows: exec-only pattern still upgrades a // command (in-exec match)", () => {
   // The motivating shape: pattern's exec-path == command's exec token (after // folding).
   assertEquals(
