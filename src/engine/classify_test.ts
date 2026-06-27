@@ -276,3 +276,26 @@ Deno.test("命令規則硬 deny 不被中央前置 ask 遮蔽，且不可由 Bas
   assertEquals(onlyWith("find / > out.txt", rulesOf({ allow: ["Bash(find *)"] })).kind, "deny");
   assertEquals(onlyWith("find / < /etc/passwd", rulesOf({ allow: ["Bash(find *)"] })).kind, "deny");
 });
+
+function classifyWithHome(src: string, rules: PermissionRules, home: string | null) {
+  const invs = walk(parseCommand(src).script, START, ROOT);
+  return classify(invs[0], ROOT, rules, home);
+}
+
+Deno.test("classify: settings ~ allow + // command upgrades to allow", () => {
+  assertEquals(
+    classifyWithHome(
+      "/home/me/proj//tool.sh --x",
+      rulesOf({ allow: ["Bash(~/proj/tool.sh *)"] }),
+      "/home/me",
+    ).kind,
+    "allow",
+  );
+});
+
+Deno.test("classify: settings absolute allow + // command upgrades (home null)", () => {
+  assertEquals(
+    onlyWith("/opt/t//run.sh --x", rulesOf({ allow: ["Bash(/opt/t/run.sh *)"] })).kind,
+    "allow",
+  );
+});
