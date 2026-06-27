@@ -151,6 +151,10 @@ export function canonicalizeExecPath(token: string, home: string | null): string
   if (token === "~" || token.startsWith("~/")) {
     if (home === null) return token;
     work = token === "~" ? home : home + token.slice(1); // "~/x" -> home + "/x"
+    // 展開後重檢 fail-closed：home 本身為 UNC（前導 //）或含 `..` 段時，展開結果會把 UNC 根
+    // 折疊成本機絕對路徑、或在 symlink 下失真 → 拒絕展開、原樣返回 token（規則 2/3 套於展開後路徑）。
+    const expanded = toPosix(work);
+    if (expanded.startsWith("//") || hasDotDotSegment(expanded)) return token;
   }
 
   const posix = toPosix(work);
