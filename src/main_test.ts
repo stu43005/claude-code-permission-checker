@@ -129,6 +129,24 @@ Deno.test("e2e: compound allow + recursive-root -> deny (最弱環節)", async (
   assertEquals(JSON.parse(out).hookSpecificOutput.permissionDecision, "deny");
 });
 
+/**
+ * 父行程實際的 DENO_DIR（npm 模組快取根）。e2e 子行程以 clearEnv 啟動並覆寫 HOME 來測試
+ * 家目錄路徑邏輯，但 Deno 的模組快取預設位於 HOME 之下；若不顯式帶入真實 DENO_DIR，子行程
+ * 會去被覆寫的假 HOME 找 npm:unbash 快取而失敗（main.ts 無法啟動、stdout 為空）。DENO_DIR
+ * 與 hook 的家目錄判定正交（hook 只讀 HOME/USERPROFILE），故帶入不影響測試語義。
+ */
+function realDenoDir(): string {
+  const fromEnv = Deno.env.get("DENO_DIR");
+  if (fromEnv) return fromEnv;
+  const out = new Deno.Command("deno", {
+    args: ["info", "--json"],
+    stdout: "piped",
+    stderr: "null",
+  }).outputSync();
+  return JSON.parse(new TextDecoder().decode(out.stdout)).denoDir as string;
+}
+const REAL_DENO_DIR = realDenoDir();
+
 /** 以子行程執行 main.ts，可額外指定環境變數（如 HOME），並帶 --allow-sys=uid。 */
 async function runHookWithEnv(
   payload: unknown,
@@ -137,7 +155,8 @@ async function runHookWithEnv(
   const cmd = new Deno.Command("deno", {
     args: ["run", "--allow-env", "--allow-read", "--allow-sys=uid", "src/main.ts"],
     clearEnv: true,
-    env,
+    // DENO_DIR 先給真實值，呼叫端 env 仍可覆寫（目前無呼叫端覆寫）。
+    env: { DENO_DIR: REAL_DENO_DIR, ...env },
     stdin: "piped",
     stdout: "piped",
     stderr: "null",
