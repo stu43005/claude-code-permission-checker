@@ -258,8 +258,9 @@ Deno.test("輸入重導向 < 目標範圍檢查（第4條中央前置規則）",
   assertEquals(only("cat <<EOF\nx\nEOF").kind, "allow");         // heredoc 非 `<`，不受此規則
 });
 
-Deno.test("輸入重導向 ask 可被 Bash() 升級", () => {
-  assertEquals(onlyWith("cat < /etc/passwd", rulesOf({ allow: ["Bash(cat *)"] })).kind, "allow");
+Deno.test("輸入重導向（範圍外 <）為不可升級中央前置：Bash() 不升級、維持 ask", () => {
+  // 行為變更：範圍外 < 為中央前置安全 ask，permissions.allow 不可解除
+  assertEquals(onlyWith("cat < /etc/passwd", rulesOf({ allow: ["Bash(cat *)"] })).kind, "ask");
 });
 
 Deno.test("輸入重導向 ask 可被 Read() 讀取範圍放寬升級", () => {
@@ -298,4 +299,44 @@ Deno.test("classify: settings absolute allow + // command upgrades (home null)",
     onlyWith("/opt/t//run.sh --x", rulesOf({ allow: ["Bash(/opt/t/run.sh *)"] })).kind,
     "allow",
   );
+});
+
+Deno.test("中央前置不可升級：寫入重導向 × allowlisted / 非-allowlist", () => {
+  // allowlisted：cat 規則本會 allow，但寫入重導向覆寫、且不可由 Bash(cat:*) 升級
+  assertEquals(onlyWith("cat src/a.ts > out.txt", rulesOf({ allow: ["Bash(cat:*)"] })).kind, "ask");
+  // 非-allowlist：npm 未列入 allowlist，寫入重導向不可由 Bash(npm test:*) 升級
+  assertEquals(onlyWith("npm test x > out.txt", rulesOf({ allow: ["Bash(npm test:*)"] })).kind, "ask");
+});
+
+Deno.test("中央前置不可升級：cwd 超範圍 × allowlisted / 非-allowlist", () => {
+  const allowlisted = walk(parseCommand("cd /tmp && cat a").script, START, ROOT)
+    .find((i) => i.name === "cat")!;
+  assertEquals(classify(allowlisted, ROOT, rulesOf({ allow: ["Bash(cat:*)"] })).kind, "ask");
+  const nonAllow = walk(parseCommand("cd /tmp && npm test").script, START, ROOT)
+    .find((i) => i.name === "npm")!;
+  assertEquals(classify(nonAllow, ROOT, rulesOf({ allow: ["Bash(npm test:*)"] })).kind, "ask");
+});
+
+Deno.test("中央前置不可升級：賦值前綴 × allowlisted / 非-allowlist（維持 ask）", () => {
+  assertEquals(onlyWith("FOO=bar cat a", rulesOf({ allow: ["Bash(cat:*)"] })).kind, "ask");
+  assertEquals(onlyWith("FOO=bar npm test", rulesOf({ allow: ["Bash(npm test:*)"] })).kind, "ask");
+});
+
+Deno.test("中央前置不可升級：範圍外 < × allowlisted / 非-allowlist", () => {
+  assertEquals(onlyWith("cat < /etc/passwd", rulesOf({ allow: ["Bash(cat *)"] })).kind, "ask");
+  assertEquals(onlyWith("npm test < /etc/passwd", rulesOf({ allow: ["Bash(npm test:*)"] })).kind, "ask");
+});
+
+Deno.test("指令規則 allow 被中央前置覆寫、不洩漏成 allow", () => {
+  // cat README.md / pwd 規則本會 allow；疊加各中央前置觸發條件 + 會命中的 Bash() 仍為 ask
+  assertEquals(onlyWith("cat README.md > out.txt", rulesOf({ allow: ["Bash(cat:*)"] })).kind, "ask"); // 寫入重導向
+  assertEquals(onlyWith("cat < /etc/passwd", rulesOf({ allow: ["Bash(cat:*)"] })).kind, "ask");       // 範圍外 <
+  const outCwd = walk(parseCommand("cd /tmp && pwd").script, START, ROOT)
+    .find((i) => i.name === "pwd")!;                                                                  // cwd 超範圍
+  assertEquals(classify(outCwd, ROOT, rulesOf({ allow: ["Bash(pwd:*)"] })).kind, "ask");
+});
+
+Deno.test("可升級不退化：指令規則自身範圍外讀取 ask 仍可由 Bash() 升級", () => {
+  // grep 對 /etc/passwd → 規則 ask（非中央前置）→ 可升級為 allow
+  assertEquals(onlyWith("grep needle /etc/passwd", rulesOf({ allow: ["Bash(grep *)"] })).kind, "allow");
 });
