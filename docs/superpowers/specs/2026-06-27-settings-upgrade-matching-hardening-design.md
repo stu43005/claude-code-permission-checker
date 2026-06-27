@@ -135,6 +135,19 @@ return verdict
 5. **`Read()/Edit()/Write()` 讀取範圍放寬不受影響**：cwd（a）與範圍外 `<`（d）判定吃的是已含 readScope 放寬的 `scope`，放寬命中時這兩條本就不觸發 → 仍走可升級區。
 6. **default-deny**：未涵蓋形式 fallback `ask`；任何例外 try/catch 成 ask（fail-safe，上游既有）。
 7. **`classify` 對外簽名與回傳型別不變**：`combine.ts`/`evaluate.ts` 不需改。
+8. **中央前置 ask 覆寫指令規則的 allow/ask**：唯一能越過中央前置而提前返回的 rule 輸出是 `deny`（步驟 2，安全方向、更嚴格）。rule 的 `allow`/`ask` 一律在步驟 3 之後才被消費，故任何**帶中央前置觸發條件**（cwd 超範圍 / 寫入重導向 / 賦值前綴 / 範圍外 `<`）的指令**永不可能成為 allow**——此性質與 `rule.evaluate` 的 allow/ask 路徑邏輯**無關**，不依賴任何現行或未來指令規則的內部行為（見 §4.6）。
+9. **`rule.evaluate` 為純函式契約**：指令規則的 `evaluate` 不得有副作用（不執行指令、不寫檔、不依賴可變外部狀態）；路徑判定走純詞法的 `resolvePath`（不碰 FS、總回三態、不丟例外）。故在「cwd 超範圍 / 危險 redirect」情境下呼叫 `rule.evaluate` 無任何 runtime 危害，其輸出僅為待覆寫的候選 verdict。新增/修改指令規則時須維持此契約。
+
+### 4.6 為何 `rule.evaluate` 可安全地先於中央前置執行（順序的正當性）
+
+步驟 2（`rule.evaluate` + 硬 deny 短路）排在步驟 3（中央前置）**之前**，是被「不變量 2：指令規則硬 deny 優先於中央前置 ask」**強制**的——遞迴根掃描 deny（`grep -r x /`）必須勝過任何中央 ask；若把中央前置移到 `rule.evaluate` 前，`grep -r x / > out` 會被寫入重導向 ask 蓋掉、把 deny **降級**成 ask，違反三類硬 deny 的最高優先序。
+
+此順序**不會**讓安全性依賴指令規則的未言明行為，原因有二（對應不變量 8、9）：
+
+1. **rule 的非-deny 輸出一律被覆寫**：`rule.evaluate` 回的 `allow`/`ask` 在步驟 3 之後才被消費；只要任一中央前置命中，步驟 3 立即 return 不可升級的 ask，rule 的 allow/ask **永不生效**。唯一能在中央前置前返回的是 rule 的 `deny`（更嚴格、安全方向）。因此即使未來某指令規則在 out-of-scope cwd 下因特例回 `allow`，仍被中央前置覆寫成 ask。
+2. **rule.evaluate 為純函式（契約）**：無副作用、不碰 FS、`resolvePath` 純詞法且不丟例外；上游 `evaluate` 另有 try/catch → ask 的 fail-safe。故「在危險情境下呼叫它」沒有 runtime 危害。
+
+**為何不採用 two-phase CommandRule API**（把 evaluate 拆成「純 hard-deny prepass」+「verdict pass」，讓中央前置插在兩者之間）：該拆分需改動 `CommandRule` 介面與**所有**指令規則檔，屬本 spec「只動 `classify.ts`」範圍外的大改；且在不變量 8、9 成立下，它**不帶來額外安全性**（rule 的 allow/ask 本就被覆寫、evaluate 本就純）。故**刻意不採用**，改以明文不變量 + 測試（§5 第 5 點）鎖定既有順序的安全性。
 
 ## 5. 測試計畫
 
@@ -146,6 +159,7 @@ return verdict
    - 非-allowlist 無中央前置（`npm test --x` + `Bash(npm test:*)`）→ allow。
    - 指令規則自身範圍外讀取 ask + 對應 `Bash()`/`Read()` 規則 → allow。
 4. **deny 優先**：遞迴根掃描 + 寫入重導向 + 命中 `Bash(...)` → 仍 deny（不被中央 ask 或升級遮蔽）。
+5. **中央前置覆寫 rule allow（不變量 8 鎖定）**：取一個指令規則本身會回 `allow` 的代表案例（如 `cat README.md`），分別加上每一條中央前置觸發條件（寫入重導向 `cat README.md > out.txt`、專案外 cwd、範圍外 `<`），即使配上會命中的 `Bash(cat:*)` allow 規則，斷言**結果為 ask**——證明 rule 的 allow 被中央前置覆寫、不因 rule 自身邏輯而洩漏成 allow。
 
 ## 6. Operational verification（改規則後必做）
 
