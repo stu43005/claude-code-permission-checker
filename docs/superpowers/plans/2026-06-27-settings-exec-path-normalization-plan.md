@@ -202,9 +202,15 @@ git commit -m "feat(scope): add canonicalizeExecPath for exec-path lexical norma
 **Files:**
 - Modify: `src/permissions/matcher.ts`
 - Modify: `src/engine/classify.ts:76`（`home` 改必填 → 必須在同一原子變更內更新唯一呼叫端，否則 2 參數呼叫無法編譯）
+- Modify: `src/engine/scope.ts`（把 `canonicalizeExecPath` 接入 matcher 後浮現的兩道比對專屬安全 hardening，見下「安全 hardening」）
 - Test: `src/permissions/matcher_test.ts`（含更新既有 5 處 `settingsAllows(inv, rules)` 呼叫補 `, null`）
+- Test: `src/engine/scope_test.ts`（類別保留 fail-closed 的單元回歸測試）
 
-> **為何三檔同一 Task**：`settingsAllows` 的 `home` 改為**必填**（依 spec §4.4，避免預設值掩蓋漏接線）。改簽名會使其唯一生產呼叫端 `classify.ts:76` 的 2 參數呼叫編譯失敗，故簽名變更與呼叫端更新必須同屬一個原子變更以維持綠燈。
+> **為何多檔同一 Task**：`settingsAllows` 的 `home` 改為**必填**（依 spec §4.4，避免預設值掩蓋漏接線）。改簽名會使其唯一生產呼叫端 `classify.ts:76` 的 2 參數呼叫編譯失敗，故簽名變更與呼叫端更新必須同屬一個原子變更以維持綠燈。
+
+> **安全 hardening（把 `canonicalizeExecPath` 接入比對後才浮現的兩道比對專屬安全性質，故歸於本 Task）**：
+> 1. **類別保留 fail-closed（scope.ts，spec §4.5 不變量 9）**：相對正規化不得把「含 `/` 的路徑 token」（bash 以路徑執行）塌成「無 `/` 的裸名」（PATH 查找）——否則 `./npm install` 會被 `Bash(npm *)` 誤升級。在 `canonicalizeExecPath` 相對分支加守門：`posix.includes("/") && !normalized.includes("/")` → 原樣返回 token。`./a/b` → `a/b`（仍含 `/`）屬合法等價、不受影響。
+> 2. **指令側不展開 `~`（matcher.ts，spec §4.5 不變量 10）**：`reconstructCanonical` 指令側固定以 `canonicalizeExecPath(inv.name, null)` 構造 `canonCmd`，**永不展開指令側 `~`**（引號 `"~/x"` 在 bash 不展開，而 `inv.name` 已去引號無法區分，展開會誤升級）。pattern 側仍以真實 `home` 展開。`//` 折疊與 `.` 移除不需 `home`、照常運作。
 
 - [ ] **Step 1: 寫失敗測試（union / ~ / // / fail-closed / ask / case）**
 
@@ -421,9 +427,14 @@ export function reconstructCommand(inv: CommandInvocation): string | null {
   return reconstructWith(inv, (name) => name);
 }
 
-/** 正規化執行檔名後的指令字串（canonCmd）。argv 不正規化。 */
-function reconstructCanonical(inv: CommandInvocation, home: string | null): string | null {
-  return reconstructWith(inv, (name) => canonicalizeExecPath(name, home));
+/**
+ * 正規化執行檔名後的指令字串（canonCmd）。argv 不正規化。
+ * 指令側一律以 home=null 呼叫 canonicalizeExecPath：絕不展開指令側的 `~`（引號 "~/x" 在 bash
+ * 不展開，而 inv.name 已去引號無法區分；展開會把字面 ~ 檔名誤當家目錄絕對路徑而誤升級）。
+ * `//` 折疊與 `.` 段移除不需 home，故指令側等價正規化照常運作。
+ */
+function reconstructCanonical(inv: CommandInvocation): string | null {
+  return reconstructWith(inv, (name) => canonicalizeExecPath(name, null));
 }
 
 /** 對 pattern 的第一個空白前 head token 套 canonicalizeExecPath，其餘原樣。 */
@@ -473,7 +484,7 @@ export function settingsAllows(
 ): boolean {
   const rawCmd = reconstructCommand(inv);
   if (rawCmd === null) return false;
-  const canonCmd = reconstructCanonical(inv, home);
+  const canonCmd = reconstructCanonical(inv);
   if (canonCmd === null) return false; // 與 rawCmd 同步，理論上不會發生
   if (matchesRuleSet(rawCmd, canonCmd, rules.bash.deny, home)) return false;
   if (matchesRuleSet(rawCmd, canonCmd, rules.bash.ask, home)) return false;
