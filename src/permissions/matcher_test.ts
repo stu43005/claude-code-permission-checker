@@ -399,6 +399,20 @@ Deno.test("settingsAllows: argv-specific ask still blocks a // command an exec-o
   assertEquals(settingsAllows(firstInv("/opt/t//run.sh --danger x"), rules, null), false);
 });
 
+Deno.test("settingsAllows: exec/argv flattening pre-exists in raw (single-slash) -> canon adds no new capability", () => {
+  // The single-slash spelling ALREADY matches the spaced allow via the raw branch (de-quote +
+  // space-join in reconstructCommand). The // spelling runs the SAME file (/tmp/My == /tmp//My),
+  // so the canon branch grants nothing the raw branch doesn't already grant here.
+  assertEquals(
+    settingsAllows(
+      firstInv('"/tmp/My" "App/run.sh" evil'),
+      rulesOf({ allow: ["Bash(/tmp/My App/run.sh *)"] }),
+      null,
+    ),
+    true,
+  );
+});
+
 Deno.test("settingsAllows: path-equivalent deny blocks the exec/argv flattening case (deny symmetry)", () => {
   // reconstructCommand de-quotes and space-joins exec+argv (a pre-existing property, independent
   // of exec-path normalization: raw matches the same via the single-slash spelling). Canon stays
