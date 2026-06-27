@@ -77,9 +77,14 @@ export function reconstructCommand(inv: CommandInvocation): string | null {
   return reconstructWith(inv, (name) => name);
 }
 
-/** 正規化執行檔名後的指令字串（canonCmd）。argv 不正規化。 */
-function reconstructCanonical(inv: CommandInvocation, home: string | null): string | null {
-  return reconstructWith(inv, (name) => canonicalizeExecPath(name, home));
+/**
+ * 正規化執行檔名後的指令字串（canonCmd）。argv 不正規化。
+ * 指令側一律以 home=null 呼叫 canonicalizeExecPath：絕不展開指令側的 `~`。指令字串無法
+ * 區分引號與否，而引號 `"~/x"` 在 bash 不展開；展開會把字面 `~` 檔名誤當成家目錄絕對路徑
+ * 而誤升級（permission bypass）。`//` 折疊與 `.` 段移除不需 home，故指令側等價正規化照常運作。
+ */
+function reconstructCanonical(inv: CommandInvocation): string | null {
+  return reconstructWith(inv, (name) => canonicalizeExecPath(name, null));
 }
 
 /** 對 pattern 的第一個空白前 head token 套 canonicalizeExecPath，其餘原樣。 */
@@ -125,7 +130,7 @@ export function settingsAllows(
 ): boolean {
   const rawCmd = reconstructCommand(inv);
   if (rawCmd === null) return false;
-  const canonCmd = reconstructCanonical(inv, home);
+  const canonCmd = reconstructCanonical(inv);
   if (canonCmd === null) return false; // 與 rawCmd 同步，理論上不會發生
   if (matchesRuleSet(rawCmd, canonCmd, rules.bash.deny, home)) return false;
   if (matchesRuleSet(rawCmd, canonCmd, rules.bash.ask, home)) return false;

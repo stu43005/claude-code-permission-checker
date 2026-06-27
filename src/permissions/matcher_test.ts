@@ -330,3 +330,16 @@ Deno.test("settingsAllows: deeper ./a/b command still matches relative a/b allow
     true,
   );
 });
+
+Deno.test("settingsAllows: quoted-tilde command is NOT expanded -> home-absolute allow does not match (no bypass)", () => {
+  // Bash does not tilde-expand a quoted "~/...". The command side must not expand it either,
+  // otherwise a literal ~-named file would be auto-allowed as the home-dir absolute path.
+  assertEquals(
+    settingsAllows(
+      firstInv('"~/proj/tool.sh" x'),
+      rulesOf({ allow: ["Bash(/home/me/proj/tool.sh *)"] }),
+      "/home/me",
+    ),
+    false,
+  );
+});
