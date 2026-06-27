@@ -141,6 +141,9 @@ export function canonicalizeExecPath(token: string, home: string | null): string
   if (!token.includes("/") && !token.includes("\\") && token !== "~" && !token.startsWith("~/")) {
     return token;
   }
+  // 規則 1.5：POSIX 反斜線守門（非 Windows）。`\` 在 POSIX 是路徑字面 byte，toPosix 會 `\`→`/`，
+  // 對含反斜線的執行檔 token 會改寫成不同檔 → 留字面、不正規化（fail-closed）。置於規則 2（首個 toPosix）之前。
+  if (Deno.build.os !== "windows" && token.includes("\\")) return token;
   // 規則 2：前導 //（UNC / 歧義絕對）→ 原樣（fail-closed，不 toPosix、不折疊）
   if (toPosix(token).startsWith("//")) return token;
   // 規則 3：含獨立 .. 段 → 原樣（symlink/junction 安全）

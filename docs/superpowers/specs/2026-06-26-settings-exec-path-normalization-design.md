@@ -57,6 +57,7 @@ canonicalizeExecPath(token: string, home: string | null): string
 **刻意不接受 `cwd` 參數**：相對路徑**不對 cwd 解析**（見規則 5 與 §4.5 不變量 3 的信任邊界理由），故本函式對 cwd 無依賴。**轉換限定為「折疊中段 `//` + 移除 `.` 段」這兩種真語義等價變換**（兩者在任何 symlink 拓樸下都不改變路徑解析結果），外加 `~`/`~/` 展開。**不解析 `..`**。對**單一執行檔 token** 正規化，指令側與 pattern 側**對稱套用同一函式**。規則依序（先判先套，命中即返回）：
 
 1. **裸指令名**：token 不含 `/` 且不含 `\` 且非 `~`、非 `~/` 開頭 → **原樣返回**（`cat`、`git` 不得被當成路徑）。
+1.5. **POSIX 反斜線守門（非 Windows）**：`Deno.build.os !== "windows"` 且 token 含 `\` → **原樣返回、不正規化（fail-closed）**。POSIX 上 `\` 是路徑字面 byte（非分隔符），而 `toPosix` 會把 `\`→`/`；若不守門，引號的 `"/tmp/foo\bar"`（檔名含字面反斜線）會被改寫成 `/tmp/foo/bar` 而誤配 `Bash(/tmp/foo/bar *)`（不同檔）→ 權限繞道。此守門置於規則 2 之前（規則 2 起才呼叫 `toPosix`）。Windows 上 `\` 為分隔符，照常處理。（僅引號靜態 token 會帶字面 `\` 進到 `inv.name`；未引號反斜線 token 已被視為動態 → `null`、不升級。）
 2. **前導雙斜線（UNC / 歧義絕對）**：`toPosix(token)` 以 `//` 開頭（涵蓋 posix `//x`、Windows UNC `\\server\share`）→ **不做語義正規化、原樣返回 token（不 toPosix、不折疊、fail-closed；字面相同的 pattern 仍可命中）**。理由見 §4.5 不變量 4。**注意**：此規則只攔**前導** `//`；路徑**中段**的 `//`（如核可用例 `superpowers-codex//scripts`）不受影響、照常折疊。
 3. **含 `..` 路徑段 → 原樣返回（fail-closed）**：`toPosix(token)` 以 `/` 切段後，**任一段恰為 `..`** → **不正規化、原樣返回 token**。理由見 §4.5 不變量 5：詞法折疊 `..` 在 symlink/junction 下不等於真實解析路徑，可能放行不同的磁碟上執行檔。留字面使其只配相同字面 pattern（至多 ask）。注意以段為單位判定——檔名內含 `..`（如 `foo..bar`，非獨立 `..` 段）不受影響、照常正規化。
 4. **`~` 或 `~/` 開頭**：
@@ -147,6 +148,7 @@ canonicalizeExecPath(token: string, home: string | null): string
 10. **含 `/` 塌成裸名的相對 token 留字面（類別保留）**：`./npm`、`a/.` 等原含 `/` 卻會塌成無 `/` 裸名者一律留字面（§4.2 規則 5 / §4.5 不變量 9），避免 path-exec 與 PATH-lookup 混淆。`./a/b` → `a/b`（仍含 `/`）屬合法等價、不在此列。
 11. **指令側 `~` 不展開**：`canonCmd` 以 `home = null` 構造，未引號或引號的 `~/x` 指令一律不展開 `~`（§4.5 不變量 10）；只有 pattern 側的 `~` 會展開。代價是「未引號 `~/x` 指令 × 絕對 home pattern」拿不到加成（回退 raw、至多 ask），換取 quoted-tilde 不被誤升級。
 12. **exec+argv 扁平化歧義（`reconstructCommand` 既有、非本層引入）**：`reconstructCommand` 把 exec 與 argv 去引號後以單一空白拼接成一條字串供比對。因此含空白的執行檔路徑 pattern 可能跨越 exec/argv 邊界匹配——例如 allow `Bash(/tmp/My App/run.sh *)` 會命中「執行 `/tmp/My`、首個 argv 為 `App/run.sh`」的指令。**此為 `reconstructCommand` 的既存性質、與本正規化層無關**：raw 經單斜線拼寫（`"/tmp/My" "App/run.sh"`）即已如此，本層只是讓 `//` 拼寫也走同一路徑、**未新增能力**。canon 與 raw 對此一致；且因 deny/ask 與 allow 一致扁平比對（§4.5 不變量 11），path-equivalent 的 deny 仍會擋下。修正 `reconstructCommand` 的扁平化（保留 exec/argv 邊界）屬獨立議題，不在本層範圍。
+13. **POSIX 反斜線留字面（不跨 `\`↔`/` 改寫）**：非 Windows 上含 `\` 的執行檔 token 一律留字面、不正規化（§4.2 規則 1.5）。POSIX 的 `\` 是路徑字面 byte，`toPosix` 的 `\`→`/` 改寫只在 Windows 正確；故 `"/tmp/foo\bar"` 在 POSIX 留字面、不會被改寫成 `/tmp/foo/bar` 而誤配不同檔的 allow。Windows 上 `\` 為分隔符、照常正規化。
 
 ## 7. 測試計畫
 
