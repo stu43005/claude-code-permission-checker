@@ -296,6 +296,15 @@ Deno.test("canonicalizeExecPath: ~ expansion into a normal absolute home still w
   assertEquals(canonicalizeExecPath("~/tool", "/home/me"), "/home/me/tool");
 });
 
+Deno.test({
+  name: "canonicalizeExecPath: POSIX backslash kept literal (not a separator)",
+  ignore: Deno.build.os === "windows",
+  fn() {
+    assertEquals(canonicalizeExecPath("/tmp/foo\\bar", null), "/tmp/foo\\bar");
+    assertEquals(canonicalizeExecPath("foo\\bar", null), "foo\\bar");
+  },
+});
+
 Deno.test("isReadScoped: trusted root grants read; root-first and deny/ask override", () => {
   const SID = "/home/me/.claude/projects/-proj/115826ef-e830-461f-8101-edac56694d2b";
   const scope: ScopeConfig = { ...rootScope("/proj"), trusted: [SID] };

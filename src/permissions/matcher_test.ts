@@ -435,6 +435,28 @@ Deno.test("settingsAllows: ~ pattern with UNC home does not allow the rewritten 
   );
 });
 
+Deno.test({
+  name: "settingsAllows: POSIX backslash exec is not normalized into a slash allow (no bypass)",
+  ignore: Deno.build.os === "windows",
+  fn() {
+    assertEquals(
+      settingsAllows(firstInv('"/tmp/foo\\bar" x'), rulesOf({ allow: ["Bash(/tmp/foo/bar *)"] }), null),
+      false,
+    );
+  },
+});
+
+Deno.test({
+  name: "settingsAllows: identical backslash exec on both sides matches (POSIX literal)",
+  ignore: Deno.build.os === "windows",
+  fn() {
+    assertEquals(
+      settingsAllows(firstInv('"/tmp/foo\\bar" x'), rulesOf({ allow: ["Bash(/tmp/foo\\bar *)"] }), null),
+      true,
+    );
+  },
+});
+
 Deno.test("settingsAllows: exec-only pattern still upgrades a // command (in-exec match)", () => {
   // The motivating shape: pattern's exec-path == command's exec token (after // folding).
   assertEquals(
