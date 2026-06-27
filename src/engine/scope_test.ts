@@ -1,7 +1,7 @@
 import { assertEquals } from "@std/assert";
 import { parse } from "../deps.ts";
 import type { Command } from "../deps.ts";
-import { dangerousRoot, isDangerousRootAbs, isReadScoped, isWithin, normalizeAbsolute, resolvePath, rootScope, type PathScope, type ScopeConfig } from "./scope.ts";
+import { canonicalizeExecPath, dangerousRoot, isDangerousRootAbs, isReadScoped, isWithin, normalizeAbsolute, resolvePath, rootScope, type PathScope, type ScopeConfig } from "./scope.ts";
 import type { CwdState } from "../types.ts";
 
 function firstArg(src: string) {
@@ -215,6 +215,62 @@ Deno.test({
 
 Deno.test("rootScope sets empty trusted", () => {
   assertEquals(rootScope("/proj").trusted, []);
+});
+
+Deno.test("canonicalizeExecPath: bare command name unchanged", () => {
+  assertEquals(canonicalizeExecPath("git", null), "git");
+  assertEquals(canonicalizeExecPath("cat", "/home/me"), "cat");
+});
+
+Deno.test("canonicalizeExecPath: folds middle // and removes . segment", () => {
+  assertEquals(canonicalizeExecPath("/a//b/c", null), "/a/b/c");
+  assertEquals(canonicalizeExecPath("/a/./b", null), "/a/b");
+});
+
+Deno.test("canonicalizeExecPath: home unavailable still normalizes non-tilde paths", () => {
+  assertEquals(canonicalizeExecPath("/a//b", null), "/a/b");
+});
+
+Deno.test("canonicalizeExecPath: expands ~ and ~/x when home known", () => {
+  assertEquals(canonicalizeExecPath("~", "/home/me"), "/home/me");
+  assertEquals(canonicalizeExecPath("~/x/y", "/home/me"), "/home/me/x/y");
+  assertEquals(canonicalizeExecPath("~/proj//tool.sh", "/home/me"), "/home/me/proj/tool.sh");
+});
+
+Deno.test("canonicalizeExecPath: ~ left literal when home is null", () => {
+  assertEquals(canonicalizeExecPath("~/x", null), "~/x");
+  assertEquals(canonicalizeExecPath("~", null), "~");
+});
+
+Deno.test("canonicalizeExecPath: .. segment left literal (symlink safety)", () => {
+  assertEquals(canonicalizeExecPath("/a/../b", null), "/a/../b");
+  assertEquals(canonicalizeExecPath("/allowed/link/../tool", null), "/allowed/link/../tool");
+});
+
+Deno.test("canonicalizeExecPath: '..' inside a filename is not a .. segment", () => {
+  assertEquals(canonicalizeExecPath("/a//foo..bar", null), "/a/foo..bar");
+});
+
+Deno.test("canonicalizeExecPath: leading // (UNC) left literal", () => {
+  assertEquals(canonicalizeExecPath("//server/share/tool", null), "//server/share/tool");
+});
+
+Deno.test("canonicalizeExecPath: zero-segment / bare-root collapse left literal", () => {
+  assertEquals(canonicalizeExecPath("./", null), "./");
+  assertEquals(canonicalizeExecPath("/.", null), "/.");
+});
+
+Deno.test("canonicalizeExecPath: a/. normalizes to a (named segment remains)", () => {
+  assertEquals(canonicalizeExecPath("a/.", null), "a");
+});
+
+Deno.test("canonicalizeExecPath: relative stays relative, folds //", () => {
+  assertEquals(canonicalizeExecPath("scripts//run.sh", null), "scripts/run.sh");
+  assertEquals(canonicalizeExecPath("scripts/run.sh", null), "scripts/run.sh");
+});
+
+Deno.test("canonicalizeExecPath: preserves trailing slash (directory boundary)", () => {
+  assertEquals(canonicalizeExecPath("/a/scripts/", null), "/a/scripts/");
 });
 
 Deno.test("isReadScoped: trusted root grants read; root-first and deny/ask override", () => {

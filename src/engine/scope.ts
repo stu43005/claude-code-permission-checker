@@ -56,6 +56,71 @@ export function normalizeAbsolute(abs: string): string {
   return prefix + "/" + out.join("/");
 }
 
+/** 路徑是否含獨立 ".." 段（以 "/" 切段比對，排除檔名內的 ".." 如 foo..bar）。 */
+function hasDotDotSegment(posix: string): boolean {
+  return posix.split("/").some((seg) => seg === "..");
+}
+
+/**
+ * 相對路徑詞法正規化：折疊 `//`、移除 `.` 段；**不**解析 `..`、**不**加前導 `/`。
+ * 呼叫端保證傳入的 posix 不含獨立 `..` 段（已由 canonicalizeExecPath 規則 3 攔截）。
+ */
+function lexicalNormalizeRelative(posix: string): string {
+  const out: string[] = [];
+  for (const seg of posix.split("/")) {
+    if (seg === "" || seg === ".") continue;
+    out.push(seg);
+  }
+  return out.join("/");
+}
+
+/**
+ * 把單一執行檔 token 做純詞法正規化（不碰檔案系統、不依賴 cwd、idempotent）。
+ * 指令側與 pattern 側對稱套用。轉換限定：展開 `~`/`~/`、折疊中段 `//`、移除 `.` 段。
+ * 三道 fail-closed：前導 `//`（UNC，避免 UNC 根被改寫）、含獨立 `..` 段（symlink/junction 下
+ * 詞法折疊不等於真實路徑）、正規化後塌成空/裸根 → 一律原樣返回 token。
+ */
+export function canonicalizeExecPath(token: string, home: string | null): string {
+  // 規則 1：裸指令名（無 / 無 \ 且非 ~、~/）→ 原樣
+  if (!token.includes("/") && !token.includes("\\") && token !== "~" && !token.startsWith("~/")) {
+    return token;
+  }
+  // 規則 2：前導 //（UNC / 歧義絕對）→ 原樣（fail-closed，不 toPosix、不折疊）
+  if (toPosix(token).startsWith("//")) return token;
+  // 規則 3：含獨立 .. 段 → 原樣（symlink/junction 安全）
+  if (hasDotDotSegment(toPosix(token))) return token;
+
+  // 規則 4：~ / ~/ 展開（home 為 null → 原樣，僅停用 ~ 展開）
+  let work = token;
+  if (token === "~" || token.startsWith("~/")) {
+    if (home === null) return token;
+    work = token === "~" ? home : home + token.slice(1); // "~/x" -> home + "/x"
+  }
+
+  const posix = toPosix(work);
+  // 尾斜線語義（依原 token，非 work）；單一根 "/" 不算
+  const hadTrailingSlash = /[/\\]$/.test(token) && toPosix(token) !== "/";
+
+  let normalized: string;
+  if (isAbsolute(posix)) {
+    // 規則 6：絕對 → normalizeAbsolute（.. 已被規則 3 攔截，故僅折疊 //、移除 .、Windows 磁碟正規化）
+    normalized = normalizeAbsolute(posix);
+  } else {
+    // 規則 5：相対 → 維持相對的詞法正規化
+    normalized = lexicalNormalizeRelative(posix);
+  }
+
+  // 零段／塌根 fail-closed：結果塌成空、或塌成裸根而原非該裸根 → 原樣 token
+  const isBareRoot = normalized === "/" || /^[A-Za-z]:\/$/.test(normalized);
+  if (normalized === "" || (isBareRoot && posix !== normalized)) {
+    return token;
+  }
+
+  // 尾斜線保留（零段 fail-closed 已先返回者不到這裡）
+  if (hadTrailingSlash && !normalized.endsWith("/")) normalized += "/";
+  return normalized;
+}
+
 /** 把相對路徑接在 cwd 之後再正規化。 */
 function resolveAgainst(cwdPath: string, arg: string): string {
   const a = toPosix(arg);
