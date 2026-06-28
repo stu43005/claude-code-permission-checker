@@ -10,10 +10,13 @@
 ## 1. 背景與問題
 
 本工具是 Claude Code 的 `PreToolUse`（matcher `Bash`）hook：解析 Bash 指令，純唯讀且全落專案內才 `allow`，
-其餘 `ask`，並對三類情形回**硬 `deny`**（不可由 `permissions.allow` 解除）：① 遞迴遍歷磁碟根/家目錄根；
-② 整鏈 print-only 偽裝（shell 層 echo/printf/cat-heredoc 靜態吐字）；③ sleep 輪詢（見 2026-06-21 規格）。
-其中 ②③ 在 `evaluate` 層、`classify` 之前短路；① 在 `classify` 內判定並對 `deny` 短路。三者皆不經
-`settingsAllows` 升級層。
+其餘 `ask`，並對三類情形回**硬 `deny`**（不可由 `permissions.allow` 解除，見 2026-06-21 規格）：
+- **遞迴遍歷磁碟根/家目錄根**：於 `classify` 內以 `isDangerousRoot` 判定、對 `deny` 短路（per-leaf）。
+- **sleep 輪詢**：`evaluate` 層**閘①**。
+- **整鏈 print-only 偽裝**（shell 層 echo/printf/cat-heredoc 靜態吐字）：`evaluate` 層**閘②**。
+
+（既有 `evaluate` 層另有**閘③**：函式遮蔽 → `ask`。）所有 deny 皆不經 `settingsAllows` 升級層。本規格新增的
+直譯器-print 偽裝為 `evaluate` 層**閘④**（deny，接於閘②之後）。
 
 ### 1.1 痛點
 
@@ -122,9 +125,13 @@ main.ts → evaluate(command, root, initialCwd, rules, home, trustedReadRoots)
 - 字串逸脫、未閉合引號/括號在此偵測；**任何未閉合 → `false`**。
 
 **步驟 2：文法比對**（消費全部 token）：整串須為「一條以上 print 敘述」，每條 `PRINT_FN '(' ARG (',' ARG)* ')' ';'?`：
-- `PRINT_FN`：js ∈ {`console.log`,`console.info`,`console.warn`,`console.error`,`console.debug`,
-  `process.stdout.write`,`process.stderr.write`}；py ∈ {`print`,`sys.stdout.write`,`sys.stderr.write`}。
-- `ARG`：恰一個 `STRING` 或 `NUMBER`。**不允許** `NAME`/`OTHER`/`DYNAMIC`/巢狀 `(`/`=`(py kwargs)。
+- `PRINT_FN`：
+  - **可帶 `STRING` 或 `NUMBER` 引數**（文字輸出 API）：js `console.log`/`info`/`warn`/`error`/`debug`；py `print`。
+  - **僅 `STRING` 引數**（write API，回應簡化後 review medium：`process.stdout.write(42)` 等數字引數非靜態文字、
+    runtime 可能失敗 → 不算純文字 print）：js `process.stdout.write`/`process.stderr.write`；py `sys.stdout.write`/
+    `sys.stderr.write`。
+- `ARG`：恰一個 `STRING`（write API 僅此）或 `NUMBER`（僅文字輸出 API）。**不允許** `NAME`/`OTHER`/`DYNAMIC`/
+  巢狀 `(`/`=`(py kwargs)。
 - 須 ≥1 條。
 
 **步驟 3：fail-safe**：任何不吻合（運算子、變數、呼叫、模板表示式、import、控制流、未閉合、token 未消費）→
@@ -178,11 +185,15 @@ main.ts → evaluate(command, root, initialCwd, rules, home, trustedReadRoots)
   - **WRITE 定義**：緊鄰前一個 sibling 葉指令，名 ∈ {`cat`,`tac`,`echo`,`printf`}、無賦值前綴、其
     **唯一有效 fd1 目標**為截斷 `>`/`>|` 到靜態路徑 P、內容可靜態還原（cat/tac heredoc body 或 echo/printf
     靜態輸出）。`>>` append、多重輸出重導向、`1>&2` 等 → 非 WRITE。
-  - **緊鄰**：WRITE 與 EXEC 為**同一循序序列內相鄰 sibling**，以 `;`/newline 或**恰兩-leg `&&`** 連接
-    （`WRITE && EXEC`）。中間有 `cd`/其他指令、跨控制流/subshell/背景邊界、`&&` 鏈有前置 leg（`false && WRITE
-    && EXEC`）→ 非緊鄰 → 不 deny。
-  - **同檔比對**：以各自 statement 的 cwd 快照 `normalizeAbsolute`；兩端 cwd 皆 known 且相等才算同檔，unknown
-    → 不 deny。（緊鄰時 cwd 同；`cd` 介於則破壞緊鄰，自然不命中。）
+  - **緊鄰前驅**：WRITE 是 EXEC 在**同一循序序列**（`;`/newline 或 `&&` 連接的 `AndOr`）內的**緊鄰前一個
+    sibling**。允許**前面有其他 setup leg**（`mkdir -p /tmp && cat > /tmp/x <<EOF…EOF && node /tmp/x`、
+    `cd /tmp; cat > x; node x` 皆 deny——常見 scaffolding，回應簡化後 review）。**WRITE 與 EXEC 之間**有任何
+    其他 statement（含 `cd`：`cat > x; cd other; node x`）、或跨控制流/subshell/背景/`||` 邊界 → 非緊鄰前驅
+    → 不 deny。（`false && cat > x && node x` 等含前置 leg 者仍 deny：結構即偽裝意圖；`false` 短路與否不影響
+    判定，屬刻意接受、與既有閘① 對 dead 分支 sleep 一致的結構/意圖導向。）
+  - **同檔比對**：以各自 statement 的 cwd 快照 `normalizeAbsolute` 後**字面相等**即同檔。緊鄰前驅時兩端 cwd
+    同一快照——cwd known（含 `cd /static`）時解析絕對路徑比對；cwd unknown（如先前 `cd $DYN`）時，**相同
+    相對路徑字串**仍同檔（同 cwd）→ 可比對；一絕對一相對且 cwd unknown → 無法證明 → 不 deny。
   - lang 由執行的直譯器決定。`node --require pre.js x.mjs`（第 2 類旗標）→ 跳過。
 
 ### 4.4 向量 D（pipe 餵 stdin）
@@ -250,7 +261,9 @@ if (interpreterPrintSprayDeny(script, initialCwd)) {
 - B：裸 `node <<'EOF'<print>EOF`/`python <<'EOF'`/`deno run -`/`bun run -` → deny；`< file`/無 fd0（繼承）
   → 不 deny。
 - C：**旗艦** `cat > /tmp/x.mjs <<'EOF'<print>EOF; node /tmp/x.mjs` → deny；`&&` 緊鄰 → deny；`echo '<print>' > f; node f`
-  → deny；寫專案內同理。
+  → deny；寫專案內同理。**含 setup leg（常見 scaffolding）**：`mkdir -p /tmp && cat > /tmp/x.mjs <<'EOF'<print>EOF
+  && node /tmp/x.mjs`、`cd /tmp; cat > x.mjs <<'EOF'<print>EOF; node x.mjs`、`false && cat > x.mjs <<'EOF'<print>EOF
+  && node x.mjs` → **deny**（緊鄰前驅，前置 setup/短路 leg 不影響）。
 - D：`echo 'console.log(1)' | node` → deny；`grep x f | node`/多段 → 不 deny；`echo … | node < real.js`（fd0
   蓋過）→ 不 deny。
 
@@ -262,9 +275,11 @@ if (interpreterPrintSprayDeny(script, initialCwd)) {
 - 注入旗標：`node -r ./pre.js -e '…'`、`python -m pytest t.py`、`node --require setup.js real-test.js` → 不 deny。
 - **良性旗標仍 deny**：`ts-node --transpile-only x.ts`（x.ts 為前驅 all-print WRITE）、`node --experimental-default-type=module x.mjs`、
   `deno run --allow-read x.ts`、`node --no-warnings -e 'console.log("fake")'` → **deny**（旗標無視、仍偵測）。
-- 順序/緊鄰：`node x; cat > x <<EOF…EOF`（執行在寫前）、`cat > x; echo hi; node x`（非緊鄰）、
-  `cat > x; cd other; node x`（cd 介於）、`false && cat > x && node x`（前置 leg）、`cat > x > sink <<EOF…EOF; node x`
-  （有效 fd1=sink）→ 不 deny。
+- 順序/緊鄰（不 deny）：`node x; cat > x <<EOF…EOF`（執行在寫前）、`cat > x; echo hi; node x`（WRITE 與 EXEC
+  間有非-WRITE 指令）、`cat > x; cd other; node x`（cd 介於兩者）、`cat > x > sink <<EOF…EOF; node x`（有效
+  fd1=sink、x 截空）、`if cond; then cat > x; fi; node x`（跨控制流邊界）→ 不 deny。
+- 述詞 write API（不 deny）：`process.stdout.write(42)`、`sys.stdout.write(1)`（數字引數給 write API）→ 不 deny；
+  對照 `process.stdout.write("fake")`、`console.log(42)` → deny。
 
 ### 7.4 不可升級 e2e（`main_test.ts`）
 - settings 含 `Bash(node *)`/`Bash(python *)`：向量 A/B/C/D 命中仍 **deny**；對照 `node -e 'JSON.stringify(x)'`
