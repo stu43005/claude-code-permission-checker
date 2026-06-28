@@ -159,6 +159,9 @@ main.ts → evaluate(command, root, initialCwd, rules, home, trustedReadRoots)
   閘序列，而在 `combine→classify` 步驟內。它與閘①②④ 同為硬 deny，彼此順序無關（`deny > ask > allow`）。
 - 閘④ 列於閘②之後、閘③之前：閘④ 置於閘③（ask）之前，確保命中時硬 deny 不被函式遮蔽 ask 降級
   （與閘①②同理）。
+- **閘編號說明**（沿用 2026-06-21 規格的歷史編號、非執行序）：①sleep-deny、②print-only-deny、
+  ③函式遮蔽-ask 為既有 evaluate 層閘；④（本功能）為新增 evaluate 層 deny 閘。**執行序**為
+  ①→②→④→③→`combine/classify`。遞迴根 deny 不在此編號內（classify-level，見上）。
 - 閘④ 在 `classify` 之前返回 → 天生硬性、不經中央前置規則、不經 `settingsAllows`。`Bash(node *)`/
   `Bash(python *)` 等**無法**解除。
 
@@ -318,10 +321,13 @@ interpreterPrintSprayDeny(invocations, script):
 
 1. **線性化 top-level sequential spine**：自 `script` 依序展開「當前 shell、無條件循序」的容器
    —— `Script.commands`、`CompoundList`、`BraceGroup`、以 `&&`/`;` 連接的 `AndOr` 成員 —— 得到一條
-   **有序的 statement 串**。`Subshell`/`Pipeline`/`If`/`For`/`While`/`Case`/`Function`、命令替換、以及
-   以 `||` 連接的成員一律視為**單一 opaque statement**（不展開、不深入），以免在「執行順序/可達性無
-   保證」處誤判。cwd 沿 spine 以 `walk` 相同規則 thread（遇 `cd` 後標 unknown），**每條 statement 記下
-   其自身的 cwd 快照**（`leafOf` 回傳的 `cwd` 即該 statement 入點的快照）。
+   **有序的 statement 串**。`Subshell`/`Pipeline`/`If`/`For`/`While`/`Case`/`Function`、命令替換、
+   **以 `&` 背景化/async 的 statement、coproc**、以及以 `||` 連接的成員一律視為**單一 opaque statement**
+   （不展開、不深入），以免在「執行順序/可達性無保證」處誤判。**WRITE 與 EXEC 兩者皆不得為背景/async
+   statement**（回應 round 4 finding 2：`cat > x & node x` 中背景寫入不保證在 `node` 讀檔前完成、甚至
+   未必先啟動 → 不 deny；與向量 D 排除背景 pipeline 一致）。cwd 沿 spine 以 `walk` 相同規則 thread
+   （遇 `cd` 後標 unknown），**每條 statement 記下其自身的 cwd 快照**（`leafOf` 回傳的 `cwd` 即該
+   statement 入點的快照）。
 2. **緊鄰前驅比對**（cwd-aware，回應 round 2 finding 1）：對 spine 上每個 statement，`leafOf` 取其 leaf。
    若某 statement 為 **`EXEC(P, lang, cwdₑ)`**（`leafOf` 名 ∈ INTERPRETERS 且 `recognizeInterpreter` 回
    `ScriptFile(P, lang)`、P 靜態），檢查其**緊鄰前一條** statement 是否為 **`WRITE(P', content, cwdᵥ)`**
@@ -331,11 +337,14 @@ interpreterPrintSprayDeny(invocations, script):
    `payloadIsAllStaticPrint(content, lang)` → **deny**。否則不 deny。
    （註：緊鄰時 `cwdᵥ === cwdₑ`，因兩者間無任何 statement；`cd` 介於兩者間時 `cd` 自身即緊鄰前驅、
    非 WRITE → 自然不 deny，見下例。）
-3. **`WRITE(P, content)` 定義**：statement 的 leaf 有寫入重導向 `>`/`>>`（`hasWriteRedirect`）、target 為
-   **靜態路徑** P，且內容可由該 leaf 靜態還原：`cat`/`tac` 搭靜態 heredoc/here-string
-   （`isHeredocPrintEligible`）→ 內容＝body；`echo`/`printf` 靜態 payload（沿用 `print_only.ts` 的
-   `wordPrintEligible`，printf 僅無格式化轉換符時可還原）→ 內容＝還原輸出字串。任何無法靜態還原 →
-   非 WRITE。
+3. **`WRITE(P, content)` 定義**：statement 的 leaf 有**截斷型寫入重導向 `>`/`>|`**（target 為**靜態路徑**
+   P），且內容可由該 leaf 靜態還原：`cat`/`tac` 搭靜態 heredoc/here-string（`isHeredocPrintEligible`）→
+   內容＝body；`echo`/`printf` 靜態 payload（沿用 `print_only.ts` 的 `wordPrintEligible`，printf 僅無格式化
+   轉換符時可還原）→ 內容＝還原輸出字串。任何無法靜態還原 → 非 WRITE。
+   - **排除 append `>>`（回應 round 4 finding 1）**：`>>` 是**附加**，最終檔案內容＝既有內容＋本次片段，
+     無法靜態證明整檔皆 print，且 `echo 'console.log("x")' >> real-test.js; node real-test.js` 會**誤 deny
+     既有真實腳本**。故 `>>`（及任何非截斷寫入）**不算 WRITE** → 不 deny。只有 `>`/`>|` 截斷覆寫使
+     「整檔內容＝本次靜態還原內容」成立，才可比對。
 
 **為何「緊鄰前驅」而非「任意前驅」**：靜態上要鎖定「**若 EXEC 執行、餵給它的就是這次寫入的內容**」。
 只認**緊鄰**前一條寫入，可同時免疫三種**靜態可判定**的錯配（皆會讓 node 跑到「已知不同的檔/內容」）：
@@ -501,6 +510,9 @@ export function interpreterPrintDenyReason(): string {
   - **cwd（回應 round 2 finding 1）**：`cat > x.mjs <<'EOF'…EOF; cd other; node x.mjs` → 不 deny（前驅是
     cd）；`cd "$D"; cat > x.mjs <<'EOF'…EOF; node x.mjs`（cwd unknown）→ 跳過、不 deny；相對 vs 絕對
     路徑解析到不同目錄 → 不 deny。
+  - **append / 背景（回應 round 4 findings）**：`echo 'console.log("x")' >> real.js; node real.js`（append `>>`）
+    → **不 deny**（非截斷寫入，無法證明整檔皆 print）；`cat > x.mjs <<'EOF'…EOF & node x.mjs`（背景寫入）
+    → **不 deny**（背景不保證寫入先完成）。
 - 向量 D：`echo 'console.log(1)' | node` → deny；`cat <<'EOF'…print…EOF | python` → deny；
   `grep x f | node` → 不 deny；`echo x | node app.js`（右為 ScriptFile）→ 不屬 D；多段 `a|b|node` → 不 deny。
   - **fd0 重導向（回應 round 2 finding 2）**：`echo 'console.log("x")' | node < real.js` → 不 deny（消費端
