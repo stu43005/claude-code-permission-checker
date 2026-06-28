@@ -186,8 +186,8 @@ main.ts → evaluate(command, root, initialCwd, rules, home, trustedReadRoots)
 - tokenize 過程 token 數 > `MAX_TOKENS`（建議 **20000**）→ **此 payload** `false`，同樣繼續掃描其他候選。
 - **不設「全域 byte 預算一旦超過就整體 `false`」**（round 7 finding 2：否則大的不相符 payload 會先耗盡預算、
   令後續小的相符 `node -e 'fake'` 漏判）。
-- **memoize（回應 round 14 finding 2）**：`payloadIsAllStaticPrint(source, lang)` 以 **(source identity, lang)**
-  為鍵快取結果。繼承式 redirect 會讓**同一個** heredoc body 被多個葉指令共用（如
+- **memoize（回應 round 14 finding 2）**：`payloadIsAllStaticPrint(source, lang)` 以 **(source 字串值, lang)**
+  為鍵（`Map<string, boolean>`，鍵如 `` `${lang} ${source}` ``）快取結果。繼承式 redirect 會讓**同一個** heredoc body 被多個葉指令共用（如
   `{ node; node; …多次…; } <<'EOF' …64KiB… EOF`），若不快取則每個 `node` 各 tokenize 一次 →
   葉數×payload。memoize 後每個**相異** source 只 tokenize 一次。故總工作量＝Σ(相異 payload 大小) ≤ 指令
   長度（OS/Bash 已對指令長度設限）→ O(指令長度)，**不隨葉數放大**。
