@@ -185,8 +185,12 @@ main.ts → evaluate(command, root, initialCwd, rules, home, trustedReadRoots)
   但**繼續掃描其他候選 payload**（不影響後續小 payload 的判定）。
 - tokenize 過程 token 數 > `MAX_TOKENS`（建議 **20000**）→ **此 payload** `false`，同樣繼續掃描其他候選。
 - **不設「全域 byte 預算一旦超過就整體 `false`」**（round 7 finding 2：否則大的不相符 payload 會先耗盡預算、
-  令後續小的相符 `node -e 'fake'` 漏判）。總工作量天然有界：每個 payload 至多被 tokenize 一次，且所有
-  payload 皆為**指令字串的子片段**，其位元組總和 ≤ 指令長度（OS/Bash 已對指令長度設限）→ 整體 O(指令長度)。
+  令後續小的相符 `node -e 'fake'` 漏判）。
+- **memoize（回應 round 14 finding 2）**：`payloadIsAllStaticPrint(source, lang)` 以 **(source identity, lang)**
+  為鍵快取結果。繼承式 redirect 會讓**同一個** heredoc body 被多個葉指令共用（如
+  `{ node; node; …多次…; } <<'EOF' …64KiB… EOF`），若不快取則每個 `node` 各 tokenize 一次 →
+  葉數×payload。memoize 後每個**相異** source 只 tokenize 一次。故總工作量＝Σ(相異 payload 大小) ≤ 指令
+  長度（OS/Bash 已對指令長度設限）→ O(指令長度)，**不隨葉數放大**。
 - 上述皆 fail-safe 方向（超限的**個別** payload 不 deny、退回既有 ask），確保 hook 同步路徑恆有界、永遠
   `exit 0`。
 
@@ -295,8 +299,9 @@ interpreterPrintSprayDeny(script, initialCwd):
         visit-children with defs.copy()（父 defs 不變）, fresh prevWrite = null, cwd 多為 unknown
         prevWriteRef = null
       SimpleCommand(node):                               // 任何單一簡單 Command（含 cat/echo/printf/node/python…）
-        leaf = leafOf(node)                              // §4.2.2（含繼承 redirect、cwd 快照）
-        if leaf != null and leaf.name in INTERPRETERS and leaf.name not in defs:  // 未（在此前、同 scope）被遮蔽
+        leaf = leafOf(node)                              // §4.2.2（含繼承 redirect、cwd 快照、assignments=prefix）
+        if leaf != null and leaf.name in INTERPRETERS and leaf.name not in defs
+           and leaf.assignments is empty:                // 無賦值前綴（回應 round 14：PATH=… 等可改變指令解析 → 身分不確定 → 不 deny）
           switch recognizeInterpreter(leaf):             // §4.2.1
             InlineEval(code,lang): if payloadIsAllStaticPrint(code,lang): found = true     // A（任何位置）
             StdinRead(lang): b=staticStdinBody(leaf); if b and payloadIsAllStaticPrint(b,lang): found = true  // B（任何位置）
@@ -313,8 +318,10 @@ interpreterPrintSprayDeny(script, initialCwd):
 ```
 
 > `staticTruncatingWriteOf(leaf)` 回 `WRITE(P, content, cwd, writerName)`：當 `leaf` 名 ∈
-> {`cat`,`tac`,`echo`,`printf`} 且有靜態截斷寫入重導向 `>`/`>|`（target 靜態 P）且內容可靜態還原
-> （§4.5 步驟 3）；否則回 `null`。任何**非簡單指令**或無此寫入 → `prevWrite` 重置為 `null`（緊鄰中斷）。
+> {`cat`,`tac`,`echo`,`printf`}、**無賦值前綴**（`leaf.assignments` 空；回應 round 14：`PATH=… cat` 等可改變
+> 指令解析）、且有靜態截斷寫入重導向 `>`/`>|`（target 靜態 P）且內容可靜態還原（§4.5 步驟 3）；否則回
+> `null`。任何**非簡單指令**或無此寫入 → `prevWrite` 重置為 `null`（緊鄰中斷）。**向量 D 的生產者/消費者**
+> 同理：任一段帶賦值前綴 → 身分不確定 → 跳過、不 deny。
 
 - **遮蔽 scope + source-order**：`node -e 'fake'; node(){:;}`（def 在後）→ `node -e` 時 defs 無 node →
   **deny**；`node(){:;}; node -e 'fake'`、`if cond; then node(){:;}; fi; node -e 'fake'`（同 shell、def 在前/
@@ -487,8 +494,10 @@ false-deny）。
 
 向量 D 在 §4.2 的 source-order AST 走訪中、對**任何位置的 `Pipeline` 節點**判定（`checkVectorD`；pipe 內
 資料流為節點內在、非跨敘述順序假設，故不限循序序列——亦與 A/B「任何位置」一致、無控制流包裝繞道）。
-**函式遮蔽跳過（order-aware）**：消費者直譯器名或生產者名 ∈ `definedBefore`（此前已出現定義）→ 跳過、
-不 deny（回應 round 6/7）。對每個 `Pipeline` 節點，
+**函式遮蔽跳過（scope/order-aware）**：消費者直譯器名或生產者名 ∈ 當前 `defs`（此前同 shell 已定義）→ 跳過、
+不 deny（回應 round 6/7）。**範圍可見性（回應 round 14 structural）**：pipeline 各段在 subshell 執行——走訪以
+**當前 `defs` 的複本**進入各段，故**此前同 shell 的函式定義在段內可見**（`node(){:;}; echo … | node` 一致跳過），
+但段內新定義**不洩漏回外層**。對每個 `Pipeline` 節點，
 只處理形如**恰兩段** `producer | interpreter` 的 Pipeline（`Pipeline.commands.length === 2`；多段
 `a | b | node` → 跳過、不 deny），且該 Pipeline statement 須**無下列改變語意的包裝，否則跳過、不 deny**：
 - **否定** `! producer | node`（negation 反轉退出碼，但更重要是表訊號其語意非單純 dataflow）→ 跳過。
@@ -585,6 +594,10 @@ export function interpreterPrintDenyReason(): string {
 7. **繼承式 stdin（回應 round 8）**：bare `node`/`python`/`deno run -`/`bun run -`/`ts-node` 無 fd0 重導向、
    從**繼承 stdin** 讀碼 → hook 看不到 payload → 不 deny（落 ask，可被 `Bash(node *)` 升級）。只有靜態
    heredoc/here-string（向量 B）與可見 pipe（向量 D）在硬 deny 範圍（§4.4）。
+8. **指令身分不確定（回應 round 14）**：(a) 直譯器/寫檔者帶**賦值前綴**（`PATH=… node -e …`、`LD_PRELOAD=…`）
+   可改變指令解析 → 身分不確定 → **不 deny**（落 classify；賦值前綴本即中央前置 ask）。(b) exec wrapper
+   `command`/`env`/`nice`/`nohup`/`timeout node -e …` 葉指令名為 wrapper（非 `node`）→ 不命中 INTERPRETERS
+   → under-deny（落 ask，屬 CLAUDE.md 已記錄的 exec-wrapper 繞道，安全方向）。
 
 > 上述 ask 多數**可被** `settingsAllows` 升級（使用者自設 `Bash(node *)` 等）——屬使用者自負的 settings
 > 風險；本功能不新增此升級路徑，亦不硬擋這些繞道。被閘④命中的全靜態-print 形態則**不可**升級。
@@ -649,6 +662,10 @@ export function interpreterPrintDenyReason(): string {
 - 資源上限（per-payload，回應 round 3 + round 7 finding 2）：>64 KiB 或 >20000 token 的**個別** payload
   → 該 payload `false`、不 deny，但**其他候選照常掃描**；關鍵回歸：**大的不相符 heredoc/inline 在前 ＋
   小的相符 `node -e 'console.log("fake")'` 在後 → 仍 deny**（無全域 fail-open 抑制後續判定）。
+- 繼承 heredoc fan-out memoize（回應 round 14 finding 2）：`{ node; node; …多次…; } <<'EOF' …大 body… EOF`
+  → 同一 body 只 tokenize 一次（memoize）、總工作量不隨葉數放大。
+- 指令身分（回應 round 14 finding 1）：`PATH=$PWD/bin:$PATH node -e 'console.log("x")'`（賦值前綴）→ 不 deny；
+  `command node -e 'console.log("x")'`/`env node -e …`（exec wrapper）→ 名非 node → 不 deny（under-deny）。
 - 直譯器辨識：`node -r x -e 'console.log(1)'`（副作用旗標）→ Unknown → 不 deny；`deno run -A x.ts`、
   `deno eval --no-check 'console.log("x")'`（任何 deno 旗標）→ Unknown → 不 deny；裸 `deno eval
   'console.log("x")'` → deny；動態 `node -e "$C"` → 不 deny。
