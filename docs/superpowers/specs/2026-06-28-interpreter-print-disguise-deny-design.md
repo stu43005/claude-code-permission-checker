@@ -148,12 +148,11 @@ node /tmp/verify.mjs
 main.ts → evaluate(command, root, initialCwd, rules, home, trustedReadRoots)
   └─ parse → script；walk(script) → invocations[]
        ├─ invocations.length === 0 → allow（no-op，不變）
-       ├─ fnNames = definedFunctionNames(script)                                  （★提前：閘③④ 共用）
        ├─ 閘①(deny)：some(name === "sleep") → deny(pollingDenyReason())            （不變）
        ├─ 閘②(deny)：isAllPrintOnly(invocations) → deny(printOnlyDenyReason())      （不變）
-       ├─ 閘④(deny)：interpreterPrintSprayDeny(invocations, script, fnNames)        （★新增；遮蔽名自我跳過）
+       ├─ 閘④(deny)：interpreterPrintSprayDeny(script)                              （★新增；spine pass、order-aware 遮蔽）
        │             → deny(interpreterPrintDenyReason())
-       ├─ 閘③(ask) ：anyShadowed(invocations, fnNames) → ask(functionShadowReason()) （既有，fnNames 提前算）
+       ├─ 閘③(ask) ：函式遮蔽（whole-script fnNames）→ ask(functionShadowReason())   （不變）
        └─ combine(invocations.map(classify))                                        （不變）
                      └─ classify 內：遞迴遍歷磁碟根/家目錄根 deny（既有、per-leaf，於 classify 短路）
 ```
@@ -176,12 +175,15 @@ main.ts → evaluate(command, root, initialCwd, rules, home, trustedReadRoots)
 純函式。`lang`：python/python3 → `"py"`；node/nodejs/deno/bun/ts-node → `"js"`。回 `true`（→ 該向量
 命中、整鏈 deny）**僅當**下列全部成立，否則一律 `false`：
 
-**步驟 0：資源上限（回應 round 3 finding：DoS/延遲邊界）**
-- `source` 位元組數 > `MAX_PAYLOAD_BYTES`（建議 **64 KiB**）→ 立即 `false`（不 tokenize、不 deny）。
-- tokenize 過程 token 數 > `MAX_TOKENS`（建議 **20000**）→ 立即 `false`。
-- `interpreterPrintSprayDeny` 單次 hook 評估的「所有 payload 來源位元組」累計 > `MAX_TOTAL_BYTES`
-  （建議 **256 KiB**）→ 其後不再萃取、整體 `false`。
-- 三者皆 fail-safe 方向（超限即不 deny、退回既有 ask），確保 hook 同步路徑恆有界、永遠 `exit 0`。
+**步驟 0：資源上限（per-payload，無全域 fail-open；回應 round 3 + round 7 finding 2）**
+- `source` 位元組數 > `MAX_PAYLOAD_BYTES`（建議 **64 KiB**）→ **此 payload** 立即 `false`（不 tokenize），
+  但**繼續掃描其他候選 payload**（不影響後續小 payload 的判定）。
+- tokenize 過程 token 數 > `MAX_TOKENS`（建議 **20000**）→ **此 payload** `false`，同樣繼續掃描其他候選。
+- **不設「全域 byte 預算一旦超過就整體 `false`」**（round 7 finding 2：否則大的不相符 payload 會先耗盡預算、
+  令後續小的相符 `node -e 'fake'` 漏判）。總工作量天然有界：每個 payload 至多被 tokenize 一次，且所有
+  payload 皆為**指令字串的子片段**，其位元組總和 ≤ 指令長度（OS/Bash 已對指令長度設限）→ 整體 O(指令長度)。
+- 上述皆 fail-safe 方向（超限的**個別** payload 不 deny、退回既有 ask），確保 hook 同步路徑恆有界、永遠
+  `exit 0`。
 
 **步驟 1：Tokenize**（線性掃描，依 lang 區分註解）
 - 跳過：空白、換行、shebang（行首 `#!`…整行）、註解（js `//`…行尾、`/* … */`；py `#`…行尾）。
@@ -223,35 +225,45 @@ token 未完全消費、py `print` 出現 `=` keyword 引數）→ 立即 `false
 
 ### 4.2 直譯器葉指令辨識與向量分派（`interpreterPrintSprayDeny`）
 
-向量 A/B 是**單葉指令**判定（不需順序資訊），由攤平後的 `invocations` 迴圈處理；向量 C/D 需要
-**執行順序 / 管段相鄰**資訊（`invocations` 攤平後不保留），各由一個**獨立唯讀 AST pass** 直接讀
-`script` 處理。三者皆**不改** `walk.ts` 與 `CommandInvocation`。
-
-**函式遮蔽防護（回應 round 6 finding）**：閘④ 接收 `evaluate` 已算好的 `fnNames =
-definedFunctionNames(script)`，並對**任何參與判定的指令名**（直譯器、向量 C 的寫檔 `cat`/`tac`/`echo`/
-`printf`、向量 D 的生產者）做檢查：**該名 ∈ `fnNames`（被同腳本函式遮蔽）→ 該筆比對跳過、不 deny**。
-因被遮蔽時實際執行的是函式本體、非真正的直譯器/寫檔指令，指令身分不確定，**不可硬 deny**；跳過後落
-既有閘③（函式遮蔽 → 不可升級 ask），身分不確定者安全交人工確認。
+**閘④ 為單一、順序感知的 spine pass（回應 round 7 finding 1：函式遮蔽須 order-aware）**：四向量
+全部在**同一條 top-level sequential spine 的有序走訪**中判定（spine 定義同 §4.5：`Script.commands`、
+`CompoundList`、`BraceGroup`、`&&`/`;` 的 `AndOr` 成員；`Subshell`/`Pipeline`/控制流/`Function` body/
+命令替換/`&` 背景/`||` 一律 opaque）。走訪時維護 `definedSoFar`＝**至此 spine 位置之前已定義的函式名**；
+Bash 中函式定義只影響其**之後**執行的指令，故 `definedSoFar` 精準反映「此位置該名是否被遮蔽」。
 
 ```
-interpreterPrintSprayDeny(invocations, script, fnNames):
-  // 向量 A/B：單葉指令
-  for inv in invocations:
-    if inv.name not in INTERPRETERS: continue
-    if inv.name in fnNames: continue                          // 被函式遮蔽 → 身分不確定 → 不 deny（落閘③ ask）
-    mode = recognizeInterpreter(inv)                           // §4.2.1
-    match mode:
-      InlineEval(code, lang):     if payloadIsAllStaticPrint(code, lang): return true   // 向量 A
-      StdinRead(lang):            // 向量 B：該葉指令 fd0 為靜態 heredoc/here-string
-        body = staticStdinBody(inv)                            // 取 heredoc/here-string 靜態內容
-        if body != null and payloadIsAllStaticPrint(body, lang): return true
-      _: continue                                              // ScriptFile/Unknown 不在此處判（C 走 AST pass）
-  // 向量 C：順序感知、緊鄰前驅寫檔（AST pass，§4.5；EXEC 直譯器名或 WRITE 指令名 ∈ fnNames → 跳過）
-  if writeThenExecPrintSpray(script, fnNames): return true
-  // 向量 D：pipe 餵 stdin（AST pass，§4.6；消費者直譯器名或生產者名 ∈ fnNames → 跳過）
-  if pipeStdinPrintSpray(script, fnNames): return true
+interpreterPrintSprayDeny(script):
+  spine = linearizeSequentialSpine(script)      // 有序 statement 串；opaque 節點見上（§4.5）
+  definedSoFar = {}                              // 此前已在 spine 定義的函式名（order-aware 遮蔽）
+  prevWrite = null                               // 緊鄰前一條的靜態截斷 WRITE（向量 C 用）
+  for stmt in spine:
+    if stmt 是函式定義(name): definedSoFar.add(name); prevWrite = null; continue
+    if stmt 是兩段 producer|interpreter pipeline:                              // 向量 D
+      if checkVectorD(stmt, definedSoFar): return true                        // 消費者/生產者名 ∈ definedSoFar → 跳過
+      prevWrite = null; continue
+    leaf = leafOf(stmt)
+    if leaf == null: { prevWrite = null; continue }                          // 其他 opaque
+    if leaf.name in INTERPRETERS and leaf.name not in definedSoFar:           // 未（在此前）被遮蔽
+      switch recognizeInterpreter(leaf):                                       // §4.2.1
+        InlineEval(code, lang): if payloadIsAllStaticPrint(code, lang): return true        // 向量 A
+        StdinRead(lang):  body = staticStdinBody(leaf)                                      // 向量 B
+                          if body and payloadIsAllStaticPrint(body, lang): return true
+        ScriptFile(P, lang):                                                                 // 向量 C
+          if prevWrite is WRITE(P', content, cwdᵥ, writerName)
+             and writerName not in definedSoFar
+             and pathsEqualCwdAware(P', cwdᵥ, P, leaf.cwd)
+             and payloadIsAllStaticPrint(content, lang): return true
+    prevWrite = staticTruncatingWriteOf(leaf)    // 是靜態截斷寫檔 → 記為 WRITE，否則 null（更新緊鄰前驅）
   return false
 ```
+
+- **遮蔽 order-aware**：`node -e 'fake'; node(){:;}` → 走到 `node -e` 時 `definedSoFar` 不含 node → **deny**
+  （def 在後、真 node 先執行）；`node(){:;}; node -e 'fake'` → 走到 `node -e` 時 node ∈ `definedSoFar` →
+  跳過 → 落閘③ **ask**。寫檔/生產者名同理以 `definedSoFar` 判（向量 C 的 `writerName`、向量 D 的生產者）。
+- **僅 spine 範圍**：off-spine 的直譯器呼叫（`if`/`for`/subshell/命令替換 內）**不由閘④ 判**（落既有
+  classify/閘③ → ask，安全方向 under-deny）。常見偽裝（頂層 `node -e …`、`cat>x; node x`）皆在 spine。
+- **不改** `walk.ts`／`CommandInvocation`；spine pass 純讀 AST，`leafOf` 見 §4.2.2。`evaluate` 的閘③ 仍用
+  既有 whole-script `fnNames`（over-ask 安全）；閘④ 自備 order-aware `definedSoFar`，兩者獨立。
 
 **共用 leaf 萃取 `leafOf(statement)`（§4.2.2）**：向量 C/D 的 AST pass 需把單一 `Statement` 化約成
 與 `recognizeInterpreter`／靜態生產者判定相同的 `{name, argv, redirects, cwd}` 形狀。`leafOf` 只接受
@@ -308,7 +320,7 @@ interpreterPrintSprayDeny(invocations, script, fnNames):
 
 #### 4.2.2 共用 leaf 萃取 `leafOf(statement)`
 
-向量 C/D 的 AST pass 以此把單一 `Statement` 化約成 `{name, argv, redirects, cwd}`：
+§4.2 的統一 spine pass 以此把單一 `Statement` 化約成 `{name, argv, redirects, cwd}`：
 - 僅當 `statement.command` 為單一簡單 `Command` 節點時回傳該形狀；`name = staticValue(cmd.name)`
   （動態 → `null`）、`argv = cmd.suffix`、`redirects = [...statement.redirects, ...cmd.redirects]`、
   `assignments = cmd.prefix`，`cwd` 取該位置的有效 cwd（AST pass 自身以與 `walk` 相同規則於 top-level
@@ -336,8 +348,9 @@ interpreterPrintSprayDeny(invocations, script, fnNames):
 ### 4.5 向量 C（同鏈寫腳本檔 → 執行同檔）詳述
 
 **順序感知、緊鄰前驅**（修 round 1 design-soundness no-ship：原「掃全表建 map」忽略執行順序，會把
-`node x; cat > x <<EOF…EOF`（node 實際跑既有檔）誤判為跑後寫的靜態 payload）。改為 AST pass
-`writeThenExecPrintSpray(script)`：
+`node x; cat > x <<EOF…EOF`（node 實際跑既有檔）誤判為跑後寫的靜態 payload）。向量 C 在 §4.2 的**統一
+spine pass** 內判定（其 `prevWrite` 即實作「緊鄰前驅 WRITE」、`definedSoFar` 即 order-aware 遮蔽）；以下
+為其規則。spine 線性化與 opaque 邊界定義（步驟 1）由該統一 pass 共用：
 
 1. **線性化 top-level sequential spine**：自 `script` 依序展開「當前 shell、無條件循序」的容器
    —— `Script.commands`、`CompoundList`、`BraceGroup`、以 `&&`/`;` 連接的 `AndOr` 成員 —— 得到一條
@@ -365,9 +378,10 @@ interpreterPrintSprayDeny(invocations, script, fnNames):
      無法靜態證明整檔皆 print，且 `echo 'console.log("x")' >> real-test.js; node real-test.js` 會**誤 deny
      既有真實腳本**。故 `>>`（及任何非截斷寫入）**不算 WRITE** → 不 deny。只有 `>`/`>|` 截斷覆寫使
      「整檔內容＝本次靜態還原內容」成立，才可比對。
-   - **函式遮蔽跳過（回應 round 6 finding）**：`writeThenExecPrintSpray(script, fnNames)` 接收 `fnNames`；
-     若 **EXEC 直譯器名 ∈ fnNames** 或 **WRITE 指令名（`cat`/`tac`/`echo`/`printf`）∈ fnNames** → 該配對
-     身分不確定 → 跳過、不 deny（落閘③ ask）。
+   - **函式遮蔽跳過（order-aware，回應 round 6/7 finding）**：以 §4.2 的 `definedSoFar`（**此前已定義**的
+     函式名）判；若 **EXEC 直譯器名 ∈ definedSoFar** 或 **WRITE 指令名（`cat`/`tac`/`echo`/`printf`）∈
+     definedSoFar** → 該配對身分不確定 → 跳過、不 deny（落閘③ ask）。**只有在該指令之前定義的函式才算
+     遮蔽**（之後定義的不影響）。
 
 **為何「緊鄰前驅」而非「任意前驅」**：靜態上要鎖定「**若 EXEC 執行、餵給它的就是這次寫入的內容**」。
 只認**緊鄰**前一條寫入，可同時免疫三種**靜態可判定**的錯配（皆會讓 node 跑到「已知不同的檔/內容」）：
@@ -404,9 +418,9 @@ false-deny）。
 
 ### 4.6 向量 D（pipe 餵 stdin）詳述
 
-`pipeStdinPrintSpray(script, fnNames)`：獨立唯讀 AST pass（**函式遮蔽跳過**：消費者直譯器名或生產者名
-∈ `fnNames` → 跳過、不 deny，回應 round 6 finding）。**只在 §4.5 的 top-level sequential spine 上尋找
-`Pipeline` statement**（回應 round 3 finding 2：不再「遞迴走訪所有 Pipeline」，避免把 conditional/
+向量 D 在 §4.2 的**統一 spine pass** 內判定（`checkVectorD`）。**函式遮蔽跳過（order-aware）**：消費者
+直譯器名或生產者名 ∈ `definedSoFar`（此前已定義）→ 跳過、不 deny（回應 round 6/7 finding）。**只在
+top-level sequential spine 上尋找 `Pipeline` statement**（回應 round 3 finding 2：不再「遞迴走訪所有 Pipeline」，避免把 conditional/
 subshell/命令替換內、或不可達分支裡的 pipeline 當成已執行 dataflow）。對 spine 上每個 statement，
 只處理形如**恰兩段** `producer | interpreter` 的 Pipeline（`Pipeline.commands.length === 2`；多段
 `a | b | node` → 跳過、不 deny），且該 Pipeline statement 須**無下列改變語意的包裝，否則跳過、不 deny**：
@@ -447,21 +461,20 @@ heredoc 另由向量 B 判）。
 
 於閘②之後、閘③之前插入：
 
-`fnNames = definedFunctionNames(script)` 為既有閘③ 已計算者；閘④ 共用同一集合（**在閘④ 之前算好、
-傳入**，使閘④ 能對被遮蔽的直譯器/寫檔名跳過、不硬 deny）：
+閘④ 為 §4.2 的單一 spine pass，**只吃 `script`**（自備 order-aware `definedSoFar`，不需外部 `fnNames`）：
 
 ```ts
-// 閘 ④（deny）：直譯器執行全靜態-print payload（四向量）——classify 前短路、不可升級
-// fnNames：同腳本函式定義名集合（既有閘③ 用），傳入以跳過被遮蔽的指令名（身分不確定 → 不硬 deny）
-if (interpreterPrintSprayDeny(invocations, script, fnNames)) {
+// 閘 ④（deny）：直譯器執行全靜態-print payload（四向量，spine pass）——classify 前短路、不可升級
+if (interpreterPrintSprayDeny(script)) {
   return { verdict: "deny", reason: interpreterPrintDenyReason() };
 }
 ```
 
 - 仍在既有 try/catch 內 → `interpreterPrintSprayDeny` 任何例外 → `evaluate` 收斂為 ask（fail-safe）。
-- `script`、`fnNames` 皆已存在於 `evaluate`（parse 結果與既有閘③ 的計算），直接傳入；無新參數穿透。
-- **與閘③ 的關係**：閘④ 仍列於閘③ 之前（保硬 deny 不被遮蔽降級），但對**被遮蔽的指令名自我跳過** →
-  該情形落閘③ 回不可升級 ask。即「未遮蔽的真直譯器」走閘④（可能 deny）、「被遮蔽者」走閘③（ask）。
+- `script` 已存在於 `evaluate`（parse 結果）；閘④ 自走 spine、自算 `definedSoFar`，**無新參數穿透**。
+- **與閘③ 的關係**：閘④ 仍列於閘③ 之前（保硬 deny 不被遮蔽降級），但對「**在該指令之前已定義函式**」
+  而遮蔽的名自我跳過（order-aware）→ 該情形落閘③ 回不可升級 ask。閘③ 沿用既有 whole-script `fnNames`
+  （over-ask、安全），與閘④ 的 order-aware `definedSoFar` 各自獨立、互不影響。
 
 ### 4.8 deny 理由 helper（`src/rules/types.ts`）
 
@@ -554,16 +567,20 @@ export function interpreterPrintDenyReason(): string {
   - **包裝/邊界（回應 round 3 finding 2）**：`! echo 'console.log(1)' | node`（否定）、
     `echo 'console.log(1)' | node &`（背景）、`(echo 'console.log(1)' | node) > f`（pipeline 級重導向）、
     `if cond; then echo 'console.log(1)' | node; fi`（conditional 內、非 spine）→ 一律不 deny。
-- 資源上限（回應 round 3 finding 3）：>64 KiB 的 inline/heredoc/pipe payload、>20000 token 的 payload
-  → 述詞回 `false`、整體不 deny（退回 ask）；多筆 payload 累計 >256 KiB → 其後不再萃取、不 deny。
+- 資源上限（per-payload，回應 round 3 + round 7 finding 2）：>64 KiB 或 >20000 token 的**個別** payload
+  → 該 payload `false`、不 deny，但**其他候選照常掃描**；關鍵回歸：**大的不相符 heredoc/inline 在前 ＋
+  小的相符 `node -e 'console.log("fake")'` 在後 → 仍 deny**（無全域 fail-open 抑制後續判定）。
 - 直譯器辨識：`node -r x -e 'console.log(1)'`（副作用旗標）→ Unknown → 不 deny；`deno run -A x.ts`、
   `deno eval --no-check 'console.log("x")'`（任何 deno 旗標）→ Unknown → 不 deny；裸 `deno eval
   'console.log("x")'` → deny；動態 `node -e "$C"` → 不 deny。
 - 裸形式覆蓋（回應 round 5）：`echo 'console.log("x")' > verify.ts; ts-node --transpile-only verify.ts`
   （script 前有旗標）→ Unknown → **不 deny（有意 under-deny）**；對照裸 `… ; ts-node verify.ts` → deny。
-- 函式遮蔽（回應 round 6）：`node() { :; }; node -e 'console.log("x")'` → 閘④ 跳過（node ∈ fnNames）→
-  落閘③ → **ask（非 deny）**；`python`/`deno` 同理；向量 C `cat() { :; }; cat > x.mjs <<'EOF'…EOF; node
-  x.mjs`（cat 被遮蔽）→ 不 deny → 閘③ ask；向量 D 生產者被遮蔽同理。
+- 函式遮蔽 order-aware（回應 round 6/7）：`node() { :; }; node -e 'console.log("x")'`（def 在前）→ 閘④
+  跳過 → 閘③ **ask**；**`node -e 'console.log("fake")'; node() { :; }`（def 在後）→ 真 node 先執行 →
+  **deny**（不被後置 def 降級）；`python`/`deno` 同理；向量 C `cat() { :; }; cat > x.mjs <<'EOF'…EOF;
+  node x.mjs`（cat 前置遮蔽）→ 不 deny → 閘③ ask；向量 D 生產者前置遮蔽同理。
+- off-spine：`if cond; then node -e 'console.log("x")'; fi`、`$(node -e 'console.log("x")')` → 閘④ 不判
+  （under-deny）→ 落 classify ask。
 
 ### 7.3 不可升級 e2e（`main_test.ts`，子行程）
 
@@ -587,7 +604,7 @@ export function interpreterPrintDenyReason(): string {
 
 `deno task check && deno task lint && deno task test` 全綠。
 
-## 8. 風險與未決
+## 8. 風險與邊界（多為已記錄、刻意接受的取捨）
 
 - **向量 C「緊鄰前驅」的有意 under-deny**：只認 EXEC 緊鄰前一條為靜態寫同檔，故 `cat > x …; echo hi;
   node x`、寫/執行分屬不同控制流分支等非緊鄰形態**不 deny**（退回既有 ask）。這是為 zero false-deny 換取
