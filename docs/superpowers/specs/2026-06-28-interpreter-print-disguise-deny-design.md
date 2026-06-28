@@ -81,9 +81,13 @@ node /tmp/verify.mjs
 | bun | js | `-e`/`--eval[=]<code>` | `bun run -` | `bun <file>` / `bun run <file>` |
 | ts-node | js | `-e`/`--eval <code>` | 管道（無旗標；未實機確認） | 第一個非旗標位置參數 |
 
-- **副作用/預載旗標**（出現即「不可判定為純 print」，→ 跳過、不 deny）：node `-r`/`--require`/`--import`/
-  `--env-file`；python `-m`/`-i`；deno `--preload`/`--require`/`--allow-*`/`-A`；bun `-r`/`--preload`/
-  `--require`/`--import`。
+- 兩個**正交**的旗標分類（避免混淆，回應 round 19 structural）：
+  - **(A) arity（供 entrypoint 解析）**：「無值旗標」略過 1 token、其餘略過 2（§4.2.1）。
+  - **(B) 預載/注入碼旗標（供 inline/stdin payload 純度）**：出現即破壞「純 print」→ inline/stdin 回 `Unknown`。
+- **(B) 預載/注入碼旗標清單**：node `-r`/`--require`/`--import`/`--env-file`；python **`-m`**（執行模組碼）；
+  deno `--preload`/`--require`/`--allow-*`/`-A`；bun `-r`/`--preload`/`--require`/`--import`。
+  （python `-i` **不在 (B)**——它只在執行後進 REPL、**不注入額外碼**；分類為 **(A) 的無值良性旗標**，
+  見 §4.2.1。此一致性修正 round 19 的 `-i` 雙重分類。）
 - **value-flags**（資訊性；列出各直譯器帶值旗標）：**本設計刻意不維護精確 arity 表**——§4.2.1 對 script
   執行採**保守 entrypoint 解析**（§4.2.1：已知無值旗標略過 1 token、其餘一律當帶值略過 2 token；
   arity 誤判只會吃掉 entrypoint → under-deny，**絕不**把旗標值升格成 entrypoint），故只需一個小「無值旗標」
@@ -302,11 +306,12 @@ interpreterPrintSprayDeny(script, initialCwd):
         prevWriteRef = null
       SimpleCommand(node):                               // 任何單一簡單 Command（含 cat/echo/printf/node/python…）
         leaf = leafOf(node)                              // §4.2.2（含繼承 redirect、cwd 快照、assignments=prefix）
-        if leaf != null and leaf.name in INTERPRETERS and leaf.name not in defs
-           and leaf.assignments is empty:                // 無賦值前綴（回應 round 14：PATH=… 等可改變指令解析 → 身分不確定 → 不 deny）
-          switch recognizeInterpreter(leaf):             // §4.2.1
+        exec = (leaf != null) ? resolveExec(leaf) : null // §4.2.0：透視 command/env/timeout/nice/nohup wrapper
+        if exec != null and exec.name in INTERPRETERS and exec.name not in defs
+           and leaf.assignments is empty:                // 無賦值前綴（round 14：PATH=… 可改變解析 → 不 deny；env 改環境已於 resolveExec→Unknown）
+          switch recognizeInterpreter(exec):             // §4.2.1（exec＝§4.2.0 透視後的 name+argv）
             InlineEval(code,lang): if payloadIsAllStaticPrint(code,lang): found = true     // A（任何位置）
-            StdinRead(lang): b=staticStdinBody(leaf); if b and payloadIsAllStaticPrint(b,lang): found = true  // B（任何位置）
+            StdinRead(lang): b=staticStdinBody(leaf); if b and payloadIsAllStaticPrint(b,lang): found = true  // B（leaf.redirects 上的 fd0）
             ScriptExec(entrypoint,lang):                 // C（僅 SameShellSeq、緊鄰；entrypoint＝被執行腳本，非旗標值）
               if prevWriteRef is WRITE(P',content,cwd_v,writerName) and writerName not in defs
                  and pathsEqualCwdAware(P',cwd_v, entrypoint,cwd) and payloadIsAllStaticPrint(content,lang): found = true
@@ -342,6 +347,28 @@ interpreterPrintSprayDeny(script, initialCwd):
 的單一 source-order AST 走訪（§4.2）使用。
 
 `INTERPRETERS = {node, nodejs, python, python3, deno, bun, ts-node}`。
+
+#### 4.2.0 exec-wrapper 透視 `resolveExec(leaf)`（回應 round 19 finding：閉合 wrapper 繞道）
+
+在判定 `leaf.name ∈ INTERPRETERS` **之前**，先透視一小組**保留執行語意**的 exec wrapper，得到真正被執行的
+`(name, argv)`；使 `timeout 5 node -e 'fake'`、`command node -e 'fake'`、`nohup python -c 'fake'` 等仍走
+gate ④（與使用者 round-17 意圖一致——附帶 wrapper 不改變「會跑這支 print 腳本」）。**保守、fail-safe**：
+任何 wrapper 旗標/位置參數動態、或 env 改變環境 → 回 `Unknown`（不 deny），解析錯誤只會 under-deny。
+
+- `command [-p] CMD…`（`-v`/`-V` 查詢模式 → `Unknown`）→ 透視成 `CMD…`。
+- `nohup CMD…`、`setsid CMD…`、`stdbuf <-oL 等opts> CMD…` → 透視成 `CMD…`（stdbuf 的 `-oL/-eL/-iL` 等吃值）。
+- `nice [-n N | -N] CMD…` → 略過 `-n N`，透視成 `CMD…`。
+- `timeout [opts] DURATION CMD…` → 略過 opts（`--preserve-status`/`--foreground`/`-s SIG`/`--signal=`/
+  `-k DUR`/`--kill-after=`）與 `DURATION` 位置參數，透視成 `CMD…`。
+- `env CMD…`：**僅當無環境改變**（無 `NAME=VAL` 賦值、無 `-i`/`--ignore-environment`、無 `-u NAME`）→ 透視成
+  `CMD…`；否則（改環境，`PATH=` 等可改變指令解析）→ `Unknown`（與 §4.2.1 賦值前綴跳過同理）。
+- **遞迴**透視（wrapper 套 wrapper，如 `timeout 5 nice -n 1 node …`）；遇未知 wrapper 名或非上述形 → 不再
+  透視（以當前 name 判定，多半非 INTERPRETERS → under-deny）。動態 CMD 名 → `Unknown`。
+
+> 透視後 `(name, argv)` 餵 `recognizeInterpreter`；其餘 gate ④ 邏輯（賦值前綴跳過、entrypoint 解析、向量
+> A/B/C/D、source-order 遮蔽）不變。**安全**：透視只在保留執行語意且**靜態可解**的 wrapper 形式啟用；
+> 任何不確定 → `Unknown`、不 deny。e2e 須驗 `env node -e 'fake'`/`timeout 5 python -c 'fake'` 即使有
+> `Bash(node *)`/`Bash(timeout *)` 仍 **deny**（gate ④ 短路、不經 settingsAllows）。
 
 #### 4.2.1 `recognizeInterpreter(inv)`（每直譯器一組規則）
 
@@ -599,10 +626,12 @@ export function interpreterPrintDenyReason(): string {
 7. **繼承式 stdin（回應 round 8）**：bare `node`/`python`/`deno run -`/`bun run -`/`ts-node` 無 fd0 重導向、
    從**繼承 stdin** 讀碼 → hook 看不到 payload → 不 deny（落 ask，可被 `Bash(node *)` 升級）。只有靜態
    heredoc/here-string（向量 B）與可見 pipe（向量 D）在硬 deny 範圍（§4.4）。
-8. **指令身分不確定（回應 round 14）**：(a) 直譯器/寫檔者帶**賦值前綴**（`PATH=… node -e …`、`LD_PRELOAD=…`）
-   可改變指令解析 → 身分不確定 → **不 deny**（落 classify；賦值前綴本即中央前置 ask）。(b) exec wrapper
-   `command`/`env`/`nice`/`nohup`/`timeout node -e …` 葉指令名為 wrapper（非 `node`）→ 不命中 INTERPRETERS
-   → under-deny（落 ask，屬 CLAUDE.md 已記錄的 exec-wrapper 繞道，安全方向）。
+8. **指令身分不確定（回應 round 14/19）**：(a) 直譯器/寫檔者帶**賦值前綴**（`PATH=… node -e …`、
+   `LD_PRELOAD=…`）可改變指令解析 → 身分不確定 → **不 deny**。(b) **保留執行語意的 exec wrapper**
+   （`command`/`nohup`/`nice`/`timeout`/`env`(無環境改變)/`setsid`/`stdbuf`）→ §4.2.0 **透視**後仍走 gate ④ →
+   `timeout 5 node -e 'fake'`、`command node -e 'fake'` 等 **deny**（回應 round 19，閉合此繞道）。**殘留
+   under-deny**：env 帶 `NAME=VAL`/`-i`（改環境）、未知 wrapper、wrapper 帶動態參數 → `Unknown`、不 deny
+   （安全方向；與賦值前綴同理）。
 
 > 上述 ask 多數**可被** `settingsAllows` 升級（使用者自設 `Bash(node *)` 等）——屬使用者自負的 settings
 > 風險；本功能不新增此升級路徑，亦不硬擋這些繞道。被閘④命中的全靜態-print 形態則**不可**升級。
@@ -676,7 +705,12 @@ export function interpreterPrintDenyReason(): string {
   `command node -e 'console.log("x")'`/`env node -e …`（exec wrapper）→ 名非 node → 不 deny（under-deny）。
 - 直譯器辨識（inline 純度）：`node -r x -e 'console.log(1)'`（inline + 預載旗標 → payload 失純）→ Unknown
   → 不 deny；`deno eval --allow-read 'console.log("x")'`（inline + 副作用）→ Unknown；裸/帶良性旗標
-  `node --no-warnings -e 'console.log("x")'`、`deno eval 'console.log("x")'` → deny；動態 `node -e "$C"` → 不 deny。
+  `node --no-warnings -e 'console.log("x")'`、`deno eval 'console.log("x")'`、`python -i -c 'print("x")'`
+  （-i 良性無值）→ deny；動態 `node -e "$C"` → 不 deny。
+- exec wrapper 透視（回應 round 19）：`timeout 5 node -e 'console.log("fake")'`、`command node -e '…'`、
+  `nohup python -c 'print("fake")'`、`nice -n 5 node -e '…'` → **deny**；**e2e**：含 `Bash(node *)`/
+  `Bash(timeout *)` 時 `timeout 5 node -e '…'` 仍 **deny**（不經 settingsAllows）；`env X=1 node -e '…'`
+  （改環境）、`foowrap node -e '…'`（未知 wrapper）→ 不 deny（under-deny）。
 - script 執行旗標無關（回應 round 17）：`echo 'console.log("x")' > verify.ts; ts-node --transpile-only verify.ts`
   → **deny**；`… > x.mjs; node --experimental-default-type=module x.mjs` → **deny**；`… > x.ts; deno run -A x.ts`
   → **deny**（entrypoint=x、命中前驅 P）；對照路徑不符 `… > a.mjs; node b.mjs` → 不 deny。
