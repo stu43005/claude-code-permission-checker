@@ -192,8 +192,12 @@ main.ts → evaluate(command, root, initialCwd, rules, home, trustedReadRoots)
 
 **步驟 1：Tokenize**（線性掃描，依 lang 區分註解）
 - 跳過：空白、換行、shebang（行首 `#!`…整行）、註解（js `//`…行尾、`/* … */`；py `#`…行尾）。
-- 產生 token：`STRING`（js `'…'`/`"…"`/`` `…` ``；py `'…'`/`"…"`，含一般引號逸脫；**反引號/含
-  `${` 的模板 → 標記 `DYNAMIC`**；**py f-string 前綴 `f"…"`/`f'…'` → `DYNAMIC`**）、`NUMBER`、
+- 產生 token（回應 round 13 finding 2，明確各語言靜態字串字面量）：
+  - js `STRING`：`'…'`、`"…"`；**模板字串 `` `…` ``：不含 `${` → `STRING`（靜態）；含 `${` → `DYNAMIC`**。
+  - py `STRING`：`'…'`、`"…"`、**三引號 `'''…'''`/`"""…"""`（多行靜態）**；含一般引號逸脫。
+  - **動態前綴 → `DYNAMIC`**：py f-string `f"…"`/`f'…'`/`f"""…"""`（含 `rf`/`fr` 等含 `f` 的組合）。
+    （py `r`/`b`/`rb` 等**不含 `f`** 的前綴仍是靜態字串 → `STRING`。）
+  其餘 token：`NUMBER`、
   `NAME`（識別字，含點號鏈如 `console.log`、`sys.stdout.write`）、`PUNCT`（`(` `)` `,` `;`）、
   其餘任何字元（`+ - * / = % < > [ ] { } & | ! : ? ~ ^` 等）→ `OTHER`。
 - **`NUMBER` 形狀**（明確化，回應 structural advisory）：`[+-]?` 前導正負號、十進位整數或小數
@@ -290,19 +294,27 @@ interpreterPrintSprayDeny(script, initialCwd):
       NewShellScope(Subshell ( )/命令替換 $( )/程序替換/&背景/coproc):           // 其內定義不洩漏回父
         visit-children with defs.copy()（父 defs 不變）, fresh prevWrite = null, cwd 多為 unknown
         prevWriteRef = null
-      InterpreterCommand(leaf):                          // leaf.name ∈ INTERPRETERS
-        if leaf.name not in defs:                        // 當前 scope 未（在此前）被遮蔽
+      SimpleCommand(node):                               // 任何單一簡單 Command（含 cat/echo/printf/node/python…）
+        leaf = leafOf(node)                              // §4.2.2（含繼承 redirect、cwd 快照）
+        if leaf != null and leaf.name in INTERPRETERS and leaf.name not in defs:  // 未（在此前、同 scope）被遮蔽
           switch recognizeInterpreter(leaf):             // §4.2.1
             InlineEval(code,lang): if payloadIsAllStaticPrint(code,lang): found = true     // A（任何位置）
             StdinRead(lang): b=staticStdinBody(leaf); if b and payloadIsAllStaticPrint(b,lang): found = true  // B（任何位置）
             ScriptFile(P,lang):                          // C（僅 SameShellSeq、緊鄰）
               if prevWriteRef is WRITE(P',content,cwdᵥ,writerName) and writerName not in defs
                  and pathsEqualCwdAware(P',cwdᵥ, P,cwd) and payloadIsAllStaticPrint(content,lang): found = true
-        prevWriteRef = staticTruncatingWriteOf(leaf)     // 更新緊鄰前驅（僅 SameShellSeq 內）
+        // ★關鍵（回應 round 13 finding 1）：對**任何**簡單指令更新 prevWrite——寫檔者 cat/tac/echo/printf
+        // 並非 INTERPRETERS，但正是向量 C 的 WRITE 來源；若只在 interpreter 分支更新，旗艦案例 cat>x; node x 會漏。
+        prevWriteRef = (leaf != null) ? staticTruncatingWriteOf(leaf) : null      // 非靜態截斷寫檔 → null
+        update cwd（leaf 為 cd 則 thread；僅 SameShellSeq 內持久）
     return updated cwd
   visit(script, initialCwd, {}/*defs*/, &null)
   return found
 ```
+
+> `staticTruncatingWriteOf(leaf)` 回 `WRITE(P, content, cwd, writerName)`：當 `leaf` 名 ∈
+> {`cat`,`tac`,`echo`,`printf`} 且有靜態截斷寫入重導向 `>`/`>|`（target 靜態 P）且內容可靜態還原
+> （§4.5 步驟 3）；否則回 `null`。任何**非簡單指令**或無此寫入 → `prevWrite` 重置為 `null`（緊鄰中斷）。
 
 - **遮蔽 scope + source-order**：`node -e 'fake'; node(){:;}`（def 在後）→ `node -e` 時 defs 無 node →
   **deny**；`node(){:;}; node -e 'fake'`、`if cond; then node(){:;}; fi; node -e 'fake'`（同 shell、def 在前/
@@ -318,7 +330,7 @@ interpreterPrintSprayDeny(script, initialCwd):
 `argv=cmd.suffix`、`redirects=[...statement.redirects, ...cmd.redirects]`、`cwd`＝該位置有效 cwd）；
 凡 command 為 Pipeline/Subshell/控制流/Function 等複合節點 → 回 `null`（該 statement 視為 opaque）。
 此 helper 純讀、與 `walk.ts` 的 `emitCommand` 取值方式一致但**不修改** walk，僅供 `interp_print.ts`
-的兩個 AST pass 使用。
+的單一 source-order AST 走訪（§4.2）使用。
 
 `INTERPRETERS = {node, nodejs, python, python3, deno, bun, ts-node}`。
 
@@ -599,10 +611,11 @@ export function interpreterPrintDenyReason(): string {
 
 - **deny（`true`）**：js 多行 `console.log("…")`；py 多行 `print("…")`；含 `//`/`#`/`/* */` 註解＋print；
   shebang＋print；`console.error`/`process.stdout.write`/`sys.stdout.write` 變體；多字面量逗號分隔；
-  數字字面量 `console.log(42)`；同行 `print("a");print("b")`。
+  數字字面量 `console.log(42)`；同行 `print("a");print("b")`；**py 三引號 `print("""fake""")`/`print('''x''')`**；
+  **js 無 `${` 模板 `` console.log(`fake`) ``**；**py 非-f 前綴 `print(r"raw")`/`print(b"x")`**（回應 round 13）。
 - **不-deny（`false`）**：`console.log(1+1)`、`"a"+"b"`、`JSON.stringify(x)`、`sorted([…])`、`json.dumps`、
-  變數 `console.log(x)`、模板 `` `${x}` ``、py f-string、`import`/`require`、`if`/`for`、賦值、
-  未閉合括號/引號、空 payload、`console.log()`、`print("x", end="")`（kwargs `=`）。
+  變數 `console.log(x)`、**含 `${}` 模板 `` `${x}` ``**、**py f-string `print(f"{x}")`/`print(f"""{x}""")`**、
+  `import`/`require`、`if`/`for`、賦值、未閉合括號/引號、空 payload、`console.log()`、`print("x", end="")`（kwargs `=`）。
 
 ### 7.2 向量整合測試（`evaluate_test.ts` 或 `interp_print_test.ts`）
 
