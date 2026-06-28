@@ -661,5 +661,5 @@ export function interpreterPrintDenyReason(): string {
   觸發 StdinRead；若 ts-node 實際語意不同，最差是漏 deny（安全方向）。
 - **詞法器 fragility**：手寫 tokenizer 對冷僻字串逸脫/多行構造可能誤判——但因 fail-safe，誤判方向恆為
   「不 deny」（漏 deny），不會誤 deny。測試需覆蓋逸脫與未閉合案例固化此性質。
-- **效能**：閘④ 對每次 Bash 呼叫多一趟 invocations 掃描＋（命中直譯器時）一趟極小詞法；payload 通常
-  短，額外成本可忽略。
+- **效能**：閘④ 對每次 Bash 呼叫多一趟 source-order AST 走訪＋（命中直譯器時）一趟極小詞法；payload
+  通常短，總工作量 O(指令長度)（§4.1 步驟 0），額外成本可忽略。
