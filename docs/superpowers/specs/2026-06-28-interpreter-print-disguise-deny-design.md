@@ -125,6 +125,10 @@ node /tmp/verify.mjs
 
 ### 2.1 目標
 
+- **Shipped guarantee（明確界定，使用者 2026-06-28 接受、§5.1 item 1）**：硬 deny 僅涵蓋**單一 Bash 呼叫
+  鏈內**的「直譯器執行全靜態-print payload」（含同鏈寫檔→執行，向量 C）。**跨 Bash 呼叫拆分**（呼叫 1 寫檔、
+  呼叫 2 執行）**不在範圍**——本 hook per-call 無狀態，此為本工具所有 deny 類別共有的根本架構邊界，**刻意
+  不引入持久 taint 狀態**（非目標，§2.2）。本功能擋的是「單一呼叫所表達的偽裝形態」，非以狀態追蹤的「行為」。
 - 在 `evaluate` 既有閘②（整鏈 print-only）之後新增**閘④（deny）**：偵測「直譯器執行全靜態-print
   payload」四向量，命中即整鏈 deny，`classify` 前短路、不可由 `permissions.allow` 升級。
 - 新增 `src/engine/interp_print.ts`：
@@ -809,6 +813,11 @@ export function interpreterPrintDenyReason(): string {
   （證明閘④ 不經 settingsAllows）。
 - 對照：`node -e 'console.log(JSON.stringify(x))'`＋`Bash(node *)` → **allow**（真實運算可升級，未被閘④
   命中），證明只擋全靜態-print 子集。
+- **跨呼叫拆分（已記錄之 shipped-guarantee 邊界，使用者 2026-06-28 接受、§5.1 item 1）**：
+  - 呼叫 1 `cat > /tmp/x.mjs <<'EOF'…EOF`（孤立）→ **ask**（寫入重導向中央前置、不可升級）。
+  - 呼叫 2 `node /tmp/x.mjs`（孤立、含 `Bash(node *)`）→ **allow**（hook 無跨呼叫狀態，第二呼叫不知 x.mjs
+    來歷）。此即「硬 deny 僅及單一呼叫鏈」的明確界定；**單一呼叫** `cat > /tmp/x.mjs <<'EOF'…EOF; node
+    /tmp/x.mjs` 則 **deny**（向量 C）。本測試固化此邊界（非待修 bug）。
 
 ### 7.4 誤 deny 稽核清單
 
