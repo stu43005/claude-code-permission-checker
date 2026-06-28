@@ -167,7 +167,9 @@ main.ts → evaluate(command, root, initialCwd, rules, home, trustedReadRoots)
 1. **inline-eval 旗標**：node/bun/ts-node `-e`/`--eval`、python `-c`、`deno eval`（子指令）、`-p`/`--print`
    （吐運算式值）。取其值為 payload。
 2. **會注入/改變執行的旗標**（出現即**跳過此葉**、不偵測）：`-r`/`--require`/`--import`/`-m`/`--preload`/
-   `--env-file`（node/bun/python/deno 對應者）。
+   `--env-file`（node/bun/python/deno 對應者）。**只計 inline payload/script 位置參數之前的旗標**——
+   inline-eval（`-e`/`-c`）值之後的 token 是程式 argv，不視為直譯器旗標（`node -e 'console.log("x")' -r p`
+   的 `-r` 在 payload 之後＝argv → 不致跳過 → 仍 deny；回應 structural advisory）。
 3. **不影響執行的良性旗標**（**無視、繼續偵測**）：其餘旗標——`--transpile-only`/`--experimental-*`/
    `--no-warnings`/deno `--allow-*`/`-A`/`--no-check`、ts-node `--esm`… 以及它們的值（如 `--allow-read=path`）。
    解析時略過這些旗標 token（保守：`--flag=value` 略 1；裸 `--flag` 略 1；不維護精確 arity 表——多略/少略只
@@ -187,10 +189,11 @@ main.ts → evaluate(command, root, initialCwd, rules, home, trustedReadRoots)
     靜態輸出）。`>>` append、多重輸出重導向、`1>&2` 等 → 非 WRITE。
   - **緊鄰前驅**：WRITE 是 EXEC 在**同一循序序列**（`;`/newline 或 `&&` 連接的 `AndOr`）內的**緊鄰前一個
     sibling**。允許**前面有其他 setup leg**（`mkdir -p /tmp && cat > /tmp/x <<EOF…EOF && node /tmp/x`、
-    `cd /tmp; cat > x; node x` 皆 deny——常見 scaffolding，回應簡化後 review）。**WRITE 與 EXEC 之間**有任何
-    其他 statement（含 `cd`：`cat > x; cd other; node x`）、或跨控制流/subshell/背景/`||` 邊界 → 非緊鄰前驅
-    → 不 deny。（`false && cat > x && node x` 等含前置 leg 者仍 deny：結構即偽裝意圖；`false` 短路與否不影響
-    判定，屬刻意接受、與既有閘① 對 dead 分支 sleep 一致的結構/意圖導向。）
+    `cd /tmp; cat > x; node x` 皆 deny——常見 scaffolding）。**WRITE 與 EXEC 之間**有任何其他 statement（含
+    `cd`：`cat > x; cd other; node x`）、或跨控制流/subshell/背景/`||` 邊界 → 非緊鄰前驅 → 不 deny。
+  - **靜態不可達排除**（回應 review medium：不 deny 永不執行的鏈）：若 EXEC 所在 `&&` 鏈中、WRITE 之前有
+    **靜態必失敗 leg**（字面 `false` 指令，或 `! true`）→ 整鏈短路、WRITE/EXEC 皆不執行 → **不 deny**
+    （`false && cat > x && node x` → 不 deny）。`mkdir`/`cd`/`test` 等非靜態必失敗 leg → 視為可達、照常 deny。
   - **同檔比對**：以各自 statement 的 cwd 快照 `normalizeAbsolute` 後**字面相等**即同檔。緊鄰前驅時兩端 cwd
     同一快照——cwd known（含 `cd /static`）時解析絕對路徑比對；cwd unknown（如先前 `cd $DYN`）時，**相同
     相對路徑字串**仍同檔（同 cwd）→ 可比對；一絕對一相對且 cwd unknown → 無法證明 → 不 deny。
@@ -262,8 +265,9 @@ if (interpreterPrintSprayDeny(script, initialCwd)) {
   → 不 deny。
 - C：**旗艦** `cat > /tmp/x.mjs <<'EOF'<print>EOF; node /tmp/x.mjs` → deny；`&&` 緊鄰 → deny；`echo '<print>' > f; node f`
   → deny；寫專案內同理。**含 setup leg（常見 scaffolding）**：`mkdir -p /tmp && cat > /tmp/x.mjs <<'EOF'<print>EOF
-  && node /tmp/x.mjs`、`cd /tmp; cat > x.mjs <<'EOF'<print>EOF; node x.mjs`、`false && cat > x.mjs <<'EOF'<print>EOF
-  && node x.mjs` → **deny**（緊鄰前驅，前置 setup/短路 leg 不影響）。
+  && node /tmp/x.mjs`、`cd /tmp; cat > x.mjs <<'EOF'<print>EOF; node x.mjs` → **deny**（緊鄰前驅，前置 setup
+  leg 不影響）。**靜態不可達不 deny**：`false && cat > x.mjs <<'EOF'<print>EOF && node x.mjs`（前置字面 `false`
+  → 整鏈短路）→ 不 deny。
 - D：`echo 'console.log(1)' | node` → deny；`grep x f | node`/多段 → 不 deny；`echo … | node < real.js`（fd0
   蓋過）→ 不 deny。
 
