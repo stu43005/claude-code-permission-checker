@@ -267,7 +267,8 @@ token 未完全消費、py `print` 出現 `=` keyword 引數）→ 立即 `false
 **統一原則**：閘④ 依**結構/意圖**偵測偽裝，**在 AST 中任何位置**命中即 deny（與本工具既有 deny 哲學
 一致——閘① 連 dead 分支的 sleep 都 deny；使用者 round-3 明確採意圖導向）。唯三類「身分/資料流不確定」
 才跳過：**(i) 名被 source-order 前置函式定義遮蔽**、**(ii) payload/路徑動態無法靜態取得**、**(iii) 改變
-資料流/啟動順序的包裝**（背景 `&`、coproc、否定 `!`、整體 pipeline redirect、消費端 fd0 蓋過 pipe）。
+資料流/啟動順序的包裝**（背景 `&`、coproc、整體 pipeline redirect、消費端 fd0 蓋過 pipe）。**否定 `!`
+不在此列**（`!` 只反轉退出碼、不改 producer→consumer 資料流，回應 round 20 finding 1）。
 - **向量 A/B（單葉 inline/stdin）對任何位置的直譯器 Command 節點生效**（含 `if`/`for`/subshell/命令替換
   內——回應 round 9 finding 2：`if true; then node -e 'fake'; fi`、`(node -e 'fake')` 不再繞過硬 deny）。
 - **向量 D（兩段 `producer|interpreter` Pipeline）亦對任何位置的 Pipeline 節點生效**（pipe 內「生產者
@@ -307,7 +308,9 @@ interpreterPrintSprayDeny(script, initialCwd):
       SimpleCommand(node):                               // 任何單一簡單 Command（含 cat/echo/printf/node/python…）
         leaf = leafOf(node)                              // §4.2.2（含繼承 redirect、cwd 快照、assignments=prefix）
         exec = (leaf != null) ? resolveExec(leaf) : null // §4.2.0：透視 command/env/timeout/nice/nohup wrapper
-        if exec != null and exec.name in INTERPRETERS and exec.name not in defs
+        if exec != null and exec.name in INTERPRETERS
+           and leaf.name not in defs                     // 遮蔽檢查用「shell 最先解析的最外層名」leaf.name（回應 round 20 finding 2）：
+                                                         //   bare node → leaf.name=node；timeout 5 node → leaf.name=timeout（real timeout exec node binary、node 函式無關）
            and leaf.assignments is empty:                // 無賦值前綴（round 14：PATH=… 可改變解析 → 不 deny；env 改環境已於 resolveExec→Unknown）
           switch recognizeInterpreter(exec):             // §4.2.1（exec＝§4.2.0 透視後的 name+argv）
             InlineEval(code,lang): if payloadIsAllStaticPrint(code,lang): found = true     // A（任何位置）
@@ -522,9 +525,10 @@ false-deny）。
 但段內新定義**不洩漏回外層**。對每個 `Pipeline` 節點，
 只處理形如**恰兩段** `producer | interpreter` 的 Pipeline（`Pipeline.commands.length === 2`；多段
 `a | b | node` → 跳過、不 deny），且該 Pipeline statement 須**無下列改變語意的包裝，否則跳過、不 deny**：
-- **否定** `! producer | node`（negation 反轉退出碼，但更重要是表訊號其語意非單純 dataflow）→ 跳過。
 - **背景/async** `producer | node &`、coproc → 跳過。
 - **pipeline 整體掛載的 redirect**（如 `(producer | node) > f`、statement 級重導向影響整體）→ 跳過。
+- **否定 `!` 不跳過**（回應 round 20 finding 1）：`!` 僅反轉退出碼、不改 producer→consumer stdin 流 →
+  `! echo 'console.log("fake")' | node` 仍照常判向量 D → **deny**。
 **兩段各為一個 `Statement`**，皆以 §4.2.2 的 `leafOf` 化約成 `{name, argv, redirects, cwd}`（任一段
 `leafOf` 回 `null`，即該段非單一簡單 Command → 跳過、不 deny）：
 - 右段（消費者）`leafOf` 名 ∈ INTERPRETERS 且 `recognizeInterpreter` 回 `StdinRead(lang)`（即無
@@ -692,17 +696,19 @@ export function interpreterPrintDenyReason(): string {
   - **fd0 重導向（回應 round 2 finding 2）**：`echo 'console.log("x")' | node < real.js` → 不 deny（消費端
     fd0 被 `< real.js` 蓋過）；`echo … | node <<'EOF'…EOF` → 不取 pipe source（消費者 heredoc 為有效
     stdin）；`echo … | node 0<&3` fd-dup → 不 deny。
-  - **包裝/邊界（回應 round 3 finding 2）**：`! echo 'console.log(1)' | node`（否定）、
-    `echo 'console.log(1)' | node &`（背景）、`(echo 'console.log(1)' | node) > f`（pipeline 級重導向）、
-    `! echo 'console.log(1)' | node`（否定）→ 不 deny。對照 `if true; then echo 'console.log(1)' | node; fi`
-    （conditional 內的 pipe，無 (iii) 包裝）→ **deny**（向量 D 任何位置生效，回應 round 9）。
+  - **包裝/邊界（回應 round 3/20）**：`echo 'console.log(1)' | node &`（背景）、
+    `(echo 'console.log(1)' | node) > f`（pipeline 級重導向）→ 不 deny；**`! echo 'console.log(1)' | node`
+    （否定）→ **deny**（`!` 不改資料流，回應 round 20 finding 1）**；`if true; then echo 'console.log(1)' |
+    node; fi`（conditional 內的 pipe，無 (iii) 包裝）→ **deny**（向量 D 任何位置生效，回應 round 9）。
 - 資源上限（per-payload，回應 round 3 + round 7 finding 2）：>64 KiB 或 >20000 token 的**個別** payload
   → 該 payload `false`、不 deny，但**其他候選照常掃描**；關鍵回歸：**大的不相符 heredoc/inline 在前 ＋
   小的相符 `node -e 'console.log("fake")'` 在後 → 仍 deny**（無全域 fail-open 抑制後續判定）。
 - 繼承 heredoc fan-out memoize（回應 round 14 finding 2）：`{ node; node; …多次…; } <<'EOF' …大 body… EOF`
   → 同一 body 只 tokenize 一次（memoize）、總工作量不隨葉數放大。
-- 指令身分（回應 round 14 finding 1）：`PATH=$PWD/bin:$PATH node -e 'console.log("x")'`（賦值前綴）→ 不 deny；
-  `command node -e 'console.log("x")'`/`env node -e …`（exec wrapper）→ 名非 node → 不 deny（under-deny）。
+- 指令身分（回應 round 14/19/20）：`PATH=$PWD/bin:$PATH node -e 'console.log("x")'`（賦值前綴）→ 不 deny；
+  **`command node -e 'console.log("x")'`/`env node -e …`（無環境改變的 exec wrapper）→ 透視後 **deny**（§4.2.0）**；
+  `env X=1 node -e …`（改環境）→ 不 deny。函式遮蔽不誤抑制 wrapper：`node(){:;}; timeout 5 node -e 'fake'`
+  → leaf.name=timeout ∉ defs、real timeout exec node binary → **deny**（回應 round 20 finding 2）。
 - 直譯器辨識（inline 純度）：`node -r x -e 'console.log(1)'`（inline + 預載旗標 → payload 失純）→ Unknown
   → 不 deny；`deno eval --allow-read 'console.log("x")'`（inline + 副作用）→ Unknown；裸/帶良性旗標
   `node --no-warnings -e 'console.log("x")'`、`deno eval 'console.log("x")'`、`python -i -c 'print("x")'`
