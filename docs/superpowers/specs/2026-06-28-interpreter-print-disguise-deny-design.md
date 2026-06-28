@@ -88,9 +88,10 @@ node /tmp/verify.mjs
 #### 1.4.2 unbash 4.0.1 解析行為（沿用 2026-06-21 規格，信心度：高）
 
 1. 攤平後的 `CommandInvocation` 已帶 **`redirects`（含繼承的寫入 target 與 heredoc body/content）**
-   與 **`argv`（suffix）**、**`assignments`（prefix）**、**`cwd`**。故「同葉指令的寫入重導向＋heredoc
-   body」「直譯器葉指令的旗標/位置參數」皆可由 `CommandInvocation[]` 直接取得，**vectors A/B/C 不需改
-   `walk.ts`**。
+   與 **`argv`（suffix）**、**`assignments`（prefix）**、**`cwd`**。故**單葉指令**判定（向量 A/B：直譯器
+   旗標/位置參數、其 fd0 heredoc body）可由 `CommandInvocation[]` 直接取得。向量 C/D 需**執行順序/管段
+   相鄰**資訊（攤平後不保留），改由獨立唯讀 AST pass 直接讀 `script`，**皆不改** `walk.ts`／
+   `CommandInvocation`（§4.2.2 的 `leafOf` 對單一 `Statement` 純讀化約，與 `emitCommand` 同取值方式）。
 2. heredoc：引號分隔符（`<<'EOF'`）→ `heredocQuoted === true`、body 為 `undefined`、$ 不展開（靜態）；
    未引號且含展開 → `body` 為結構化 Word；純文字 → body `undefined`、文字在 `content`。靜態性判定沿用
    `print_only.ts` 既有的 `isHeredocPrintEligible`（引號分隔符，或 body/content 無 `$`/反引號）。
@@ -113,7 +114,7 @@ node /tmp/verify.mjs
   payload」四向量，命中即整鏈 deny，`classify` 前短路、不可由 `permissions.allow` 升級。
 - 新增 `src/engine/interp_print.ts`：
   - 純函式 `payloadIsAllStaticPrint(source: string, lang: "js" | "py"): boolean`——手寫極小、
-    **fail-closed** 的 tokenizer + 窄文法比對（§4.1）。
+    **fail-safe** 的 tokenizer + 窄文法比對（§4.1）。
   - 四向量的偵測入口 `interpreterPrintSprayDeny(invocations, script): boolean`（§4.2–§4.6）。
 - 新增 deny 理由 helper `interpreterPrintDenyReason()`（`src/rules/types.ts`，§4.8）。
 - 同步更新 CLAUDE.md：deny「三類/三閘」→「四類/四閘」、政策反轉段落、架構管線圖（§6）。
@@ -130,7 +131,7 @@ node /tmp/verify.mjs
 - **不**涵蓋 `bash -c`/`sh -c`/`eval`/`perl -e`/`ruby -e`/`php -r`/`source`（維持既有可升級 ask）。
 - **不**改 echo/printf/cat 既有 print-only 閘②語意、**不**改寫入重導向/賦值前綴/中央前置任何既有判定。
   本功能**只收緊（新增 deny）**，不放寬任何既有判定。
-- **不**改 `walk.ts` 攤平職責（vectors A/B/C 由現有 `CommandInvocation[]` 算出；vector D 由獨立 AST
+- **不**改 `walk.ts` 攤平職責（向量 A/B 由現有 `CommandInvocation[]` 算出；向量 C/D 由獨立 AST
   pass 讀 `script`）。**不**改 `CommandInvocation` 結構。
 - **不**引入快取、**不**讀 enterprise managed-settings。
 
@@ -149,10 +150,14 @@ main.ts → evaluate(command, root, initialCwd, rules, home, trustedReadRoots)
        │             → deny(interpreterPrintDenyReason())
        ├─ 閘③(ask) ：函式遮蔽 → ask(functionShadowReason())                         （不變）
        └─ combine(invocations.map(classify))                                        （不變）
+                     └─ classify 內：遞迴遍歷磁碟根/家目錄根 deny（既有、per-leaf，於 classify 短路）
 ```
 
-- 閘④ 列於閘②之後、閘③之前。四個產出 deny 的閘（①②④＋遞迴根 deny）彼此順序無關（`deny > ask >
-  allow`）；閘④ 置於閘③（ask）之前，確保命中時硬 deny 不被遮蔽豁免降級（與閘①②同理）。
+- **遞迴根 deny 的位置**：它**不是** evaluate 層的閘，而是各遞迴指令規則在 `classify` 內以
+  `isDangerousRoot` 判定、由 `classify` 對 `deny` 短路（既有行為，本功能不動）；故未列於上方 evaluate
+  閘序列，而在 `combine→classify` 步驟內。它與閘①②④ 同為硬 deny，彼此順序無關（`deny > ask > allow`）。
+- 閘④ 列於閘②之後、閘③之前：閘④ 置於閘③（ask）之前，確保命中時硬 deny 不被函式遮蔽 ask 降級
+  （與閘①②同理）。
 - 閘④ 在 `classify` 之前返回 → 天生硬性、不經中央前置規則、不經 `settingsAllows`。`Bash(node *)`/
   `Bash(python *)` 等**無法**解除。
 
@@ -183,7 +188,7 @@ PRINT_FN '(' ARG (',' ARG)* ')' ';'?
   （模板/f-string）、巢狀 `(`。
 - 須 **≥1 條** print 敘述（零有效 token → `false`）。
 
-**步驟 3：fail-closed**
+**步驟 3：fail-safe（任何不確定即 `false` → 不 deny、退回既有 ask；絕不誤 deny）**
 比對過程遇到任何不吻合（`NAME` 出現在該是 `STRING`/`PRINT_FN` 的位置、`OTHER`、`DYNAMIC`、未閉合、
 token 未完全消費、py `print` 出現 `=` keyword 引數）→ 立即 `false`。
 
@@ -200,24 +205,36 @@ token 未完全消費、py `print` 出現 `=` keyword 引數）→ 立即 `false
 
 ### 4.2 直譯器葉指令辨識與向量分派（`interpreterPrintSprayDeny`）
 
+向量 A/B 是**單葉指令**判定（不需順序資訊），由攤平後的 `invocations` 迴圈處理；向量 C/D 需要
+**執行順序 / 管段相鄰**資訊（`invocations` 攤平後不保留），各由一個**獨立唯讀 AST pass** 直接讀
+`script` 處理。三者皆**不改** `walk.ts` 與 `CommandInvocation`。
+
 ```
 interpreterPrintSprayDeny(invocations, script):
-  staticWrites = buildStaticWriteMap(invocations)              // 向量 C 用（§4.5）
+  // 向量 A/B：單葉指令
   for inv in invocations:
     if inv.name not in INTERPRETERS: continue
-    mode = recognizeInterpreter(inv)                           // §4.2
+    mode = recognizeInterpreter(inv)                           // §4.2.1
     match mode:
       InlineEval(code, lang):     if payloadIsAllStaticPrint(code, lang): return true   // 向量 A
       StdinRead(lang):            // 向量 B：該葉指令 fd0 為靜態 heredoc/here-string
         body = staticStdinBody(inv)                            // 取 heredoc/here-string 靜態內容
         if body != null and payloadIsAllStaticPrint(body, lang): return true
-      ScriptFile(path, lang):     // 向量 C
-        src = staticWrites.get(normalize(path, inv.cwd))
-        if src != null and payloadIsAllStaticPrint(src, lang): return true
-      Unknown: continue                                        // 含副作用/未知旗標 → 跳過
-  if pipeStdinPrintSpray(script): return true                  // 向量 D（§4.6）
+      _: continue                                              // ScriptFile/Unknown 不在此處判（C 走 AST pass）
+  // 向量 C：順序感知、緊鄰前驅寫檔（AST pass，§4.5）
+  if writeThenExecPrintSpray(script): return true
+  // 向量 D：pipe 餵 stdin（AST pass，§4.6）
+  if pipeStdinPrintSpray(script): return true
   return false
 ```
+
+**共用 leaf 萃取 `leafOf(statement)`（§4.2.2）**：向量 C/D 的 AST pass 需把單一 `Statement` 化約成
+與 `recognizeInterpreter`／靜態生產者判定相同的 `{name, argv, redirects, cwd}` 形狀。`leafOf` 只接受
+「statement 的 command 為單一簡單 `Command` 節點」者，回傳該形狀（`name=staticValue(cmd.name)`、
+`argv=cmd.suffix`、`redirects=[...statement.redirects, ...cmd.redirects]`、`cwd`＝該位置有效 cwd）；
+凡 command 為 Pipeline/Subshell/控制流/Function 等複合節點 → 回 `null`（該 statement 視為 opaque）。
+此 helper 純讀、與 `walk.ts` 的 `emitCommand` 取值方式一致但**不修改** walk，僅供 `interp_print.ts`
+的兩個 AST pass 使用。
 
 `INTERPRETERS = {node, nodejs, python, python3, deno, bun, ts-node}`。
 
@@ -247,7 +264,19 @@ interpreterPrintSprayDeny(invocations, script):
     `--allow-*`/`-A`/`--preload`/`--require`/未知旗標 → `Unknown`。
   - 其他子指令（`deno test`/`deno task`/…）→ `Unknown`（不屬本偵測）。
 
-> 此辨識器**只負責分派與 fail-closed**；真正判定靜態-print 仍由 §4.1 述詞。任何辨識歧義一律 `Unknown`。
+> 此辨識器**只負責分派**，行為 fail-safe（任何辨識歧義一律 `Unknown` → 不 deny）；真正判定靜態-print
+> 仍由 §4.1 述詞。
+
+#### 4.2.2 共用 leaf 萃取 `leafOf(statement)`
+
+向量 C/D 的 AST pass 以此把單一 `Statement` 化約成 `{name, argv, redirects, cwd}`：
+- 僅當 `statement.command` 為單一簡單 `Command` 節點時回傳該形狀；`name = staticValue(cmd.name)`
+  （動態 → `null`）、`argv = cmd.suffix`、`redirects = [...statement.redirects, ...cmd.redirects]`、
+  `assignments = cmd.prefix`，`cwd` 取該位置的有效 cwd（AST pass 自身以與 `walk` 相同規則於 top-level
+  sequential spine 上 thread cwd；遇控制流/subshell 內即不適用，見 §4.5）。
+- command 為 `Pipeline`/`Subshell`/`If`/`For`/`While`/`Case`/`BraceGroup`/`Function`/… 等複合節點
+  → 回 `null`（該 statement 對本 pass 視為 **opaque**）。
+- 純讀，取值方式與 `walk.ts` 的 `emitCommand` 一致，但**不修改** `walk.ts`／`CommandInvocation`。
 
 ### 4.3 向量 A（inline）詳述
 
@@ -267,40 +296,67 @@ interpreterPrintSprayDeny(invocations, script):
 
 ### 4.5 向量 C（同鏈寫腳本檔 → 執行同檔）詳述
 
-`buildStaticWriteMap(invocations)`：掃所有葉指令，蒐集「**靜態寫出檔案**」：
-- 葉指令有**寫入重導向** `>`/`>>`（`hasWriteRedirect`）且 target 為**靜態路徑** P（`staticValue`），且其
-  「被寫入的內容」可由本葉指令靜態取得：
-  - `cat`/`tac` 搭靜態 heredoc/here-string（`isHeredocPrintEligible`）→ 內容＝heredoc body。
-  - `echo`/`printf` 靜態 payload（沿用 `print_only.ts` 的 `wordPrintEligible`/`staticValue`，組出輸出
-    字串；printf 僅在無格式化轉換符時內容可確定）→ 內容＝還原的輸出字串。
-- 以 `normalizeAbsolute(P, inv.cwd)` 為 key 存入 map（值＝內容字串）。
-- **歧義即放棄**：同一正規化 path 被多筆寫入（內容可能不同）→ 該 key 標記為「不可判定」、不納入 map
-  （保守，不 deny）。path 動態、或內容無法靜態確定 → 不納入。
+**順序感知、緊鄰前驅**（修 round 1 design-soundness no-ship：原「掃全表建 map」忽略執行順序，會把
+`node x; cat > x <<EOF…EOF`（node 實際跑既有檔）誤判為跑後寫的靜態 payload）。改為 AST pass
+`writeThenExecPrintSpray(script)`：
 
-`recognizeInterpreter` 回 `ScriptFile(P, lang)` 時，以 `normalizeAbsolute(P, inv.cwd)` 查 map；命中且
-`payloadIsAllStaticPrint(內容, lang)` → deny。
-例（目標案例）：`cat > /tmp/x.mjs <<'EOF'\nconsole.log("…")\nEOF; node /tmp/x.mjs` → map[`/tmp/x.mjs`]
-＝heredoc body（全 console.log 字面量）；`node /tmp/x.mjs` → ScriptFile → 述詞 `true` → **deny**。
-`echo 'console.log("x")' > x.mjs; node x.mjs` → 同理 deny。
-`cat > x.py <<'EOF'\nimport sys; print(sys.argv)\nEOF; python x.py` → 述詞遇 import → `false` → 不 deny。
+1. **線性化 top-level sequential spine**：自 `script` 依序展開「當前 shell、無條件循序」的容器
+   —— `Script.commands`、`CompoundList`、`BraceGroup`、以 `&&`/`;` 連接的 `AndOr` 成員 —— 得到一條
+   **有序的 statement 串**。`Subshell`/`Pipeline`/`If`/`For`/`While`/`Case`/`Function`、命令替換、以及
+   以 `||` 連接的成員一律視為**單一 opaque statement**（不展開、不深入），以免在「執行順序/可達性無
+   保證」處誤判。cwd 沿 spine 以 `walk` 相同規則 thread（遇 `cd` 後標 unknown）。
+2. **緊鄰前驅比對**：對 spine 上每個 statement，`leafOf` 取其 leaf。若某 statement 為
+   **`EXEC(P, lang)`**（`leafOf` 名 ∈ INTERPRETERS 且 `recognizeInterpreter` 回 `ScriptFile(P, lang)`、
+   P 靜態），檢查其**緊鄰前一條** statement 是否為 **`WRITE(P', content)`**（靜態寫腳本檔，見下）且
+   `normalizeAbsolute(P', cwd) === normalizeAbsolute(P, cwd)`；若是且 `payloadIsAllStaticPrint(content,
+   lang)` → **deny**。否則不 deny。
+3. **`WRITE(P, content)` 定義**：statement 的 leaf 有寫入重導向 `>`/`>>`（`hasWriteRedirect`）、target 為
+   **靜態路徑** P，且內容可由該 leaf 靜態還原：`cat`/`tac` 搭靜態 heredoc/here-string
+   （`isHeredocPrintEligible`）→ 內容＝body；`echo`/`printf` 靜態 payload（沿用 `print_only.ts` 的
+   `wordPrintEligible`，printf 僅無格式化轉換符時可還原）→ 內容＝還原輸出字串。任何無法靜態還原 →
+   非 WRITE。
+
+**為何「緊鄰前驅」而非「任意前驅」**：要 zero false-deny 就得保證「被執行的內容＝該次寫入的內容」。
+只認**緊鄰**前一條寫入，可同時免疫：執行在寫入之前（`node x; cat > x …` → EXEC 的前驅非寫 x → 不
+deny）、中間插入可能改寫 P 的其他 statement（前驅非 WRITE → 不 deny）、重複寫入（只看最後緊鄰那筆）。
+代價是非緊鄰的 `cat > x …; echo hi; node x` 不 deny（保守漏 deny，安全、可接受）。
+
+- 目標案例 `cat > /tmp/x.mjs <<'EOF'\nconsole.log("…")\nEOF`（newline＝`;`）`node /tmp/x.mjs` → 兩條
+  在 spine 上**緊鄰**、同 path、內容全 console.log 字面量 → **deny**。
+- `cat > x.mjs <<'EOF'…EOF && node x.mjs`（`&&` 連接）→ 緊鄰 → deny；且 `&&` 保證寫入成功才執行。
+- `node x.mjs; cat > x.mjs <<'EOF'…EOF` → EXEC 前驅不是寫 x → **不 deny**（修正後正確）。
+- `echo 'console.log("x")' > x.mjs; node x.mjs` → deny。
+- `cat > x.py <<'EOF'\nimport sys; print(sys.argv)\nEOF; python x.py` → 述詞遇 import → 不 deny。
 
 > lang 一律由**執行的直譯器**決定（不靠副檔名）：`cat > x.txt <<'EOF'…EOF; node x.txt` 仍以 js 判定。
+> 殘留（已知、可接受）：以 `;`/newline 連接時，若寫入在 runtime 失敗（如目標路徑唯讀），EXEC 仍會跑
+> 既有/不存在的檔，而本 pass 已先 deny——但「寫一段全 print 腳本緊接著執行它」這整條鏈**無論寫入成敗
+> 都是偽裝意圖**，deny 仍為正確方向（`&&` 形式則連此殘留都無）；故不視為有意義的 false-deny。
 
 ### 4.6 向量 D（pipe 餵 stdin）詳述
 
 `pipeStdinPrintSpray(script)`：獨立唯讀 AST pass，遞迴走訪 `script` 找 `Pipeline` 節點，只處理
 **恰兩段** `producer | interpreter`（`Pipeline.commands.length === 2`；多段 `a | b | node` →
-保守跳過、不 deny）：
-- 右段（消費者）解出的葉指令名 ∈ INTERPRETERS 且 `recognizeInterpreter` 回 `StdinRead(lang)`（即無
+保守跳過、不 deny）。**兩段各為一個 `Statement`**，皆以 §4.2.2 的 `leafOf` 化約成 `{name, argv,
+redirects, cwd}`（任一段 `leafOf` 回 `null`，即該段非單一簡單 Command → 跳過、不 deny）：
+- 右段（消費者）`leafOf` 名 ∈ INTERPRETERS 且 `recognizeInterpreter` 回 `StdinRead(lang)`（即無
   script 檔、無 inline 旗標、無副作用旗標）。
-- 左段（生產者）為**靜態 print 生產者**：`echo`/`printf` 靜態（`isPrintOnlyForm` 為真且能還原輸出
-  字串）或 `cat`/`tac` 靜態 heredoc/here-string。取其「輸出字串」＝餵給直譯器 stdin 的 source。
+- 左段（生產者）`leafOf` 為**靜態 print 生產者**：`echo`/`printf` 靜態（`isPrintOnlyForm` 為真且能還原
+  輸出字串）或 `cat`/`tac` 靜態 heredoc/here-string。取其「輸出字串」＝餵給直譯器 stdin 的 source。
 - `payloadIsAllStaticPrint(source, lang)` → deny。
+
+> **與 `walk` 的關係**：本 pass 不經 `walk`、不產生 `CommandInvocation`，而是直接對 `Pipeline.commands`
+> 的兩個 `Statement` 各跑一次 `leafOf`（純讀 AST、§4.2.2）。`recognizeInterpreter`／靜態生產者判定／
+> `staticStdinBody` 皆已是吃 `{name, argv, redirects}` 形狀的純函式，可同時被「向量 A/B 的 invocation
+> 迴圈」與「向量 C/D 的 AST pass」呼叫，無需改 `walk.ts`／`CommandInvocation`（回應 round 1
+> structural-completeness）。
+>
+> 生產者「輸出字串」還原：echo＝argv 以空白接合（`-n`/`-e` 等語意過於複雜時保守跳過、不 deny）；printf
+> 僅無格式化轉換符時可還原；cat/tac＝heredoc body。任何無法靜態還原 → 不 deny。
+
 例：`echo 'console.log(1)' | node` → 左 echo 輸出 `console.log(1)`、右 node StdinRead js → `true` →
 deny。`cat <<'EOF'\nprint("x")\nEOF | python` → deny。`grep x f | node` → 左非靜態生產者 → 不 deny。
-
-> 生產者「輸出字串」還原：echo＝argv 以空白接合（尊重 `-n`/`-e` 既有語意過於複雜時保守跳過）；printf
-> 僅無格式化轉換符時可還原；cat/tac＝heredoc body。任何無法靜態還原 → 不 deny。
+`echo x | node app.js` → 右段為 ScriptFile（非 StdinRead）→ 不屬向量 D（落向量 C／既有判定）。
 
 ### 4.7 閘④ 接線（`src/engine/evaluate.ts`）
 
@@ -353,7 +409,7 @@ export function interpreterPrintDenyReason(): string {
 
 ### 5.2 零誤 deny 保證（最重要）
 
-§4.1 述詞 fail-closed：任何運算子/變數/呼叫/模板/import/控制流/未閉合/無法靜態還原 → `false`（不 deny）。
+§4.1 述詞 fail-safe：任何運算子/變數/呼叫/模板/import/控制流/未閉合/無法靜態還原 → `false`（不 deny）。
 故所有「真實工作」payload（含算術、排序、格式轉換、讀檔、序列化驗證等）一律**不被 deny**，最差退回
 既有 ask。deny 僅命中「純 printfn(字面量) 序列」這一窄形狀。
 
@@ -382,9 +438,16 @@ export function interpreterPrintDenyReason(): string {
 
 - 向量 A：每直譯器 `-e`/`-c`/`deno eval` 全 print → deny；含運算 → ask。
 - 向量 B：`node`/`python`/`bun run -`/`deno run -` heredoc-stdin 全 print → deny；`< file` → 不 deny。
-- 向量 C：**目標案例**（`cat > /tmp/x.mjs <<'EOF'…EOF; node /tmp/x.mjs`）→ deny；`echo … > f; node f`
-  → deny；寫專案內同理；含 import 的 body → ask；path 不符 → ask；同 path 多寫 → ask。
-- 向量 D：`echo 'console.log(1)' | node` → deny；`grep x f | node` → 不 deny；多段 pipe → 不 deny。
+- 向量 C（含順序感知，回應 round 1 design-soundness）：
+  - **deny**：目標案例 `cat > /tmp/x.mjs <<'EOF'…EOF; node /tmp/x.mjs`（newline 緊鄰）；`&&` 連接
+    `cat > x.mjs <<'EOF'…EOF && node x.mjs`；`echo 'console.log("x")' > f; node f`；寫專案內同理。
+  - **不 deny（順序/邊界）**：`node x.mjs; cat > x.mjs <<'EOF'…EOF`（執行在寫之前）；
+    `cat > x.mjs <<'EOF'…EOF; echo hi; node x.mjs`（非緊鄰前驅）；
+    `cat > x.mjs <<'EOF'(real)EOF; cat > x.mjs <<'EOF'(print)EOF; node x.mjs`（最後緊鄰是 print → deny）
+    與反序（最後緊鄰是 real → 不 deny）；含 import 的 body → 不 deny；path 不符 → 不 deny；
+    寫/執行分屬不同 `if`/subshell 分支（opaque、非 spine 緊鄰）→ 不 deny。
+- 向量 D：`echo 'console.log(1)' | node` → deny；`cat <<'EOF'…print…EOF | python` → deny；
+  `grep x f | node` → 不 deny；`echo x | node app.js`（右為 ScriptFile）→ 不屬 D；多段 `a|b|node` → 不 deny。
 - 直譯器辨識：`node -r x -e 'console.log(1)'`（副作用旗標）→ Unknown → 不 deny；`deno run -A x.ts`
   → Unknown → 不 deny；動態 `node -e "$C"` → 不 deny。
 
@@ -412,9 +475,15 @@ export function interpreterPrintDenyReason(): string {
 
 ## 8. 風險與未決
 
+- **向量 C「緊鄰前驅」的有意 under-deny**：只認 EXEC 緊鄰前一條為靜態寫同檔，故 `cat > x …; echo hi;
+  node x`、寫/執行分屬不同控制流分支等非緊鄰形態**不 deny**（退回既有 ask）。這是為 zero false-deny 換取
+  的保守取捨（§4.5）。
+- **向量 C 以 `;`/newline 連接的 runtime 寫入失敗殘留**：寫入若於 runtime 失敗、EXEC 跑既有檔，本 pass
+  仍先 deny；因「寫全 print 腳本緊接執行」整鏈無論寫入成敗皆屬偽裝意圖，deny 仍為正確方向，不視為有意義
+  的 false-deny（`&&` 形式無此殘留，§4.5）。
 - **ts-node `-` stdin** 未實機確認（research 註記）：保守僅以「無位置參數＋無旗標」配 heredoc/pipe
   觸發 StdinRead；若 ts-node 實際語意不同，最差是漏 deny（安全方向）。
-- **詞法器 fragility**：手寫 tokenizer 對冷僻字串逸脫/多行構造可能誤判——但因 fail-closed，誤判方向恆為
+- **詞法器 fragility**：手寫 tokenizer 對冷僻字串逸脫/多行構造可能誤判——但因 fail-safe，誤判方向恆為
   「不 deny」（漏 deny），不會誤 deny。測試需覆蓋逸脫與未閉合案例固化此性質。
 - **效能**：閘④ 對每次 Bash 呼叫多一趟 invocations 掃描＋（命中直譯器時）一趟極小詞法；payload 通常
   短，額外成本可忽略。
