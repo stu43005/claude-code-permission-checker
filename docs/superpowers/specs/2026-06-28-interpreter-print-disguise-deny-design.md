@@ -588,6 +588,15 @@ export function interpreterPrintDenyReason(): string {
 4. **`-p`/`--print` 運算式吐值**、**多段 pipeline**（`a|b|node`）、**副作用旗標併用**（`node -r x -e …`）
    → 保守跳過、不 deny。
 5. **間接寫檔/執行**：用 `tee`、`sed -n w`、`dd` 等非列舉寫檔形態，或經變數傳 path → 不 deny。
+   - **向量 C 僅及「緊鄰循序-sibling」的寫→執行（明確、刻意的邊界；回應 round 16）**：WRITE 必須是 EXEC
+     在**同一循序序列內的緊鄰前一個 sibling**。故**寫檔巢狀於控制流、再 `&&`/`;` 接執行**者——如
+     `if cond; then cat > x.mjs <<'EOF'…EOF; fi && node x.mjs`、`{ … ; cat > x; } ; node x` 跨非循序邊界、
+     或 `cat > x; echo hi; node x`（非緊鄰）——**不 deny**（退回 ask）。選擇此邊界的理由：緊鄰相鄰才能
+     **靜態保證「被執行的內容＝該次寫入」** 且 **zero false-deny**；放寬到「控制流內任意前置寫」會引入
+     分支可達性/最後寫者歧義。**安全性**：此 under-deny 與已無解的「跨 Bash 呼叫拆分」（item 1）同性質
+     ——欲規避者本就能拆兩次呼叫；單一呼叫內的控制流包裝並未新增任何 allow 路徑（最差落既有 ask，依
+     `Bash(node *)` 設定升級，使用者自負）。**inline/heredoc/pipe（向量 A/B/D）不受此限**，於任何位置
+     （含控制流內）皆 deny；僅向量 C 的「寫→執行關聯」需此循序相鄰前提。
 6. **僅裸直譯器形式（回應 round 5）**：script 路徑前帶任何 execution-shaping 旗標（`ts-node
    --transpile-only x.ts`、`node --experimental-* x.mjs`、`python -X… x.py`）→ Unknown → 不 deny。
    刻意不建旗標 allowlist（避免把旗標值誤解析成路徑）；屬安全方向 under-deny（§4.2.1）。
@@ -650,6 +659,9 @@ export function interpreterPrintDenyReason(): string {
   - **append / 背景（回應 round 4 findings）**：`echo 'console.log("x")' >> real.js; node real.js`（append `>>`）
     → **不 deny**（非截斷寫入，無法證明整檔皆 print）；`cat > x.mjs <<'EOF'…EOF & node x.mjs`（背景寫入）
     → **不 deny**（背景不保證寫入先完成）。
+  - **控制流巢狀寫檔 `&&`-接執行（明確邊界，回應 round 16）**：`if cond; then cat > x.mjs <<'EOF'…EOF; fi
+    && node x.mjs`、`{ cat > x.mjs <<'EOF'…EOF; } 跨非循序邊界後 node x.mjs` → **不 deny**（非緊鄰循序
+    sibling；§5.1 item 5）。對照緊鄰 `cat > x.mjs <<'EOF'…EOF && node x.mjs` → deny。
 - 向量 D：`echo 'console.log(1)' | node` → deny；`cat <<'EOF'…print…EOF | python` → deny；
   `grep x f | node` → 不 deny；`echo x | node app.js`（右為 ScriptFile）→ 不屬 D；多段 `a|b|node` → 不 deny。
   - **fd0 重導向（回應 round 2 finding 2）**：`echo 'console.log("x")' | node < real.js` → 不 deny（消費端
