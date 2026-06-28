@@ -91,17 +91,19 @@ node /tmp/verify.mjs
 
 #### 1.4.2 unbash 4.0.1 解析行為（沿用 2026-06-21 規格，信心度：高）
 
-1. 攤平後的 `CommandInvocation` 已帶 **`redirects`（含繼承的寫入 target 與 heredoc body/content）**
-   與 **`argv`（suffix）**、**`assignments`（prefix）**、**`cwd`**。故**單葉指令**判定（向量 A/B：直譯器
-   旗標/位置參數、其 fd0 heredoc body）可由 `CommandInvocation[]` 直接取得。向量 C/D 需**執行順序/管段
-   相鄰**資訊（攤平後不保留），改由獨立唯讀 AST pass 直接讀 `script`，**皆不改** `walk.ts`／
-   `CommandInvocation`（§4.2.2 的 `leafOf` 對單一 `Statement` 純讀化約，與 `emitCommand` 同取值方式）。
+1. 閘④ **唯一資料來源＝單一 order-aware AST spine pass**（§4.2），**不**讀攤平 `invocations`（攤平後不
+   保留執行順序、函式定義位置、管段相鄰，無法做 order-aware 遮蔽與向量 C/D）。spine pass 以 §4.2.2 的
+   `leafOf` 對每條 `Statement` 純讀化約，**鏡射 `walk` 的取值規則**：`name=staticValue(cmd.name)`、
+   `argv=cmd.suffix`、`assignments=cmd.prefix`、`redirects`＝**該 statement 自身 redirect ＋ 沿 spine 下降時
+   由外層 `CompoundList`/`BraceGroup`/`Statement` 累積的繼承 redirect**（與 walk 對複合結構繼承 redirect
+   一致）、`cwd`＝由 `initialCwd` 沿 spine 以 walk 相同 `cd` 規則 thread 的快照。**不改** `walk.ts`／
+   `CommandInvocation`。（既有閘①②③ 仍各自用攤平 `invocations`，與閘④ 獨立。）
 2. heredoc：引號分隔符（`<<'EOF'`）→ `heredocQuoted === true`、body 為 `undefined`、$ 不展開（靜態）；
    未引號且含展開 → `body` 為結構化 Word；純文字 → body `undefined`、文字在 `content`。靜態性判定沿用
    `print_only.ts` 既有的 `isHeredocPrintEligible`（引號分隔符，或 body/content 無 `$`/反引號）。
 3. **Pipeline 結構**：unbash AST 有 `Pipeline` 節點（`Pipeline.commands: Statement[]`）。walk 攤平時
-   各段以同 cwd 列舉、**不保留管段相鄰關係**；故 **vector D（pipe）需要獨立的 AST pass** 直接讀
-   `Pipeline.commands` 取得「生產者 → 直譯器」相鄰結構（見 §4.6）。
+   各段以同 cwd 列舉、**不保留管段相鄰關係**；故 **vector D（pipe）由 §4.2 的統一 spine pass** 直接讀
+   spine 上的 `Pipeline.commands` 取得「生產者 → 直譯器」相鄰結構（見 §4.6）。
 4. `staticValue(word)` 對含任何展開/未引號 glob 的 word 回 `null`（動態）。payload 來源字串取不到靜態
    值即視為不可判定 → 不 deny。
 
@@ -119,7 +121,8 @@ node /tmp/verify.mjs
 - 新增 `src/engine/interp_print.ts`：
   - 純函式 `payloadIsAllStaticPrint(source: string, lang: "js" | "py"): boolean`——手寫極小、
     **fail-safe** 的 tokenizer + 窄文法比對（§4.1）。
-  - 四向量的偵測入口 `interpreterPrintSprayDeny(invocations, script): boolean`（§4.2–§4.6）。
+  - 四向量的偵測入口 `interpreterPrintSprayDeny(script, initialCwd): boolean`——**單一 order-aware AST
+    spine pass**（§4.2）為唯一資料來源（不另吃攤平 `invocations`；cwd 由 `initialCwd` 沿 spine thread）。
 - 新增 deny 理由 helper `interpreterPrintDenyReason()`（`src/rules/types.ts`，§4.8）。
 - 同步更新 CLAUDE.md：deny「三類/三閘」→「四類/四閘」、政策反轉段落、架構管線圖（§6）。
 - 全程 fail-safe：任何不確定一律不 deny（退回 ask）；`evaluate` 既有 try/catch 把例外收斂成 ask；
@@ -150,7 +153,7 @@ main.ts → evaluate(command, root, initialCwd, rules, home, trustedReadRoots)
        ├─ invocations.length === 0 → allow（no-op，不變）
        ├─ 閘①(deny)：some(name === "sleep") → deny(pollingDenyReason())            （不變）
        ├─ 閘②(deny)：isAllPrintOnly(invocations) → deny(printOnlyDenyReason())      （不變）
-       ├─ 閘④(deny)：interpreterPrintSprayDeny(script)                              （★新增；spine pass、order-aware 遮蔽）
+       ├─ 閘④(deny)：interpreterPrintSprayDeny(script, initialCwd)                   （★新增；spine pass、order-aware 遮蔽）
        │             → deny(interpreterPrintDenyReason())
        ├─ 閘③(ask) ：函式遮蔽（whole-script fnNames）→ ask(functionShadowReason())   （不變）
        └─ combine(invocations.map(classify))                                        （不變）
@@ -232,8 +235,8 @@ token 未完全消費、py `print` 出現 `=` keyword 引數）→ 立即 `false
 Bash 中函式定義只影響其**之後**執行的指令，故 `definedSoFar` 精準反映「此位置該名是否被遮蔽」。
 
 ```
-interpreterPrintSprayDeny(script):
-  spine = linearizeSequentialSpine(script)      // 有序 statement 串；opaque 節點見上（§4.5）
+interpreterPrintSprayDeny(script, initialCwd):
+  spine = linearizeSequentialSpine(script, initialCwd)  // 有序 statement 串（含每條的 cwd 快照與繼承 redirect）；opaque 節點見上（§4.5）
   definedSoFar = {}                              // 此前已在 spine 定義的函式名（order-aware 遮蔽）
   prevWrite = null                               // 緊鄰前一條的靜態截斷 WRITE（向量 C 用）
   for stmt in spine:
@@ -322,9 +325,10 @@ interpreterPrintSprayDeny(script):
 
 §4.2 的統一 spine pass 以此把單一 `Statement` 化約成 `{name, argv, redirects, cwd}`：
 - 僅當 `statement.command` 為單一簡單 `Command` 節點時回傳該形狀；`name = staticValue(cmd.name)`
-  （動態 → `null`）、`argv = cmd.suffix`、`redirects = [...statement.redirects, ...cmd.redirects]`、
-  `assignments = cmd.prefix`，`cwd` 取該位置的有效 cwd（AST pass 自身以與 `walk` 相同規則於 top-level
-  sequential spine 上 thread cwd；遇控制流/subshell 內即不適用，見 §4.5）。
+  （動態 → `null`）、`argv = cmd.suffix`、`assignments = cmd.prefix`、`redirects = [...inherited,
+  ...statement.redirects, ...cmd.redirects]`（`inherited`＝spine 下降時由外層 `CompoundList`/`BraceGroup`/
+  `Statement` 累積的繼承 redirect，與 `walk` 對複合結構繼承一致）、`cwd`＝spine pass 由 `initialCwd` 沿
+  spine 以 `walk` 相同 `cd` 規則 thread 的快照（遇控制流/subshell 內不適用，見 §4.5）。
 - command 為 `Pipeline`/`Subshell`/`If`/`For`/`While`/`Case`/`BraceGroup`/`Function`/… 等複合節點
   → 回 `null`（該 statement 對本 pass 視為 **opaque**）。
 - 純讀，取值方式與 `walk.ts` 的 `emitCommand` 一致，但**不修改** `walk.ts`／`CommandInvocation`。
@@ -344,6 +348,14 @@ interpreterPrintSprayDeny(script):
 例：`node <<'EOF'\nconsole.log("x")\nEOF` → body=`console.log("x")` → `true` → deny。
 `python <<'EOF'\nimport os; print(os.getcwd())\nEOF` → 含 import/`NAME` → `false` → 不 deny。
 有效 stdin 為 `< file`（讀真實檔）/`<&n`（fd 複製）/動態 heredoc → `staticStdinBody` 回 null → 不 deny。
+
+**繼承式 stdin 明確排除於硬 deny 範圍（回應 round 8 finding）**：bare `node`／`node -`／bare `python`／
+`python -`／`deno run -`／`bun run -`／`ts-node`（**無任何 fd0 重導向**）會從**繼承的 stdin 串流**讀程式
+碼，而本 hook **只收到 Bash 指令字串、看不到該 stdin 內容**。此情形 `staticStdinBody` 必回 `null` →
+**不 deny**（無可靜態檢視的 payload）。這是**明確、有意的範圍排除**（非靜默 fallthrough）：繼承式 stdin
+執行**不在**硬 deny 保證內，落既有 classify（直譯器不在 allowlist → ask，**可被** `Bash(node *)` 等升級
+為 allow——屬使用者自負的 settings 風險）。唯有「向量 B 的靜態 heredoc/here-string」與「向量 D 的可見
+pipe 生產者」這兩種**hook 能靜態看到 payload** 的 stdin 來源才在硬 deny 範圍。
 
 ### 4.5 向量 C（同鏈寫腳本檔 → 執行同檔）詳述
 
@@ -461,17 +473,18 @@ heredoc 另由向量 B 判）。
 
 於閘②之後、閘③之前插入：
 
-閘④ 為 §4.2 的單一 spine pass，**只吃 `script`**（自備 order-aware `definedSoFar`，不需外部 `fnNames`）：
+閘④ 為 §4.2 的單一 spine pass，吃 `script` 與 `initialCwd`（自備 order-aware `definedSoFar`，不需外部
+`fnNames`；`initialCwd` 供向量 C 沿 spine thread cwd 做 cwd-aware 路徑比對，§4.5）：
 
 ```ts
 // 閘 ④（deny）：直譯器執行全靜態-print payload（四向量，spine pass）——classify 前短路、不可升級
-if (interpreterPrintSprayDeny(script)) {
+if (interpreterPrintSprayDeny(script, initialCwd)) {
   return { verdict: "deny", reason: interpreterPrintDenyReason() };
 }
 ```
 
 - 仍在既有 try/catch 內 → `interpreterPrintSprayDeny` 任何例外 → `evaluate` 收斂為 ask（fail-safe）。
-- `script` 已存在於 `evaluate`（parse 結果）；閘④ 自走 spine、自算 `definedSoFar`，**無新參數穿透**。
+- `script`、`initialCwd` 皆已是 `evaluate` 既有參數；閘④ 自走 spine、自算 `definedSoFar`，**無新狀態穿透**。
 - **與閘③ 的關係**：閘④ 仍列於閘③ 之前（保硬 deny 不被遮蔽降級），但對「**在該指令之前已定義函式**」
   而遮蔽的名自我跳過（order-aware）→ 該情形落閘③ 回不可升級 ask。閘③ 沿用既有 whole-script `fnNames`
   （over-ask、安全），與閘④ 的 order-aware `definedSoFar` 各自獨立、互不影響。
@@ -510,6 +523,9 @@ export function interpreterPrintDenyReason(): string {
 6. **僅裸直譯器形式（回應 round 5）**：script 路徑前帶任何 execution-shaping 旗標（`ts-node
    --transpile-only x.ts`、`node --experimental-* x.mjs`、`python -X… x.py`）→ Unknown → 不 deny。
    刻意不建旗標 allowlist（避免把旗標值誤解析成路徑）；屬安全方向 under-deny（§4.2.1）。
+7. **繼承式 stdin（回應 round 8）**：bare `node`/`python`/`deno run -`/`bun run -`/`ts-node` 無 fd0 重導向、
+   從**繼承 stdin** 讀碼 → hook 看不到 payload → 不 deny（落 ask，可被 `Bash(node *)` 升級）。只有靜態
+   heredoc/here-string（向量 B）與可見 pipe（向量 D）在硬 deny 範圍（§4.4）。
 
 > 上述 ask 多數**可被** `settingsAllows` 升級（使用者自設 `Bash(node *)` 等）——屬使用者自負的 settings
 > 風險；本功能不新增此升級路徑，亦不硬擋這些繞道。被閘④命中的全靜態-print 形態則**不可**升級。
@@ -544,7 +560,9 @@ export function interpreterPrintDenyReason(): string {
 ### 7.2 向量整合測試（`evaluate_test.ts` 或 `interp_print_test.ts`）
 
 - 向量 A：每直譯器 `-e`/`-c`/`deno eval` 全 print → deny；含運算 → ask。
-- 向量 B：`node`/`python`/`bun run -`/`deno run -` heredoc-stdin 全 print → deny；`< file` → 不 deny。
+- 向量 B：`node`/`python`/`bun run -`/`deno run -` heredoc-stdin 全 print → deny；`< file` → 不 deny；
+  **bare `node`/`python`/`deno run -`/`bun run -`/`ts-node` 無 fd0 重導向（繼承 stdin）→ 不 deny**（回應
+  round 8；落 ask，非硬 deny 範圍）。
 - 向量 C（含順序感知，回應 round 1 design-soundness）：
   - **deny**：目標案例 `cat > /tmp/x.mjs <<'EOF'…EOF; node /tmp/x.mjs`（newline 緊鄰）；`&&` 連接
     `cat > x.mjs <<'EOF'…EOF && node x.mjs`；`echo 'console.log("x")' > f; node f`；寫專案內同理。
