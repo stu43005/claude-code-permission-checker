@@ -233,10 +233,18 @@ token 未完全消費、py `print` 出現 `=` keyword 引數）→ 立即 `false
 單一架構、order-aware 遮蔽、無 off-spine 繞道）。**不**讀攤平 `invocations`，而是依**原始碼順序**前序走訪
 整棵 `script`，維護兩組狀態：
 
-- `definedBefore`＝**在原始碼順序上、此節點之前已出現的函式定義名**。Bash 函式定義只影響其**之後**執行的
-  指令；「textually-before」是「**可能在執行前先定義**」的健全 over-approximation——含**控制流/subshell 內、
-  位置在前**的定義（回應 round 9 finding 1：`if true; then node(){:;}; fi; node -e …` 中 node 的定義在前 →
-  視為可能遮蔽 → 跳過、不 deny）。
+- `definedBefore`＝**在原始碼順序上、此節點之前、且在「同一 shell scope」可見的函式定義名**（**scope-aware**，
+  回應 round 11 finding）。Bash 函式定義只影響**同一 shell** 中其**之後**執行的指令；「同 scope ＋
+  textually-before」是「**可能在執行前先於本 shell 定義**」的健全 over-approximation。
+  - **同 shell scope（會累積進 definedBefore）**：`Script.commands`、`CompoundList`、`BraceGroup`、`AndOr`、
+    以及 `If`/`For`/`While`/`Case` 的本體（控制流分支在當前 shell 執行；其定義**可能**洩漏到之後 → 視為
+    可能遮蔽 → 跳過、不 deny；回應 round 9 finding 1：`if cond; then node(){:;}; fi; node -e …` → ask）。
+  - **不同 shell scope（descend 進去但其內定義 NOT 洩漏回父 → 不計入父的 definedBefore）**：`Subshell`
+    `( … )`、命令替換 `$( … )`、程序替換 `<( … )`/`>( … )`、背景 `&`、coproc。實作上以**傳值複本**進入：
+    子範圍可加自己的定義供其內部使用，但返回後**父範圍 definedBefore 不變**（回應 round 11：
+    `(node(){:;}); node -e 'fake'` 中 subshell 的 node 定義**不遮蔽**父 shell 的 `node` → **deny**）。
+  - 故識別三態：**確定為 binary（無同-scope 前置定義）→ 可 deny**；**同-scope 前置（含條件分支）定義 →
+    身分不確定 → 跳過、落閘③ 不可升級 ask**；subshell/替換內定義**不影響**父範圍判定。
 - 在每個**循序序列**（`Script.commands`、`CompoundList`、`BraceGroup`、`&&`/`;` 的 `AndOr`——皆當前
   shell 循序）內維護 `prevWrite`＝緊鄰前一個 sibling 的靜態截斷 WRITE（向量 C 用）。
 
@@ -252,44 +260,49 @@ token 未完全消費、py `print` 出現 `=` keyword 引數）→ 立即 `false
 - **向量 C（寫檔→執行）需跨敘述的執行順序保證，故僅在循序序列上判**：比對 EXEC 與其循序序列內**緊鄰
   前一個 sibling** 的 WRITE；跨控制流/subshell 邊界不延續 `prevWrite`（無此保證即不 deny）。
 
+`defs` 為「**當前 shell scope** 中、此前已定義的函式名」集合，**scope-aware**：同 shell 的循序/複合/控制流
+節點**共享並 mutate** 同一個 `defs`（定義洩漏給其後）；進入 subshell/命令替換/程序替換/背景/coproc 時以
+**複本** `defs.copy()` 下降（其內定義不洩漏回父）。
+
 ```
 interpreterPrintSprayDeny(script, initialCwd):
-  definedBefore = {}                              // source-order：此前已出現的函式定義名
   found = false
-  // 前序走訪 script（source order）；對每個循序序列維護局部 prevWrite 與沿序列 thread 的 cwd
-  visit(node, cwd, prevWriteRef):
+  // visit 回傳更新後 cwd；defs 依 scope 規則傳遞（同 shell 共享、新 shell 傳複本）
+  visit(node, cwd, defs, prevWriteRef):
     switch node:
-      FunctionDef(name):           definedBefore.add(name); prevWriteRef = null
-      SequentialSeq(children):     // Script.commands / CompoundList / BraceGroup / AndOr(&&,;)
+      FunctionDef(name):           defs.add(name); prevWriteRef = null          // 加入「當前 scope」
+      SameShellSeq(children):      // Script.commands / CompoundList / BraceGroup / AndOr(&&,;)
         local prev = null; local c = cwd
-        for child in children: c = visit(child, c, &prev)   // 同序列共享 prev、thread cwd（cd→unknown）
-      Pipeline(2段 producer|interp)  (任何位置；含 (iii) 包裝排除):     // 向量 D
-        if checkVectorD(node, definedBefore): found = true   // 消費者/生產者名 ∈ definedBefore → 跳過
-        descend 各段子節點以收集函式定義/跑 A/B；prevWriteRef = null  // pipeline 非循序序列、不延續 C 相鄰
-      InterpreterCommand(leaf):                              // leaf.name ∈ INTERPRETERS
-        if leaf.name not in definedBefore:
-          switch recognizeInterpreter(leaf):                 // §4.2.1
+        for child in children: c = visit(child, c, defs, &prev)                 // 共享同一 defs（同 shell）
+      ControlFlow(If/For/While/Case):                                           // 本體在當前 shell 執行
+        descend 各分支/本體 with 同一 defs（共享：分支內定義可能洩漏 → 之後視為可能遮蔽）, prevWriteRef = null
+      Pipeline(2段 producer|interp)  (任何位置；含 (iii) 包裝排除):              // 向量 D
+        if checkVectorD(node, defs): found = true        // 消費者/生產者名 ∈ defs → 跳過
+        descend 各段 with defs.copy()（各段在 subshell）以收集定義/跑 A/B; prevWriteRef = null
+      NewShellScope(Subshell ( )/命令替換 $( )/程序替換/&背景/coproc):           // 其內定義不洩漏回父
+        visit-children with defs.copy()（父 defs 不變）, fresh prevWrite = null, cwd 多為 unknown
+        prevWriteRef = null
+      InterpreterCommand(leaf):                          // leaf.name ∈ INTERPRETERS
+        if leaf.name not in defs:                        // 當前 scope 未（在此前）被遮蔽
+          switch recognizeInterpreter(leaf):             // §4.2.1
             InlineEval(code,lang): if payloadIsAllStaticPrint(code,lang): found = true     // A（任何位置）
             StdinRead(lang): b=staticStdinBody(leaf); if b and payloadIsAllStaticPrint(b,lang): found = true  // B（任何位置）
-            ScriptFile(P,lang):                              // C（僅循序序列、緊鄰）
-              if prevWriteRef is WRITE(P',content,cwdᵥ,writerName) and writerName not in definedBefore
+            ScriptFile(P,lang):                          // C（僅 SameShellSeq、緊鄰）
+              if prevWriteRef is WRITE(P',content,cwdᵥ,writerName) and writerName not in defs
                  and pathsEqualCwdAware(P',cwdᵥ, P,cwd) and payloadIsAllStaticPrint(content,lang): found = true
-        prevWriteRef = staticTruncatingWriteOf(leaf)         // 更新緊鄰前驅（僅循序序列內）
-      Opaque(其他: Subshell/If/For/While/Case body/命令替換/&背景/||):
-        // 仍「descend」以便 (a) 收集其內函式定義入 definedBefore、(b) 對其內直譯器跑向量 A/B；
-        // 但不把其內當「循序序列」延續外層 prevWrite（C/D 相鄰只在真正循序序列內成立）
-        descend children with fresh prevWrite = null, cwd 視情況（cd 不外洩 → 多為 unknown）
-        prevWriteRef = null
+        prevWriteRef = staticTruncatingWriteOf(leaf)     // 更新緊鄰前驅（僅 SameShellSeq 內）
     return updated cwd
-  visit(script, initialCwd, &null)
+  visit(script, initialCwd, {}/*defs*/, &null)
   return found
 ```
 
-- **遮蔽 source-order**：`node -e 'fake'; node(){:;}`（def 在後）→ 走到 `node -e` 時 `definedBefore` 無 node
-  → **deny**；`node(){:;}; node -e 'fake'`、`if true; then node(){:;}; fi; node -e 'fake'`（def 在前，含控制流內）
-  → node ∈ `definedBefore` → 跳過 → 落閘③ **ask**。writer/生產者名同理。
+- **遮蔽 scope + source-order**：`node -e 'fake'; node(){:;}`（def 在後）→ `node -e` 時 defs 無 node →
+  **deny**；`node(){:;}; node -e 'fake'`、`if cond; then node(){:;}; fi; node -e 'fake'`（同 shell、def 在前/
+  條件分支）→ node ∈ defs → 跳過 → 落閘③ **不可升級 ask**；**`(node(){:;}); node -e 'fake'`、
+  `$(node(){:;}); node -e 'fake'`（def 在 subshell/替換內）→ 不洩漏回父 → defs 無 node → **deny****
+  （回應 round 11）。writer/生產者名同理以同 scope `defs` 判。
 - **不改** `walk.ts`／`CommandInvocation`；此為**獨立**前序 AST 走訪（`leafOf` 取 leaf，§4.2.2）。`evaluate`
-  的閘③ 仍用既有 whole-script `fnNames`（over-ask 安全），與閘④ 的 source-order `definedBefore` 獨立。
+  的閘③ 仍用既有 whole-script `fnNames`（over-ask 安全），與閘④ 的 scope-aware `defs` 獨立。
 
 **共用 leaf 萃取 `leafOf(statement)`（§4.2.2）**：向量 C/D 的 AST pass 需把單一 `Statement` 化約成
 與 `recognizeInterpreter`／靜態生產者判定相同的 `{name, argv, redirects, cwd}` 形狀。`leafOf` 只接受
@@ -615,10 +628,14 @@ export function interpreterPrintDenyReason(): string {
   'console.log("x")'` → deny；動態 `node -e "$C"` → 不 deny。
 - 裸形式覆蓋（回應 round 5）：`echo 'console.log("x")' > verify.ts; ts-node --transpile-only verify.ts`
   （script 前有旗標）→ Unknown → **不 deny（有意 under-deny）**；對照裸 `… ; ts-node verify.ts` → deny。
-- 函式遮蔽 order-aware（回應 round 6/7）：`node() { :; }; node -e 'console.log("x")'`（def 在前）→ 閘④
-  跳過 → 閘③ **ask**；**`node -e 'console.log("fake")'; node() { :; }`（def 在後）→ 真 node 先執行 →
-  **deny**（不被後置 def 降級）；`python`/`deno` 同理；向量 C `cat() { :; }; cat > x.mjs <<'EOF'…EOF;
-  node x.mjs`（cat 前置遮蔽）→ 不 deny → 閘③ ask；向量 D 生產者前置遮蔽同理。
+- 函式遮蔽 scope + order-aware（回應 round 6/7/11）：
+  - `node() { :; }; node -e 'console.log("x")'`（同 shell、def 在前）→ 跳過 → 閘③ **ask**。
+  - `node -e 'console.log("fake")'; node() { :; }`（def 在後）→ 真 node 先執行 → **deny**（不被後置 def 降級）。
+  - `if cond; then node(){:;}; fi; node -e 'fake'`（同 shell、條件分支內前置 def）→ 身分不確定 → 跳過 → ask。
+  - **`(node(){:;}); node -e 'fake'`、`$(node(){:;}); node -e 'fake'`（def 在 subshell/替換內，不洩漏回父）
+    → **deny**（回應 round 11，不被跨 scope 的假定義降級）。
+  - `python`/`deno`/`bun`/`ts-node` 同理；向量 C `cat(){:;}; cat > x.mjs <<'EOF'…EOF; node x.mjs`（同 shell
+    前置遮蔽 cat）→ 跳過 → ask；`(cat(){:;}); cat > x.mjs <<'EOF'…EOF; node x.mjs`（subshell cat 定義）→ deny。
 - 控制流內 A/B（回應 round 9 finding 2，不再繞道）：`if true; then node -e 'console.log("x")'; fi`、
   `(node -e 'console.log("x")')`、`$(node -e 'console.log("x")')` → 向量 A 於任何位置生效 → **deny**；
   對照 `if true; then node(){:;}; fi; node -e 'x'`（控制流內前置 def）→ node ∈ definedBefore → 跳過 → ask。
@@ -657,6 +674,10 @@ export function interpreterPrintDenyReason(): string {
   deny、閘② 依結構判 print-only）；「寫全 print 腳本緊接執行同檔」無正當用途，其結構即偽裝意圖，故依結構
   deny、不要求靜態證明寫檔成功。此為**有意接受、已記錄並覆寫 reviewer 建議**的取捨（`&&` 形式連此殘留
   都無；§4.5 已詳述不變量框架）。
+- **同 shell 條件分支內的函式定義 → 降級為不可升級 ask（已記錄殘留）**：`if false; then node(){:;}; fi;
+  node -e 'fake'` 中 node 實際未被遮蔽，但因不 const-eval 條件、保守視為「可能遮蔽」→ 跳過硬 deny、落閘③
+  **不可升級 ask**（非 allow）。代價是 agent 可用假條件 def 把 deny 降為不可升級 ask；取捨：避免 round 9
+  的「`if true` 真遮蔽卻誤 deny」、且 ask 仍非放行。subshell/替換內定義則因 scope-aware 不降級（仍 deny）。
 - **ts-node `-` stdin** 未實機確認（research 註記）：保守僅以「無位置參數＋無旗標」配 heredoc/pipe
   觸發 StdinRead；若 ts-node 實際語意不同，最差是漏 deny（安全方向）。
 - **詞法器 fragility**：手寫 tokenizer 對冷僻字串逸脫/多行構造可能誤判——但因 fail-safe，誤判方向恆為
