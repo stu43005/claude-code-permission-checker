@@ -83,7 +83,9 @@ node /tmp/verify.mjs
 - **副作用/預載旗標**（出現即「不可判定為純 print」，→ 跳過、不 deny）：node `-r`/`--require`/`--import`/
   `--env-file`；python `-m`/`-i`；deno `--preload`/`--require`/`--allow-*`/`-A`；bun `-r`/`--preload`/
   `--require`/`--import`。
-- **value-flags**（解析時須正確吃掉其值，勿誤判為 script 位置參數）：各直譯器規則見 §4.2.1。
+- **value-flags**（資訊性；列出各直譯器帶值旗標）：**本設計刻意不解析它們**——§4.2.1 採「裸形式才辨識、
+  出現任何旗標即 Unknown」，故無需 value-flag 表、也不會把旗標值誤判為 script 位置參數（此表僅供理解
+  CLI，不進入辨識邏輯）。
 - `-p`/`--print` 的 payload 是**運算式**（非 `printfn(...)` 敘述），保守述詞天生不命中 → 不 deny
   （可接受的漏 deny）。本設計**不**特別處理 `-p`。
 
@@ -146,11 +148,12 @@ node /tmp/verify.mjs
 main.ts → evaluate(command, root, initialCwd, rules, home, trustedReadRoots)
   └─ parse → script；walk(script) → invocations[]
        ├─ invocations.length === 0 → allow（no-op，不變）
+       ├─ fnNames = definedFunctionNames(script)                                  （★提前：閘③④ 共用）
        ├─ 閘①(deny)：some(name === "sleep") → deny(pollingDenyReason())            （不變）
        ├─ 閘②(deny)：isAllPrintOnly(invocations) → deny(printOnlyDenyReason())      （不變）
-       ├─ 閘④(deny)：interpreterPrintSprayDeny(invocations, script)                 （★新增）
+       ├─ 閘④(deny)：interpreterPrintSprayDeny(invocations, script, fnNames)        （★新增；遮蔽名自我跳過）
        │             → deny(interpreterPrintDenyReason())
-       ├─ 閘③(ask) ：函式遮蔽 → ask(functionShadowReason())                         （不變）
+       ├─ 閘③(ask) ：anyShadowed(invocations, fnNames) → ask(functionShadowReason()) （既有，fnNames 提前算）
        └─ combine(invocations.map(classify))                                        （不變）
                      └─ classify 內：遞迴遍歷磁碟根/家目錄根 deny（既有、per-leaf，於 classify 短路）
 ```
@@ -224,11 +227,18 @@ token 未完全消費、py `print` 出現 `=` keyword 引數）→ 立即 `false
 **執行順序 / 管段相鄰**資訊（`invocations` 攤平後不保留），各由一個**獨立唯讀 AST pass** 直接讀
 `script` 處理。三者皆**不改** `walk.ts` 與 `CommandInvocation`。
 
+**函式遮蔽防護（回應 round 6 finding）**：閘④ 接收 `evaluate` 已算好的 `fnNames =
+definedFunctionNames(script)`，並對**任何參與判定的指令名**（直譯器、向量 C 的寫檔 `cat`/`tac`/`echo`/
+`printf`、向量 D 的生產者）做檢查：**該名 ∈ `fnNames`（被同腳本函式遮蔽）→ 該筆比對跳過、不 deny**。
+因被遮蔽時實際執行的是函式本體、非真正的直譯器/寫檔指令，指令身分不確定，**不可硬 deny**；跳過後落
+既有閘③（函式遮蔽 → 不可升級 ask），身分不確定者安全交人工確認。
+
 ```
-interpreterPrintSprayDeny(invocations, script):
+interpreterPrintSprayDeny(invocations, script, fnNames):
   // 向量 A/B：單葉指令
   for inv in invocations:
     if inv.name not in INTERPRETERS: continue
+    if inv.name in fnNames: continue                          // 被函式遮蔽 → 身分不確定 → 不 deny（落閘③ ask）
     mode = recognizeInterpreter(inv)                           // §4.2.1
     match mode:
       InlineEval(code, lang):     if payloadIsAllStaticPrint(code, lang): return true   // 向量 A
@@ -236,10 +246,10 @@ interpreterPrintSprayDeny(invocations, script):
         body = staticStdinBody(inv)                            // 取 heredoc/here-string 靜態內容
         if body != null and payloadIsAllStaticPrint(body, lang): return true
       _: continue                                              // ScriptFile/Unknown 不在此處判（C 走 AST pass）
-  // 向量 C：順序感知、緊鄰前驅寫檔（AST pass，§4.5）
-  if writeThenExecPrintSpray(script): return true
-  // 向量 D：pipe 餵 stdin（AST pass，§4.6）
-  if pipeStdinPrintSpray(script): return true
+  // 向量 C：順序感知、緊鄰前驅寫檔（AST pass，§4.5；EXEC 直譯器名或 WRITE 指令名 ∈ fnNames → 跳過）
+  if writeThenExecPrintSpray(script, fnNames): return true
+  // 向量 D：pipe 餵 stdin（AST pass，§4.6；消費者直譯器名或生產者名 ∈ fnNames → 跳過）
+  if pipeStdinPrintSpray(script, fnNames): return true
   return false
 ```
 
@@ -355,6 +365,9 @@ interpreterPrintSprayDeny(invocations, script):
      無法靜態證明整檔皆 print，且 `echo 'console.log("x")' >> real-test.js; node real-test.js` 會**誤 deny
      既有真實腳本**。故 `>>`（及任何非截斷寫入）**不算 WRITE** → 不 deny。只有 `>`/`>|` 截斷覆寫使
      「整檔內容＝本次靜態還原內容」成立，才可比對。
+   - **函式遮蔽跳過（回應 round 6 finding）**：`writeThenExecPrintSpray(script, fnNames)` 接收 `fnNames`；
+     若 **EXEC 直譯器名 ∈ fnNames** 或 **WRITE 指令名（`cat`/`tac`/`echo`/`printf`）∈ fnNames** → 該配對
+     身分不確定 → 跳過、不 deny（落閘③ ask）。
 
 **為何「緊鄰前驅」而非「任意前驅」**：靜態上要鎖定「**若 EXEC 執行、餵給它的就是這次寫入的內容**」。
 只認**緊鄰**前一條寫入，可同時免疫三種**靜態可判定**的錯配（皆會讓 node 跑到「已知不同的檔/內容」）：
@@ -391,7 +404,8 @@ false-deny）。
 
 ### 4.6 向量 D（pipe 餵 stdin）詳述
 
-`pipeStdinPrintSpray(script)`：獨立唯讀 AST pass。**只在 §4.5 的 top-level sequential spine 上尋找
+`pipeStdinPrintSpray(script, fnNames)`：獨立唯讀 AST pass（**函式遮蔽跳過**：消費者直譯器名或生產者名
+∈ `fnNames` → 跳過、不 deny，回應 round 6 finding）。**只在 §4.5 的 top-level sequential spine 上尋找
 `Pipeline` statement**（回應 round 3 finding 2：不再「遞迴走訪所有 Pipeline」，避免把 conditional/
 subshell/命令替換內、或不可達分支裡的 pipeline 當成已執行 dataflow）。對 spine 上每個 statement，
 只處理形如**恰兩段** `producer | interpreter` 的 Pipeline（`Pipeline.commands.length === 2`；多段
@@ -433,15 +447,21 @@ heredoc 另由向量 B 判）。
 
 於閘②之後、閘③之前插入：
 
+`fnNames = definedFunctionNames(script)` 為既有閘③ 已計算者；閘④ 共用同一集合（**在閘④ 之前算好、
+傳入**，使閘④ 能對被遮蔽的直譯器/寫檔名跳過、不硬 deny）：
+
 ```ts
 // 閘 ④（deny）：直譯器執行全靜態-print payload（四向量）——classify 前短路、不可升級
-if (interpreterPrintSprayDeny(invocations, script)) {
+// fnNames：同腳本函式定義名集合（既有閘③ 用），傳入以跳過被遮蔽的指令名（身分不確定 → 不硬 deny）
+if (interpreterPrintSprayDeny(invocations, script, fnNames)) {
   return { verdict: "deny", reason: interpreterPrintDenyReason() };
 }
 ```
 
 - 仍在既有 try/catch 內 → `interpreterPrintSprayDeny` 任何例外 → `evaluate` 收斂為 ask（fail-safe）。
-- `script` 已存在於 `evaluate`（parse 結果），直接傳入；無新參數穿透。
+- `script`、`fnNames` 皆已存在於 `evaluate`（parse 結果與既有閘③ 的計算），直接傳入；無新參數穿透。
+- **與閘③ 的關係**：閘④ 仍列於閘③ 之前（保硬 deny 不被遮蔽降級），但對**被遮蔽的指令名自我跳過** →
+  該情形落閘③ 回不可升級 ask。即「未遮蔽的真直譯器」走閘④（可能 deny）、「被遮蔽者」走閘③（ask）。
 
 ### 4.8 deny 理由 helper（`src/rules/types.ts`）
 
@@ -541,6 +561,9 @@ export function interpreterPrintDenyReason(): string {
   'console.log("x")'` → deny；動態 `node -e "$C"` → 不 deny。
 - 裸形式覆蓋（回應 round 5）：`echo 'console.log("x")' > verify.ts; ts-node --transpile-only verify.ts`
   （script 前有旗標）→ Unknown → **不 deny（有意 under-deny）**；對照裸 `… ; ts-node verify.ts` → deny。
+- 函式遮蔽（回應 round 6）：`node() { :; }; node -e 'console.log("x")'` → 閘④ 跳過（node ∈ fnNames）→
+  落閘③ → **ask（非 deny）**；`python`/`deno` 同理；向量 C `cat() { :; }; cat > x.mjs <<'EOF'…EOF; node
+  x.mjs`（cat 被遮蔽）→ 不 deny → 閘③ ask；向量 D 生產者被遮蔽同理。
 
 ### 7.3 不可升級 e2e（`main_test.ts`，子行程）
 
