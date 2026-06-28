@@ -130,8 +130,9 @@ node /tmp/verify.mjs
 
 ### 2.2 非目標（YAGNI，刻意排除）
 
-- **不**做跨 Bash 呼叫的關聯：hook 每次呼叫無狀態，「呼叫 1 寫檔、呼叫 2 執行」無法偵測（§5.1）。
-  **僅在單一 chain 內**偵測寫檔→執行。
+- **不**做跨 Bash 呼叫的關聯、**不引入任何持久 taint/狀態**：hook per-call 無狀態，「呼叫 1 寫檔、
+  呼叫 2 執行」無法偵測（§5.1 item 1，本工具所有 deny 共有的根本邊界）。**硬 deny 的 shipped guarantee
+  僅及單一 Bash 呼叫鏈內**的寫檔→執行（向量 C）。
 - **不**完整解析 JS/Python 語法（不引入 acorn 等依賴；Python 側 Deno 無好 parser）。只用窄詞法器辨識
   「純 print 字面量序列」這一種形狀，其餘全部放手。
 - **不**處理 `-p`/`--print` 運算式吐值（payload 非 printfn 敘述、述詞天生不命中）。
@@ -275,7 +276,14 @@ interpreterPrintSprayDeny(script, initialCwd):
         local prev = null; local c = cwd
         for child in children: c = visit(child, c, defs, &prev)                 // 共享同一 defs（同 shell）
       ControlFlow(If/For/While/Case):                                           // 本體在當前 shell 執行
-        descend 各分支/本體 with 同一 defs（共享：分支內定義可能洩漏 → 之後視為可能遮蔽）, prevWriteRef = null
+        // 各分支互斥：以「分支本地複本」掃描，掃完才把各分支離開時定義的「聯集」併回父 defs（回應 round 12）
+        union = {}
+        for branch in 各分支/本體:
+          local d = defs.copy()
+          visit branch with d（共享 d；其內定義只在該分支可見）, fresh prevWrite = null
+          union = union ∪ (d \ defs)               // 該分支新定義
+        defs.add_all(union)                         // 構造之後（同 shell）視為可能遮蔽（保守）
+        prevWriteRef = null
       Pipeline(2段 producer|interp)  (任何位置；含 (iii) 包裝排除):              // 向量 D
         if checkVectorD(node, defs): found = true        // 消費者/生產者名 ∈ defs → 跳過
         descend 各段 with defs.copy()（各段在 subshell）以收集定義/跑 A/B; prevWriteRef = null
@@ -543,10 +551,15 @@ export function interpreterPrintDenyReason(): string {
 
 ### 5.1 已知、刻意接受的限制（退回 ask/既有判定，本功能不新增任何 allow 路徑）
 
-1. **跨 Bash 呼叫拆分（無解，stateless）**：呼叫 1 `cat > /tmp/x.mjs <<'EOF'…EOF`（→ ask，寫入重導向）、
-   呼叫 2 `node /tmp/x.mjs`（若使用者設 `Bash(node *)` → 升級 allow）。hook 無跨呼叫狀態，**無法**偵測。
-   屬既有 `permissions.allow` 行為，本功能不新增、亦無法硬擋。**單一 chain 內**的寫檔→執行則被閘④
-   涵蓋（向量 C）。
+1. **跨 Bash 呼叫拆分（本工具的根本架構邊界、非本功能特有；明確界定 shipped guarantee）**：本 hook
+   **per-call、無狀態**——每次 Bash 呼叫獨立評估，**不**保存任何跨呼叫狀態（無檔案 taint、無 mtime 追蹤）。
+   故凡「拆成兩次呼叫」的偽裝皆不在硬 deny 範圍：呼叫 1 `cat > /tmp/x.mjs <<'EOF'…EOF`（→ 不可升級 ask，
+   寫入重導向）、呼叫 2 `node /tmp/x.mjs`（若使用者設 `Bash(node *)` → 升級 allow）。**此為本工具所有 deny
+   類別共有的限制**（既有 print-only deny 同樣無法關聯呼叫 1 `echo 'fake' > f` 與呼叫 2 `cat f`），**非**
+   本功能新增的弱點，也**非**本功能可在不引入持久狀態下解決者。**明確的 shipped guarantee：硬 deny 僅
+   涵蓋「單一 Bash 呼叫鏈內」的寫檔→執行（向量 C）**；跨呼叫拆分維持既有 `permissions.allow` 語意（使用者
+   自負）。新增跨呼叫 stateful tainting 屬本工具未採用的重大架構變更（無狀態為刻意設計），列為非目標
+   （§2.2）。
 2. **非範圍直譯器**：`bash -c`/`sh -c`/`eval`/`source`/`perl -e`/`ruby -e`/`php -r` → 維持既有可升級
    ask（§2.2）。
 3. **動態 token**：直譯器名動態（`$CMD -e …`）、payload 動態（`-e "$CODE"`）、script 路徑動態、
@@ -634,6 +647,9 @@ export function interpreterPrintDenyReason(): string {
   - `if cond; then node(){:;}; fi; node -e 'fake'`（同 shell、條件分支內前置 def）→ 身分不確定 → 跳過 → ask。
   - **`(node(){:;}); node -e 'fake'`、`$(node(){:;}); node -e 'fake'`（def 在 subshell/替換內，不洩漏回父）
     → **deny**（回應 round 11，不被跨 scope 的假定義降級）。
+  - **`if false; then node(){:;}; else node -e 'fake'; fi`（互斥 sibling 分支）→ **deny**（回應 round 12：
+    then 分支的 def 以分支本地複本掃描、不洩漏到 else 分支）；對照 `if x; then node(){:;}; fi; node -e 'y'`
+    （構造之後）→ ask。
   - `python`/`deno`/`bun`/`ts-node` 同理；向量 C `cat(){:;}; cat > x.mjs <<'EOF'…EOF; node x.mjs`（同 shell
     前置遮蔽 cat）→ 跳過 → ask；`(cat(){:;}); cat > x.mjs <<'EOF'…EOF; node x.mjs`（subshell cat 定義）→ deny。
 - 控制流內 A/B（回應 round 9 finding 2，不再繞道）：`if true; then node -e 'console.log("x")'; fi`、
