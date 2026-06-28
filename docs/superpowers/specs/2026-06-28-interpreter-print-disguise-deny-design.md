@@ -288,9 +288,14 @@ token 未完全消費、py `print` 出現 `=` keyword 引數）→ 立即 `false
 節點**共享並 mutate** 同一個 `defs`（定義洩漏給其後）；進入 subshell/命令替換/程序替換/背景/coproc 時以
 **複本** `defs.copy()` 下降（其內定義不洩漏回父）。
 
+**短路、單調（回應 round 28 finding：positive 不可被後續例外抹除）**：任一向量命中即**立即回 `true`
+（deny）、停止後續走訪**（下方以 `found=true` 後 `return`/拋出 `MatchFound` sentinel 表示）。如此後續節點
+的任何 malformed-AST 例外都**無法**把已成立的 deny 降級為 ask；`evaluate` 的外層 try/catch 只在「**尚未
+命中**就拋例外」時退化為 ask（fail-safe）——已命中者已先行返回 deny，不進 catch。
+
 ```
 interpreterPrintSprayDeny(script, initialCwd):
-  found = false
+  // 任一向量命中即短路返回 true（單調、不可被後續節點例外抹除）；visit 內命中以 return/sentinel 上拋至此
   // visit 回傳更新後 cwd；defs 依 scope 規則傳遞（同 shell 共享、新 shell 傳複本）
   visit(node, cwd, defs, prevWriteRef):
     switch node:
@@ -320,7 +325,7 @@ interpreterPrintSprayDeny(script, initialCwd):
         defs.add_all(union)                         // 構造之後（同 shell）視為可能遮蔽（保守）
         prevWriteRef = null
       Pipeline(2段 producer|interp)  (任何位置；含 (iii) 包裝排除):              // 向量 D
-        if checkVectorD(node, defs): found = true        // 消費者/生產者名 ∈ defs → 跳過
+        if checkVectorD(node, defs): return true /*短路：命中即整體返回 deny*/        // 消費者/生產者名 ∈ defs → 跳過
         descend 各段 with defs.copy()（各段在 subshell）以收集定義/跑 A/B; prevWriteRef = null
       NewShellScope(Subshell ( )/命令替換 $( )/程序替換/&背景/coproc):           // 其內定義不洩漏回父
         visit-children with defs.copy()（父 defs 不變）, fresh prevWrite = null, cwd 多為 unknown
@@ -333,18 +338,18 @@ interpreterPrintSprayDeny(script, initialCwd):
                                                                  //（回應 round 20/21：zero-false-deny 優先；任一被遮蔽 → 身分不確定 → 跳過、落閘③ 不可升級 ask）
            and leaf.assignments is empty:                // 無賦值前綴（round 14：PATH=… 可改變解析 → 不 deny；env 改環境已於 resolveExec→Unknown）
           switch recognizeInterpreter(exec):             // §4.2.1（exec＝§4.2.0 透視後的 name+argv）
-            InlineEval(code,lang): if payloadIsAllStaticPrint(code,lang): found = true     // A（任何位置）
-            StdinRead(lang): b=staticStdinBody(leaf); if b and payloadIsAllStaticPrint(b,lang): found = true  // B（leaf.redirects 上的 fd0）
+            InlineEval(code,lang): if payloadIsAllStaticPrint(code,lang): return true /*短路：命中即整體返回 deny*/     // A（任何位置）
+            StdinRead(lang): b=staticStdinBody(leaf); if b and payloadIsAllStaticPrint(b,lang): return true /*短路：命中即整體返回 deny*/  // B（leaf.redirects 上的 fd0）
             ScriptExec(entrypoint,lang):                 // C（僅 SameShellSeq、緊鄰；entrypoint＝被執行腳本，非旗標值）
               if prevWriteRef is WRITE(P',content,cwd_v,writerName) and writerName not in defs
-                 and pathsEqualCwdAware(P',cwd_v, entrypoint,cwd) and payloadIsAllStaticPrint(content,lang): found = true
+                 and pathsEqualCwdAware(P',cwd_v, entrypoint,cwd) and payloadIsAllStaticPrint(content,lang): return true /*短路：命中即整體返回 deny*/
         // ★關鍵（回應 round 13 finding 1）：對**任何**簡單指令更新 prevWrite——寫檔者 cat/tac/echo/printf
         // 並非 INTERPRETERS，但正是向量 C 的 WRITE 來源；若只在 interpreter 分支更新，旗艦案例 cat>x; node x 會漏。
         prevWriteRef = (leaf != null) ? staticTruncatingWriteOf(leaf) : null      // 非靜態截斷寫檔 → null
         update cwd（leaf 為 cd 則 thread；僅 SameShellSeq 內持久）
     return updated cwd
   visit(script, initialCwd, {}/*defs*/, &null)
-  return found
+  return false   // 走完整棵樹皆無命中（任一命中已於上方短路返回 true）
 ```
 
 > `staticTruncatingWriteOf(leaf)` 回 `WRITE(P, content, cwd, writerName)`：當 `leaf` 名 ∈
@@ -631,7 +636,9 @@ if (interpreterPrintSprayDeny(script, initialCwd)) {
 }
 ```
 
-- 仍在既有 try/catch 內 → `interpreterPrintSprayDeny` 任何例外 → `evaluate` 收斂為 ask（fail-safe）。
+- **短路單調（回應 round 28 finding 1）**：`interpreterPrintSprayDeny` 一命中即返回 `true`（deny），**不再
+  續走**——故後續節點的 malformed-AST 例外**無法**抹除已成立的 deny。`evaluate` 既有 try/catch 僅在「**尚未
+  命中**就拋例外」時退化為 ask（fail-safe）；已命中者已先返回、不進 catch。
 - `script`、`initialCwd` 皆已是 `evaluate` 既有參數；閘④ 自走 AST、自算 `definedBefore`，**無新狀態穿透**。
 - **與閘③ 的關係**：閘④ 仍列於閘③ 之前（保硬 deny 不被遮蔽降級），但對「**在該指令之前已定義函式**」
   而遮蔽的名自我跳過（order-aware）→ 該情形落閘③ 回不可升級 ask。閘③ 沿用既有 whole-script `fnNames`
@@ -769,6 +776,8 @@ export function interpreterPrintDenyReason(): string {
     `(echo 'console.log(1)' | node) > f`（pipeline 級重導向）→ 不 deny；**`! echo 'console.log(1)' | node`
     （否定）→ **deny**（`!` 不改資料流，回應 round 20 finding 1）**；`if true; then echo 'console.log(1)' |
     node; fi`（conditional 內的 pipe，無 (iii) 包裝）→ **deny**（向量 D 任何位置生效，回應 round 9）。
+- 短路單調（回應 round 28 finding 1）：`node -e 'console.log("fake")'; <後段為會令走訪拋例外的構造>` →
+  早段命中即短路返回 **deny**，**不**因後段例外被外層 try/catch 降為 ask（早段 deny 已先返回）。
 - 資源上限（per-payload，回應 round 3 + round 7 finding 2）：>64 KiB 或 >20000 token 的**個別** payload
   → 該 payload `false`、不 deny，但**其他候選照常掃描**；關鍵回歸：**大的不相符 heredoc/inline 在前 ＋
   小的相符 `node -e 'console.log("fake")'` 在後 → 仍 deny**（無全域 fail-open 抑制後續判定）。
