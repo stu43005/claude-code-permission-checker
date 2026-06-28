@@ -57,7 +57,8 @@ node /tmp/verify.mjs
 1. **目標 verdict＝硬 deny**：與既有三類 deny 同級，`evaluate` 層短路、不經 `settingsAllows`。
 2. **涵蓋範圍＝最廣（四向量）**：(A) inline 旗標 `-e`/`-c`/`deno eval`；(B) heredoc 餵 stdin；
    (C) 同鏈內「靜態寫腳本檔 → 用直譯器執行同檔」；(D) pipe 餵 stdin（`靜態生產者 | 直譯器`）。
-3. **直譯器集合**：`node`、`nodejs`、`python`、`python3`、`deno`、`bun`、`ts-node`。
+3. **直譯器集合**：`node`、`nodejs`、`python`、`python3`、`deno`、`bun`、`ts-node`（**名稱涵蓋**；實際
+   只辨識**裸形式**——script 路徑前帶任何旗標即退回 ask、不 deny，見 §4.2.1）。
 4. **carve-out＝極保守**：只有「**每一條有效敘述都是 `printfn(純字串/數字字面量)`**」才 deny；任何運算子
    /變數/函式呼叫/模板表示式/import/控制流/賦值 → **不 deny**（退回既有 ask）。寧可漏 deny（安全），
    絕不誤 deny。
@@ -258,6 +259,15 @@ interpreterPrintSprayDeny(invocations, script):
 `InlineEval(code, lang)` / `StdinRead(lang)` / `ScriptFile(path, lang)` / `Unknown`。**核心保守規則：
 只要出現任何「非本表已知的純模式選擇旗標」或任何副作用/預載旗標或無法靜態解析的旗標 → 回
 `Unknown`（不 deny）**。script 位置參數之後的 token 視為「程式 argv」（忽略，不影響判定）。
+
+> **覆蓋範圍＝裸形式（明確、回應 round 5 finding）**：所有直譯器**只辨識「裸形式」**——`-e`/`-c`/`deno
+> eval` 的 inline、無旗標的 stdin、以及「**script 位置參數前無任何 execution-shaping 旗標**」的 script 檔。
+> 凡 script 路徑前出現任何旗標（如 `ts-node --transpile-only|--project|--esm <file>`、`node
+> --experimental-* <file>`、`python -X … <file>`）→ 一律 `Unknown` → **不 deny（有意 under-deny、安全
+> 方向）**。刻意**不**為任何直譯器建旗標 allowlist——逐一維護帶值旗標表會引入把旗標值誤解析成路徑/code
+> 的風險，違反本工具「寧可漏 deny、絕不誤 deny」原則。代價：帶旗標的 ts-node/node 寫檔→執行偽裝會漏 deny
+> （仍可能被使用者 `Bash(ts-node *)` 等升級為 allow，屬既有 settings 風險）。§1.3 的直譯器集合指的是
+> **名稱涵蓋**，實際辨識以本裸形式規則為準；測試與覆蓋宣稱據此限縮。
 
 - **node / nodejs / bun / ts-node**（lang=js）：
   - `-e`/`--eval`（含 `--eval=X` 黏寫；或 `-e X` 取下一 token）→ `InlineEval(X, js)`；X 動態 → `Unknown`。
@@ -464,6 +474,9 @@ export function interpreterPrintDenyReason(): string {
 4. **`-p`/`--print` 運算式吐值**、**多段 pipeline**（`a|b|node`）、**副作用旗標併用**（`node -r x -e …`）
    → 保守跳過、不 deny。
 5. **間接寫檔/執行**：用 `tee`、`sed -n w`、`dd` 等非列舉寫檔形態，或經變數傳 path → 不 deny。
+6. **僅裸直譯器形式（回應 round 5）**：script 路徑前帶任何 execution-shaping 旗標（`ts-node
+   --transpile-only x.ts`、`node --experimental-* x.mjs`、`python -X… x.py`）→ Unknown → 不 deny。
+   刻意不建旗標 allowlist（避免把旗標值誤解析成路徑）；屬安全方向 under-deny（§4.2.1）。
 
 > 上述 ask 多數**可被** `settingsAllows` 升級（使用者自設 `Bash(node *)` 等）——屬使用者自負的 settings
 > 風險；本功能不新增此升級路徑，亦不硬擋這些繞道。被閘④命中的全靜態-print 形態則**不可**升級。
@@ -526,6 +539,8 @@ export function interpreterPrintDenyReason(): string {
 - 直譯器辨識：`node -r x -e 'console.log(1)'`（副作用旗標）→ Unknown → 不 deny；`deno run -A x.ts`、
   `deno eval --no-check 'console.log("x")'`（任何 deno 旗標）→ Unknown → 不 deny；裸 `deno eval
   'console.log("x")'` → deny；動態 `node -e "$C"` → 不 deny。
+- 裸形式覆蓋（回應 round 5）：`echo 'console.log("x")' > verify.ts; ts-node --transpile-only verify.ts`
+  （script 前有旗標）→ Unknown → **不 deny（有意 under-deny）**；對照裸 `… ; ts-node verify.ts` → deny。
 
 ### 7.3 不可升級 e2e（`main_test.ts`，子行程）
 
