@@ -160,6 +160,16 @@ main.ts → evaluate(command, root, initialCwd, rules, home, trustedReadRoots)
   `prevWrite`，見向量 C）。
 - `leaf.name ∈ INTERPRETERS` → 依 §4.3 旗標規則判定向量 A/B/C；§4.4 另以 AST 判向量 D（pipe）。
 
+**控制流 body 的處理**：向量 A/B（單葉 inline/stdin）對**任何位置**的直譯器葉指令生效，含 `if`/`for`/
+`while`/`case` body、subshell `( )`、命令替換 `$( )` 內（這些 body 會在某執行路徑執行，走訪下降之）。
+**向量 C（寫→執行相鄰）僅在循序序列上判**，不跨控制流/subshell 邊界（§4.3）。`Function` 定義 body 不下降
+（且腳本含任何函式定義時整個閘④ 已先被全域跳過閘擋下）。
+
+**deno 子指令解析**（明確化）：`deno eval <payload>` → 向量 A（inline）；`deno run -`（裸 dash）→ 向量 B
+（stdin，`-` 是 stdin 標記、**非** script 位置參數）；`deno run <file>` → 向量 C（script 執行，`<file>` 為
+EXEC 的 token）。良性旗標（`--allow-*` 等）於 `eval`/`run` 後出現皆無視（§4.3 第 3 類）；注入旗標
+（`--preload`/`--require`）→ 跳過。
+
 ### 4.3 旗標規則與向量 A/B/C（直譯器葉指令）
 
 掃 `inv.argv`（靜態化）。**旗標分三類**：
