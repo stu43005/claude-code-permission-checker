@@ -222,8 +222,13 @@ re-export），因其同被葉載具判定、WRITE→EXEC 的 WRITE 內容還原
   fd0 為靜態 heredoc/here-string（fd0「最後者勝」＋`isHeredocPrintEligible`）→ body 餵述詞。無 fd0 重導向
   （繼承 stdin，hook 看不到）→ 非載具。
 
-`INTERPRETERS = {node, nodejs, python, python3, deno, bun, ts-node}`。**deno 子指令解析**：`deno eval <payload>` →
-inline；`deno run -`（裸 dash，`-` 是 stdin 標記）→ heredoc-stdin；`deno run <file>` → 下述 WRITE→EXEC 的 EXEC。
+`INTERPRETERS = {node, nodejs, python, python3, deno, bun, ts-node}`。**子指令解析**：
+- **deno**：`deno eval <payload>` → inline；`deno run -`（裸 dash，`-` 是 stdin 標記）→ heredoc-stdin；
+  `deno run <file>` → 下述 WRITE→EXEC 的 EXEC。
+- **bun**：`bun run <file>` → EXEC（同 `<file>` 執行）；裸 `bun` 配 heredoc/here-string → heredoc-stdin。
+  **`bun run -` 的 `-` 是否為 stdin 標記待實作前以 research subagent 查證 bun 版本行為**（若非 stdin 標記則不
+  觸發、屬 under-deny，安全）；§7.4 的 `bun run -` 測試須以查證結果為準、或改用裸 `bun <<'EOF'` 形式。
+- **node/python/ts-node**：裸直譯器配 heredoc/here-string → heredoc-stdin（無專屬 `run` 子指令）。
 
 #### 4.3.2 複合載具（跨葉 pattern）
 
@@ -410,10 +415,6 @@ if (hasAliasRedefinition(invocations)) {
 ```
 
 #### 4.6.1 函式定義（node-based、fail-closed）
-
-- **判定用 node-based、fail-closed 的新 helper `hasExecutableFunctionDefinition(script)`（回應 review high
-  finding）**，**非** name-based 的 `definedFunctionNames`：只要 AST 中存在**任一可執行位置的 `Function` 節點**
-  即 `true`，**不依賴函式名是否可靜態還原**。
 
 - **判定用 node-based、fail-closed 的新 helper `hasExecutableFunctionDefinition(script)`（回應 review high
   finding）**，**非** name-based 的 `definedFunctionNames`：只要 AST 中存在**任一可執行位置的 `Function` 節點**
