@@ -9,7 +9,7 @@
   2. **新增「名稱重定義構造 → 硬 deny」閘**（取代既有閘③「函式遮蔽 → ask」，升級為 deny）：**函式定義**與
      **alias 類**（`alias`/`unalias`/`shopt -s expand_aliases`）皆能重定義指令名、根本繞過本工具 name-based
      分析，屬危險結構 → 直接 deny。此閘排在 print 閘**之前**，故 print 閘只跑在「無函式、無 alias」腳本上、
-     其 name-based 載具判定恆可信，print 閘**不再需要**任何名稱重定義特例。
+     其 name-based 載具判定**不受函式/alias 遮蔽**，print 閘**不再需要**任何名稱重定義特例。
 - 因此本版 **deny 由三類擴為四類**：① 遞迴遍歷磁碟根/家目錄根；② sleep 輪詢；③ 整鏈 print-only 偽裝（跨載具）；
   ④ **名稱重定義**（函式定義＋alias 類）。
 - 威脅模型（延續早期簡化重寫）：**只針對「agent 用常見形態做 print-only 假驗證」，不防駭客刻意繞過**；凡指令含
@@ -77,8 +77,9 @@ cat /tmp/q.txt
   3. **名稱重定義 → deny**（閘②，§4.6）：函式定義與 alias 類皆破壞 name-based 安全模型，主動擋。此為對嚴格
      「絕不誤 deny」刻意接受的 over-deny（合法 `helper(){…}; helper`、`alias` 列出形亦被擋）——使用者定案
      「agent 不該在 Bash 呼叫內定義函式或設 alias」。
-  4. **不影響「會執行什麼」的旗標**（`--transpile-only`/`--experimental-*`/deno `--allow-*`…）→ **無視、繼續
-     判定**（不是跳過）。
+  4. **不影響「會執行什麼」的良性旗標**（`--transpile-only`/`--experimental-*`/deno `--allow-*`…）→ **已知
+     nullary 者無視、繼續判定**；但**未知/可能吃值的分離裸旗標 → 保守放棄本葉定位**（fail-safe arity，§4.3.3，
+     避免把旗標值誤當 `-e`/進入點而誤 deny）。
   5. 方向恆安全：**除 (3) 名稱重定義 deny（函式/alias）與 cat 讀回複合載具（§4.3.2(b)）兩處刻意 over-deny 外，
      絕不誤 deny、絕不新增 allow 路徑**。
 
@@ -109,7 +110,7 @@ cat /tmp/q.txt
   （`nameRedefinitionDenyReason(kind)`）。取代舊閘③「函式遮蔽 → ask」。`definedFunctionNames` 僅供理由文字/測試診斷。
 - **閘③（合併升級，deny）**：把既有 `isAllPrintOnly` 升級為統一「print 載具」框架，跨 shell/直譯器；命中即整鏈
   deny、`classify` 前短路、不可升級。因**名稱重定義構造**已由閘② deny，print 閘只跑在「無函式、無 alias」腳本 →
-  其 name-based 判定恆可信、**不含任何名稱重定義特例**。
+  其 name-based 判定**不受函式/alias 遮蔽**、**不含任何名稱重定義特例**。
 - **模組結構**（維持 `src/engine/` 扁平慣例）：
   - `static_output.ts`（**新**）：靜態輸出還原原語——echo/printf/cat-heredoc → 具體輸出字串（`string | null`）；
     `wordPrintEligible`/`isHeredocPrintEligible`/fd0「最後者勝」自 `print_only.ts` 移入或 re-export。
@@ -146,7 +147,8 @@ main.ts → evaluate(command, root, initialCwd, rules, home, trustedReadRoots)
        └─ combine(invocations.map(classify))                                        （不變）
 ```
 
-- **順序要點**：閘② 在閘③ 前 → print 閘只在「無函式定義」腳本上執行，其 name-based 載具判定恆可信。
+- **順序要點**：閘② 在閘③ 前 → print 閘只在「無函式、無 alias」腳本上執行，其 name-based 載具判定不受函式/
+  alias 遮蔽（其他 mutator 為既有 out-of-scope 邊界，§5）。
 - **no-op 與函式的交互（排序修正）**：現行 `evaluate` 把 `invocations.length === 0 → allow` 放在**最前**；
   但純函式定義（`f(){:;}`）walk 產 0 個 invocation，若 no-op 檢查先跑會誤放行。故本版**把 no-op allow 檢查移到
   閘②（函式）之後**——`f(){:;}` 先被閘② deny；no-op allow 僅在「無函式定義且無葉指令」（如空指令）時成立。
@@ -284,18 +286,25 @@ inline；`deno run -`（裸 dash，`-` 是 stdin 標記）→ heredoc-stdin；`d
    `--env-file`/**`--loader`/`--experimental-loader`**（後二者注入模組載入器、改變執行）。**只計 inline payload/
    script 位置參數之前的旗標**——inline-eval 值之後的 token 是程式 argv（`node -e 'console.log("x")' -r p` 的 `-r`
    在 payload 之後＝argv → 仍為載具）。
-3. **不影響執行的良性旗標**——**兩種用途分開處理**：
-   - **葉載具 inline（A）找 payload 時**：無視良性旗標、繼續判定（`--flag=value` 略 1；裸 `--flag` 略 1）。
-     多略/少略只影響是否找到 inline payload，方向皆 under-deny。
-   - **WRITE→EXEC(a) 找進入點時（§4.3.2(a)）**：**改採 fail-safe 保守解析**——`--flag=value` 略 1、**已知 nullary
-     良性旗標**（`--transpile-only`/`--experimental-*`/`--no-warnings`/deno `--allow-*` 裸形/`-A`/`--no-check`/
-     ts-node `--esm`…）略 1；遇**任何其他分離式裸旗標**（可能吃值者/未知）→ **放棄進入點定位、不成對**。理由：
-     進入點若定錯（把吃值旗標的值當成進入點）會**誤 deny**，故此處不容「保守略 1」的模糊，寧 under-deny。
+3. **不影響執行的良性旗標**——**inline（A）payload 定位與 WRITE→EXEC(a) 進入點定位皆採同一 fail-safe 保守
+   arity 模型（回應 review medium/high finding）**：由左至右掃旗標，
+   - `--flag=value`（黏值形）→ arity 0、略 1；
+   - **已知 nullary 良性旗標**（維護一份小集合：`--transpile-only`/`--experimental-*` 裸形/`--no-warnings`/deno
+     `--allow-*` 裸形/`-A`/`--no-check`/ts-node `--esm`…）→ 略 1；
+   - 遇**任何其他分離式裸旗標**（可能吃走下一個 token 為值的良性旗標，或未知旗標）→ **無法確定後續 token 角色 →
+     放棄本葉的載具/進入點定位（EXEC/inline 非載具、不成對）**。
+   理由：**inline 與進入點皆不容「保守略 1」的模糊**——若把吃值旗標的值誤當成 `-e`/`-c` 標記或進入點會**誤 deny**
+   （例：`node --title -e script.js` 中 `--title` 若吃走 `-e`，鬆散略 1 會把 `script.js` 當 inline payload）。統一
+   保守解析後，方向恆 under-deny、絕不誤 deny。已知 nullary 旗標之後的 inline-eval/進入點照常判定（如
+   `node --no-warnings -e '<print>'`、`node --transpile-only x.ts` 仍 deny）。
 
 ### 4.4 聚合語意 `printDisguiseDeny(script, initialCwd)`（**取代 per-leaf 短路；單一自足走訪**）
 
-> **前提**：本閘（閘③）僅在閘② 未 deny 時執行，故腳本**保證無函式定義**——載具的 name-based 判定恆可信、
-> **無需任何函式遮蔽處理**（舊閘②′ 的全域跳過特例已移除）。
+> **前提（收窄後，回應 review high finding）**：本閘（閘③）僅在閘② 未 deny 時執行，故腳本**保證無函式定義、
+> 無 alias 類**——載具的 name-based 判定**不受函式/alias 遮蔽影響**、**無需任何名稱重定義處理**（舊閘②′ 的全域
+> 跳過特例已移除）。**此可信性僅相對「函式/alias」而言，非普遍保證**：bash 尚有其他 command-resolution mutator
+> （`hash -p`/`enable -n|-f`/`PATH` 變更/`source`·`.` 匯入）也能改變名稱解析，但那些是**全工具既有的 name-based
+> 邊界**（今天就落 classify/ask、非本 spec 引入或惡化），**明列為 out-of-scope**（§5）。本閘不宣稱關閉它們。
 
 **兩階段、單一自足走訪**（**非** per-leaf 短路、**非**跨走訪 index 對位——回應 review Finding 2）：`printDisguiseDeny`
 自行對 `script` 做**一趟** source-order 前序走訪，**同時**列舉葉、分類每葉、偵測複合、記錄存在性；覆蓋判定即以
@@ -324,7 +333,8 @@ thread cwd（由 `initialCwd`；遇 `cd` 後標 unknown）、維護「緊鄰前�
   若鏈中含 ≥1 個 **WRITE→EXEC 複合載具**，則額外允許 **setup 白名單** `{mkdir, cd, true, :}` 的葉（**裸 print 鏈與
   pipe 鏈——不含 WRITE→EXEC——不吃此豁免**）。setup 白名單葉若處於**否定（`!`）之下**不算 setup（`! true` 排除）。
 - **(b) 存在**：至少一個 print 載具（葉載具或複合載具）。
-- **(c) 未遮蔽**：**由閘② 保證**——腳本無函式定義（否則已被閘② deny），故載具名絕不被遮蔽。本閘無需自行處理。
+- **(c) 未被函式/alias 遮蔽**：**由閘② 保證**——腳本無函式定義、無 alias 類（否則已被閘② deny），故載具名不被
+  函式/alias 遮蔽。本閘無需自行處理。（其他 mutator 如 `hash`/`enable`/`PATH` 為既有 out-of-scope 邊界，§5。）
 
 **控制流路徑不敏感（安全 under-deny）**：clause/guard 與所有分支一併納入葉集、覆蓋 (a) 施加於此完整集、不區分
 互斥路徑。含 guard 或多分支引入非載具葉即 (a) 失敗 → 不 deny。`if command -v node; then node -e '<print>'; else
@@ -382,9 +392,12 @@ if (hit) return { verdict: "deny", reason: printDisguiseDenyReason(hit.kind) };
 
 ### 4.6 閘②（新）：name-redefinition 構造 → deny（函式定義＋alias 類）
 
-本閘擋**所有能在同一呼叫內重定義指令名、破壞 name-based 模型的構造**：(1) 函式定義；(2) alias 類
-（`alias`/`unalias`/`shopt -s expand_aliases`）。任一命中即 deny，使閘③ print 與 classify 的 name-based 判定
-「腳本無名稱重定義」前提成立。
+本閘擋**函式與 alias 兩類名稱重定義構造**：(1) 函式定義；(2) alias 類（`alias`/`unalias`/`shopt -s expand_aliases`）。
+任一命中即 deny，使閘③ print 與 classify 的 name-based 判定**不受函式/alias 遮蔽**。**範圍界定（回應 review high
+finding）**：本閘**只**關閉函式/alias；bash 其他 command-resolution mutator（`hash -p`、`enable -n|-f`、`PATH`/
+`export` 變更、`source`/`.` 匯入）**不在本閘範圍**——它們是全工具既有的 name-based 邊界（已落 classify/ask），
+本 spec 不涵蓋、亦不惡化（§5 out-of-scope）。故本閘的價值是「消除函式/alias 這兩條**最常見**的名稱重定義」，
+非「保證名稱解析絕對可信」。
 
 ```ts
 // 閘②（deny）：name-redefinition 構造——classify 前返回、不可升級
@@ -466,6 +479,12 @@ bash **alias** 同樣能重定義 allowlisted 指令名（`shopt -s expand_alias
   內、**動態名**；node-based fail-closed）；(2) alias 類——`alias`/`unalias`/`shopt -s expand_aliases`（name-based）。
   接受 over-deny。唯一不觸發者是「文字為資料」（heredoc 純文字/字串引數，非 AST 節點/invocation → 不 deny，故
   shell-script 撰寫不受影響）。alias 動態指令名（`name===null`）→ under-deny（安全）。
+- **其他 command-resolution mutator（既有 tool-wide 邊界、out-of-scope，回應 review high finding）**：
+  `hash -p <path> <name>`、`enable -n <builtin>`/`enable -f`、`PATH`/`export PATH=` 變更、`source`/`.` 匯入
+  定義——皆能改變後續指令名解析，但**非本閘涵蓋**。它們今天就落既有 classify/ask（非硬 deny，可被 settings
+  影響），屬全工具的既有 name-based 邊界；本 spec **不引入亦不惡化**，僅明列。**不擴張到這些的理由**：清單近乎
+  無窮，且 `export PATH=`/`source` 為極常見合法用法，硬 deny 會大量誤 deny（與 alias 的低誤殺不同）。使用者
+  日後可另擇擴充特定 mutator。
 - **控制流路徑不敏感**：clause/guard 與各分支納入同一葉集、覆蓋 (a) 施加於完整集；含 guard/多分支者通常 (a)
   失敗 → 不 deny（§4.4）。
 - **exec-wrapper**（`timeout`/`command`/`env`/`nice`/`nohup`…）：葉名非載具 →（若鏈中尚有非載具葉）覆蓋 (a)
@@ -529,6 +548,10 @@ bash **alias** 同樣能重定義 allowlisted 指令名（`shopt -s expand_alias
 ### 7.4 print 閘③ 載具/聚合整合測試（`print_only_test.ts` 新增段；以下皆**無函式定義**）
 - **葉載具 inline（A）**：裸 `node -e '<print>'`/`python -c '<print>'`/`deno eval '<print>'`/`bun -e`/`ts-node -e`、
   `node -p '"fake"'` → deny；含運算 `node -e '1+1…'`、`node -p '1+1'`/`os.cpus()` → 不 deny。
+  - **已知 nullary 旗標之後仍 deny**：`node --no-warnings -e '<print>'`、`ts-node --transpile-only -e '<print>'` → deny。
+  - **分離值/未知旗標 → 放棄、不 deny（回應 review medium finding，須斷言不 deny）**：`node --title -e 'console.log("x")'`
+    （`--title` 非已知 nullary、可能吃走 `-e` → 放棄 inline 定位）、`node --unknown-flag val -e '<print>'` → **不 deny**
+    （保守 arity 避免把旗標值誤當 `-e` 標記而誤 deny）。
 - **葉載具 heredoc-stdin（B）**：裸 `node <<'EOF'<print>EOF`/`python <<'EOF'`/`deno run -`/`bun run -` → deny；
   `< file`/無 fd0（繼承）→ 不 deny。
 - **複合 WRITE→EXEC(a)**：旗艦 `cat > /tmp/x.mjs <<'EOF'<print>EOF; node /tmp/x.mjs` → deny；`&&` 緊鄰 → deny；
@@ -613,6 +636,10 @@ bash **alias** 同樣能重定義 allowlisted 指令名（`shopt -s expand_alias
 - **跨呼叫拆分 × `settingsAllows`（意識接受）**：WRITE 與 EXEC 拆到兩次呼叫時 deny 消失；配 `Bash(node *)` 呼叫2
   升級 allow。此為兩條鎖定不變量（per-call 無狀態、純詞法不讀檔）的交集、非本功能引入的漏洞；封閉需 taint/讀檔
   （違反不變量）故不做。緩解：hook 自主預設 ask、單呼叫內硬 deny 不可升級、使用者對 `Bash(node *)` 自負。
+- **其他 command-resolution mutator out-of-scope（收窄不變量，回應 review high finding）**：`hash -p`、
+  `enable -n|-f`、`PATH`/`export PATH=`、`source`/`.` 匯入——皆能改變名稱解析，但**非閘② 涵蓋**、落既有 classify/ask。
+  閘② 的可信性**僅相對函式/alias**、非普遍保證（§4.4 前提、§4.6、§5）。不擴張理由：清單近乎無窮、且 PATH/source
+  硬 deny 誤殺面大。屬既有 tool-wide 邊界、本 spec 不惡化。
 - **兩處 accepted over-deny**（觸及「絕不誤 deny」）：
   - **名稱重定義 → deny**（§4.6）：**函式**僅限可執行位置（真 `Function` 節點＋`$()`/`<()` 內、node-based
     fail-closed）；**alias 類**為 `alias`/`unalias`/`shopt -s expand_aliases`（name-based）。合法 `helper(){…};
