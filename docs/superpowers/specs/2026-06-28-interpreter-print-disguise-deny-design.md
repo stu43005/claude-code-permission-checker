@@ -26,7 +26,8 @@
 - **名稱重定義**（函式定義＋alias 類）：`evaluate` 層**閘②**（本版新增，見 §4.6）。
 - **整鏈 print-only 偽裝**：`evaluate` 層**閘③**（本版合併主體，見 §4.3–§4.5）。
 
-所有 deny 皆不經 `settingsAllows` 升級層、`classify` 前短路。
+所有 deny 皆不經 `settingsAllows` 升級層：evaluate 層三閘（sleep/名稱重定義/print）於 `classify` **之前**短路返回；
+遞迴根 deny 則於 `classify` **內部**以 `isDangerousRoot` 短路（先於升級層），故亦不可由 `permissions.allow` 解除。
 
 **本規格所做的**：(1) 把「整鏈 print-only 偽裝」由「只涵蓋 shell 層 echo/printf/cat-heredoc」（舊閘②）擴充為
 「跨載具（含直譯器 inline/heredoc/pipe/寫檔→執行、cat 讀回兩步偽裝）」；(2) 把「函式遮蔽 → ask」（舊閘③）升級
@@ -285,16 +286,19 @@ re-export），因其同被葉載具判定、WRITE→EXEC 的 WRITE 內容還原
 
 #### 4.3.3 旗標規則（直譯器葉）
 
-掃 `inv.argv`（靜態化）。**旗標分三類**：
+掃 `inv.argv`（靜態化）。**先對每個旗標 token 正規化 `--name=value` → 取 `--name` 部分**（黏值/分離形統一以
+`--name` 判類別），再依下列**明確優先序**分類（**回應 review high finding：類別判定先於泛用 arity 略過**）：
 
 1. **inline-eval 旗標**：node/bun/ts-node `-e`/`--eval`、python `-c`、`deno eval`（子指令）、`-p`/`--print`。取其值為 payload。
-2. **會注入/改變執行的旗標**（出現即**跳過此葉**、不視為載具）：`-r`/`--require`/`--import`/`-m`/`--preload`/
-   `--env-file`/**`--loader`/`--experimental-loader`**（後二者注入模組載入器、改變執行）。**只計 inline payload/
-   script 位置參數之前的旗標**——inline-eval 值之後的 token 是程式 argv（`node -e 'console.log("x")' -r p` 的 `-r`
-   在 payload 之後＝argv → 仍為載具）。
-3. **不影響執行的良性旗標**——**inline（A）payload 定位與 WRITE→EXEC(a) 進入點定位皆採同一 fail-safe 保守
-   arity 模型（回應 review medium/high finding）**：由左至右掃旗標，
-   - `--flag=value`（黏值形）→ arity 0、略 1；
+2. **會注入/改變執行的旗標（優先於類別 3 檢查；一出現即此葉非載具）**：`-r`/`--require`/`--import`/`-m`/`--preload`/
+   `--env-file`/`--loader`/`--experimental-loader`（後二者注入模組載入器）。**黏值與分離形皆算**——正規化後名
+   `∈` 此集即命中，故 `node --require=./pre.js -e '<print>'`、`node --loader=./l.mjs -e '<print>'` 的注入旗標
+   **在套泛用 arity 前就被辨識 → 該葉非載具、不 deny**（避免把「先注入碼再 print」誤判為純 print）。**只計 inline
+   payload/script 位置參數之前的旗標**——inline-eval 值之後的 token 是程式 argv（`node -e 'console.log("x")' -r p`
+   的 `-r` 在 payload 之後＝argv → 仍為載具）。
+3. **不影響執行的良性旗標（僅對「非類別 1/2」的旗標套用）**——**inline（A）payload 定位與 WRITE→EXEC(a) 進入點
+   定位皆採同一 fail-safe 保守 arity 模型（回應 review medium/high finding）**：由左至右掃旗標，
+   - `--flag=value`（黏值形，且非類別 2）→ arity 0、略 1；
    - **已知 nullary 良性旗標**（維護一份小集合：`--transpile-only`/`--experimental-*` 裸形/`--no-warnings`/deno
      `--allow-*` 裸形/`-A`/`--no-check`/ts-node `--esm`…）→ 略 1；
    - 遇**任何其他分離式裸旗標**（可能吃走下一個 token 為值的良性旗標，或未知旗標）→ **無法確定後續 token 角色 →
@@ -447,9 +451,9 @@ if (hasAliasRedefinition(invocations)) {
 bash **alias** 同樣能重定義 allowlisted 指令名（`shopt -s expand_aliases; alias grep='rm -rf'; grep x`），與函式
 同屬破壞 name-based 模型的機制。**使用者定案：一律 deny**。
 
-- **`hasAliasRedefinition(invocations)`（新，純函式、以 walk 攤平的 `invocations[]` 判定，如同 sleep 閘的
-  name-based 偵測）** → `true` 當任一葉指令，**先解 `builtin`/`command` 分派器包裝取「有效 alias-builtin 名＋其後
-  argv」**（見下），再判：
+- **`hasAliasRedefinition(invocations)`（新，純函式，**置於 `walk.ts`**——與 `hasExecutableFunctionDefinition`
+  同組名稱重定義 helper；以 walk 攤平的 `invocations[]` 判定，如同 sleep 閘的 name-based 偵測）** → `true` 當任一
+  葉指令，**先解 `builtin`/`command` 分派器包裝取「有效 alias-builtin 名＋其後 argv」**（見下），再判：
   - 有效名 === `alias` 或 `unalias`（定義/移除 alias），**或**
   - 有效名 === `shopt` 且其 argv 靜態值含 `-s`（set）與 `expand_aliases`（僅擋**啟用 alias 展開**的形式；
     `shopt -s globstar`、`shopt -u expand_aliases`（停用）、`shopt expand_aliases`（查詢）**不擋**）。
@@ -568,6 +572,12 @@ bash **alias** 同樣能重定義 allowlisted 指令名（`shopt -s expand_alias
   - **分離值/未知旗標 → 放棄、不 deny（回應 review medium finding，須斷言不 deny）**：`node --title -e 'console.log("x")'`
     （`--title` 非已知 nullary、可能吃走 `-e` → 放棄 inline 定位）、`node --unknown-flag val -e '<print>'` → **不 deny**
     （保守 arity 避免把旗標值誤當 `-e` 標記而誤 deny）。
+  - **注入旗標 → 該葉非載具、不 deny（回應 review high finding；分離＋`=value` 兩形皆須斷言不 deny）**：
+    `node --require ./pre.js -e '<print>'`、`node --require=./pre.js -e '<print>'`、`node --import=./m.mjs -e '<print>'`、
+    `node --loader=./l.mjs -e '<print>'`、`node --experimental-loader=./l.mjs -e '<print>'`、`node --env-file=.env -e '<print>'`、
+    `python -m pytest -c 'print("x")'` → **不 deny**（類別 2 注入旗標先於泛用 arity 辨識、正規化 `=value` 後命中 →
+    葉非載具，避免把「先注入碼再 print」誤判為純 print）。同理 WRITE→EXEC(a)：`cat > x <<print; node --require=./p.js x`
+    → 不成對、不 deny。
 - **葉載具 heredoc-stdin（B）**：裸 `node <<'EOF'<print>EOF`/`python <<'EOF'`/`deno run -`/裸 `bun <<'EOF'` → deny；
   `< file`/無 fd0（繼承）→ 不 deny；`bun run -` **不特案**（保守 under-deny，§4.3.1）。
 - **複合 WRITE→EXEC(a)**：旗艦 `cat > /tmp/x.mjs <<'EOF'<print>EOF; node /tmp/x.mjs` → deny；`&&` 緊鄰 → deny；
