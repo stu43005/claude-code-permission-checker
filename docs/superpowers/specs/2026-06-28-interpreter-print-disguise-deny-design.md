@@ -226,10 +226,21 @@ inline；`deno run -`（裸 dash，`-` 是 stdin 標記）→ heredoc-stdin；`d
   EXEC 有兩種：
   - **(a) 直譯器執行同檔**：EXEC 葉 `name ∈ INTERPRETERS`、「script 執行」形態（非 inline、非 stdin），其
     **直譯器 script 進入點**等於 WRITE 寫出的路徑 P，且 **WRITE 內容須過 `payloadIsAllStaticPrint`**（lang 由該直譯器決定）。
-    - **進入點＝略過旗標/子指令後的第一個位置參數**：依 §4.3.3 略過良性旗標（含值）與注入旗標偵測、deno `run`
-      子指令後，取**第一個非旗標位置 token** 為進入點；**其後的 token 是程式 argv、不比對**。故只有「真正被執行
-      的那個檔＝P」才成對——`node runner.js generated.js`（進入點 runner.js ≠ P）、`python runner.py fixture.py`、
-      `deno run runner.ts fixture.ts` **皆不成對、不 deny**（generated/fixture 只是程式引數）。
+    - **進入點偵測採 fail-safe 保守解析（回應 review high finding；寧 under-deny 不誤 deny）**：deno 先過 `run`
+      子指令；然後由左至右掃旗標找第一個位置參數為進入點——但**只在能確定跳過量時前進**：
+      - `--flag=value`（黏值形）→ arity 0、跳 1。
+      - **已知 nullary 良性旗標**（`--transpile-only`/`--no-warnings`/`--experimental-*` 裸形/deno `--allow-*` 裸形/
+        `-A`/`--no-check`/ts-node `--esm` 等，維護一份**小的已知 nullary 集**）→ 跳 1。
+      - **任何其他分離式裸旗標**（可能吃值的良性旗標如 `--loader`/`--experimental-loader`/`--config`/`--project`/
+        `-P`/`--import-map`/`--compiler`，或未知旗標）→ **無法確定其是否吃走下一個 token 為值 → 放棄進入點定位 →
+        EXEC 非載具、不成對（安全 under-deny）**。
+      進入點之後的 token 一律是程式 argv、不比對。故只有「真正被執行的那個檔＝P、且其前無不確定旗標」才成對：
+      - 成對 deny：`cat > /tmp/x.mjs <<…; node /tmp/x.mjs`、`node --transpile-only x.ts`（x.ts=P、旗標已知 nullary）、
+        `node --experimental-default-type=module x.mjs`（`=value` 形）、`deno run --allow-read x.ts`（裸 allow 已知 nullary）。
+      - **不成對、不 deny**：`node runner.js generated.js`（進入點 runner.js ≠ P）、`python runner.py fixture.py`、
+        `deno run runner.ts fixture.ts`（generated/fixture 只是 argv）；`node --loader fixture.js runner.js`、
+        `ts-node --project cfg.json runner.ts`（`--loader`/`--project` 非已知 nullary → 放棄定位，即使 fixture/cfg
+        為前驅 WRITE 亦不誤 deny）。
   - **(b) cat/tac 讀回同檔**（**新增；意識接受的 narrow over-deny exception**）：EXEC 葉 `name ∈ {cat, tac}`、
     其**唯一操作元**為 WRITE 寫出的路徑 P、無蓋過的 fd0 輸入重導向；**WRITE 內容為任何可靜態還原文字即可、
     不需過 payload 述詞**（因 composite 淨效果就是把「同呼叫內剛靜態寫死的文字」原樣吐回 stdout）。封掉
@@ -267,12 +278,16 @@ inline；`deno run -`（裸 dash，`-` 是 stdin 標記）→ heredoc-stdin；`d
 
 1. **inline-eval 旗標**：node/bun/ts-node `-e`/`--eval`、python `-c`、`deno eval`（子指令）、`-p`/`--print`。取其值為 payload。
 2. **會注入/改變執行的旗標**（出現即**跳過此葉**、不視為載具）：`-r`/`--require`/`--import`/`-m`/`--preload`/
-   `--env-file`。**只計 inline payload/script 位置參數之前的旗標**——inline-eval 值之後的 token 是程式 argv
-   （`node -e 'console.log("x")' -r p` 的 `-r` 在 payload 之後＝argv → 仍為載具）。
-3. **不影響執行的良性旗標**（**無視、繼續判定**）：其餘旗標——`--transpile-only`/`--experimental-*`/`--no-warnings`/
-   deno `--allow-*`/`-A`/`--no-check`、ts-node `--esm`… 及其值（`--allow-read=path`）。解析時略過這些 token
-   （保守：`--flag=value` 略 1；裸 `--flag` 略 1；不維護精確 arity 表——多略/少略只影響是否找到 script 位置參數，
-   方向皆 under-deny）。
+   `--env-file`/**`--loader`/`--experimental-loader`**（後二者注入模組載入器、改變執行）。**只計 inline payload/
+   script 位置參數之前的旗標**——inline-eval 值之後的 token 是程式 argv（`node -e 'console.log("x")' -r p` 的 `-r`
+   在 payload 之後＝argv → 仍為載具）。
+3. **不影響執行的良性旗標**——**兩種用途分開處理**：
+   - **葉載具 inline（A）找 payload 時**：無視良性旗標、繼續判定（`--flag=value` 略 1；裸 `--flag` 略 1）。
+     多略/少略只影響是否找到 inline payload，方向皆 under-deny。
+   - **WRITE→EXEC(a) 找進入點時（§4.3.2(a)）**：**改採 fail-safe 保守解析**——`--flag=value` 略 1、**已知 nullary
+     良性旗標**（`--transpile-only`/`--experimental-*`/`--no-warnings`/deno `--allow-*` 裸形/`-A`/`--no-check`/
+     ts-node `--esm`…）略 1；遇**任何其他分離式裸旗標**（可能吃值者/未知）→ **放棄進入點定位、不成對**。理由：
+     進入點若定錯（把吃值旗標的值當成進入點）會**誤 deny**，故此處不容「保守略 1」的模糊，寧 under-deny。
 
 ### 4.4 聚合語意 `printDisguiseDeny(script, initialCwd)`（**取代 per-leaf 短路；單一自足走訪**）
 
@@ -412,8 +427,10 @@ if (hasExecutableFunctionDefinition(script)) {
 - **exec-wrapper**（`timeout`/`command`/`env`/`nice`/`nohup`…）：葉名非載具 →（若鏈中尚有非載具葉）覆蓋 (a)
   失敗 → 落 ask。
 - **賦值前綴**（`X=1 node …`）：跳過此葉、不視為載具。
-- **會注入碼的旗標**（`-r`/`--require`/`--import`/`-m`/`--preload`）：跳過此葉。
+- **會注入碼的旗標**（`-r`/`--require`/`--import`/`-m`/`--preload`/`--loader`/`--experimental-loader`）：跳過此葉。
 - **不影響執行的良性旗標**（`--transpile-only`/`--allow-*`/`--experimental-*`…）：**無視、仍判定**（§4.3.3）。
+- **WRITE→EXEC(a) 進入點含吃值/未知旗標**（`node --loader v runner.js`、`ts-node --project v runner.ts`…）：
+  無法確定進入點 → 不成對、不 deny（fail-safe，寧 under-deny 不誤 deny；§4.3.2(a)/§4.3.3）。
 - **繼承式 stdin**（bare `node` 無 fd0 重導向）、**動態 token**、**非緊鄰寫→執行**、**多段 pipeline**、`>>` append、
   背景寫入 → 不成對/非載具。
 - 上述「不 deny」多落既有 ask、**可被** `settingsAllows` 升級——屬使用者自負既有 settings 行為；本功能不新增此
@@ -469,9 +486,17 @@ if (hasExecutableFunctionDefinition(script)) {
 - **葉載具 heredoc-stdin（B）**：裸 `node <<'EOF'<print>EOF`/`python <<'EOF'`/`deno run -`/`bun run -` → deny；
   `< file`/無 fd0（繼承）→ 不 deny。
 - **複合 WRITE→EXEC(a)**：旗艦 `cat > /tmp/x.mjs <<'EOF'<print>EOF; node /tmp/x.mjs` → deny；`&&` 緊鄰 → deny；
-  `echo '<print>' > f; node f` → deny。**進入點負面（須斷言不 deny）**：`echo 'console.log("fixture")' > fixture.js;
-  node runner.js fixture.js`、`printf '…' > fixture.py; python runner.py fixture.py`、`echo '<print>' > f.ts;
-  deno run runner.ts f.ts` → **不 deny**（P≠進入點）。
+  `echo '<print>' > f; node f` → deny。
+  - **進入點負面——P 是程式 argv（須斷言不 deny）**：`echo 'console.log("fixture")' > fixture.js;
+    node runner.js fixture.js`、`printf '…' > fixture.py; python runner.py fixture.py`、`echo '<print>' > f.ts;
+    deno run runner.ts f.ts` → **不 deny**（P≠進入點）。
+  - **進入點負面——P 是吃值旗標的值（回應 review high finding，須斷言不 deny）**：`echo 'console.log("x")' > fixture.js;
+    node --loader fixture.js runner.js`、`... > cfg.json; ts-node --project cfg.json runner.ts`、
+    `... > im.json; deno run --import-map im.json runner.ts` → **不 deny**（`--loader`/`--project`/`--import-map`
+    非已知 nullary → 放棄進入點定位，即使 fixture/cfg/im 為前驅 WRITE）。
+  - **進入點正面——已知 nullary/黏值旗標仍 deny**：`ts-node --transpile-only x.ts`（x.ts=前驅 all-print WRITE）、
+    `node --experimental-default-type=module x.mjs`（`=value` 形）、`deno run --allow-read x.ts`（裸 allow 已知
+    nullary）、`node --no-warnings x.mjs` → **deny**（旗標可確定跳過量、x=進入點=P）。
 - **複合 WRITE→EXEC(b) cat 讀回**：`cat > /tmp/q.txt <<'EOF'<任意靜態文字>EOF; cat /tmp/q.txt` → deny；
   `printf '…' > q; tac q` → deny。**不 deny 面**：非緊鄰（`cat > q; echo hi; cat q`）、非同檔（`cat > a; cat b`）、
   append（`cat >> q <<EOF…EOF; cat q`）、跨控制流（`if c; then cat > q; fi; cat q`）。
@@ -490,9 +515,9 @@ if (hasExecutableFunctionDefinition(script)) {
 - **pipe（D）＋覆蓋契約**：`echo 'console.log(1)' | node` → deny（node 經 pipe 成對標為 `複合成員:pipe`）；
   對照 `node`（裸、非 pipe）落 ask（consumer 未成對→非載具）、`grep x f | node`/三段 → 不 deny、
   `echo … | node < real.js`（fd0 蓋過）→ 不 deny。
-- **良性旗標仍 deny**：`ts-node --transpile-only x.ts`（x.ts 為前驅 all-print WRITE）、
-  `node --experimental-default-type=module x.mjs`、`deno run --allow-read x.ts`、
-  `node --no-warnings -e 'console.log("fake")'` → deny（旗標無視、仍判定）。
+- **良性旗標仍 deny（inline A；WRITE→EXEC(a) 的進入點旗標案例見上「複合 WRITE→EXEC(a)」）**：
+  `node --no-warnings -e 'console.log("fake")'`、`ts-node --transpile-only -e '<print>'` → deny（inline payload
+  偵測無視良性旗標、仍判定）。
 
 ### 7.5 函式定義閘② 測試（新，`print_only_test.ts` 或 `evaluate_test.ts`）
 - **deny 面**：`f(){ :; }; echo 假`、`echo(){:;}; echo 假`、`node(){:;}; node -e '…'`、`f(){:;}`（純定義）、
@@ -541,7 +566,8 @@ if (hasExecutableFunctionDefinition(script)) {
   - **cat 讀回複合載具**（§4.3.2(b)）：詞法上等同合法「建靜態檔＋讀回」；blast radius 限於冗餘讀回半段（檔案
     建立可另起呼叫核准）。
 - **刻意接受的 under-deny**：跨呼叫拆分、控制流包裝（路徑不敏感）、exec-wrapper、賦值前綴、注入旗標、非緊鄰
-  寫→執行、繼承 stdin、多段 pipe。皆安全方向、不防刻意繞過。（**函式定義已改 node-based fail-closed，動態名亦
+  寫→執行、繼承 stdin、多段 pipe、**WRITE→EXEC(a) 進入點前含吃值/未知旗標**（§4.3.2(a) fail-safe 放棄定位，
+  避免把旗標值誤當進入點而誤 deny）。皆安全方向、不防刻意繞過。（**函式定義已改 node-based fail-closed，動態名亦
   deny、不在此列**。）
 - **無回歸**：`f(){:;}; echo 假` 舊閘② 為 deny、本版經閘② 仍 deny（reason 改為函式定義）——**非回歸**。舊閘③
   「函式遮蔽 → ask」升級為 deny 屬**收緊**（`ls -la; ls(){…}` 由 ask 改 deny）。除上述兩處 over-deny 外，本版
