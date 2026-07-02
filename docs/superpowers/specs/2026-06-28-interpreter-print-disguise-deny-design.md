@@ -155,6 +155,12 @@ main.ts → evaluate(command, root, initialCwd, rules, home, trustedReadRoots)
   閘②（函式）之後**——`f(){:;}` 先被閘② deny；no-op allow 僅在「無函式定義且無葉指令」（如空指令）時成立。
   閘① sleep（`some(name==="sleep")`）對 0 invocation 為 false、無害，位置在前不影響。
 - 三閘皆在 `classify` 前返回 → 天生硬性、不經中央前置、不經 `settingsAllows`。`Bash(node *)`/`Bash(echo *)` 無法解除。
+- **pre-execution atomicity contract（回應 review high finding）**：本工具是 `PreToolUse` hook——**在整條 Bash
+  指令執行之前**對**整個指令**回單一 decision。`deny` 使 Claude Code **完全不執行該指令**（**沒有任何 leaf 會跑**，
+  Claude Code 不會「跑一半」）。故 WRITE→EXEC / cat 讀回被 deny 時，**WRITE 那一步也不會執行、無任何檔案建立/
+  截斷副作用、無需 rollback**（本工具全程純詞法、不碰檔案系統，見「不改寫入…」不變量）。**本 spec 的偵測邏輯
+  只用於 PreToolUse 決策、不得挪用到任何「執行期 / 逐 leaf」包裝**（那才會有 partial-execution 問題）；此為明訂契約。
+  對應 e2e 驗證見 §7.7（餵被 deny 的 WRITE→EXEC/讀回指令、斷言預先建立的檔案不變）。
 
 ## 4. 詳細設計
 
@@ -438,6 +444,13 @@ if (hasAliasRedefinition(invocations)) {
   - `cat > deploy.sh <<'EOF'\ndeploy(){ … }\nEOF`、`cat > x.sh <<EOF\nf(){ … }\nEOF`、`echo 'f(){ echo hi; }'`
     → **不 deny**。
   - 對照真執行：`f(){ echo hi; }; f`、`f(){:;}`、`cat <<EOF\n$(g(){:;}; g)\nEOF` → 有 `Function` 節點 → **deny**。
+- **未引號 heredoc 內 `$()` 的節點形狀（釘死，回應 review medium finding；已實測）**：**未引號** heredoc（`<<EOF`）
+  body 若含命令替換 `$(…)`，unbash 把 body 表示為**結構化 `Word`**、其 `CommandExpansion.script` 為**完整解析的
+  內層 `Script`**（含其中的 `Function` 節點）；`walk.ts` 的 `emitCommand` 已列舉 `r.body` 內的 `$()`，
+  `hasExecutableFunctionDefinition`/`definedFunctionNames` 亦沿 `collectFnsInWord(r.body)` 下降之。**round 7 實測**：
+  `cat <<EOF\n$(g(){:;}; g)\nEOF` → `definedFunctionNames` 回 `{"g"}`（非空）→ node 偵測亦見 `Function` 節點 → **deny**
+  （**非** fail-open）。對照**引號** heredoc（`<<'EOF'`）body 為 `undefined`（展開被抑制）、純文字進 `content`——
+  無 `$()`、無 `Function` 節點 → 不觸發。此形狀差異即「執行 vs 資料」的分界，§7.5 有 parser-shape 測試。
 - **`definedFunctionNames` 僅供診斷/測試**：deny 理由文字若要點名函式，可用 `definedFunctionNames` 取靜態名
   （動態名取不到時理由文字泛稱「shell 函式」即可）；**deny 決策不依賴它**。
 - **對任何（可執行位置的）函式定義**（含未被呼叫、dead branch、`$()` 內、**動態名**）皆 deny。
@@ -620,6 +633,10 @@ bash **alias** 同樣能重定義 allowlisted 指令名（`shopt -s expand_alias
   dead branch `if false; then f(){:;}; fi; echo hi`（AST 有 `Function` 節點 → deny）、
   `echo "$(f(){:;}; f)"`（`$()` 內函式定義 → deny）、**動態名 `Function` 節點若可構造 → deny**（node-based
   fail-closed，不依賴靜態名還原）。
+- **parser-shape 測試——未引號 heredoc 內 `$()`（回應 review medium finding；已 round 7 實測）**：
+  `cat <<EOF\n$(f(){:;}; f)\nEOF` → **deny**（未引號 heredoc body 之 `$()` 解析為巢狀 `Script`、含 `Function`
+  節點；`definedFunctionNames` 實測回 `{"f"}`）。對照 `cat <<'EOF'\n$(f(){:;}; f)\nEOF`（引號 heredoc、展開被
+  抑制、body=`undefined`）→ **不 deny**（純文字資料、無 `Function` 節點）。此對驗證「執行 vs 資料」node 形狀分界。
 - **不 deny 面——「函式文字為資料」不誤觸（回應 review high finding，關鍵回歸；已實測 `definedFunctionNames` 為空集）**：
   - **寫含函式的 shell script**：`cat > deploy.sh <<'EOF'\ndeploy(){ … }\nEOF`（引號 heredoc）、
     `cat > x.sh <<EOF\nf(){ … }\nEOF`（未引號、無 `$()`）→ **不 deny**（heredoc 純文字非可執行函式定義；
@@ -653,6 +670,10 @@ bash **alias** 同樣能重定義 allowlisted 指令名（`shopt -s expand_alias
 - alias `alias grep=x; grep foo` → **deny**、reason `nameRedefinitionDenyReason("alias")`；`shopt -s globstar; echo hi`
   的 shopt 不觸發 alias 閘（惟 `echo hi` 若整鏈 print 另議）。
 - 真實運算 `node -e 'console.log(1+1)'` → **非 deny**。
+- **pre-execution 無副作用（回應 review high finding，§3 atomicity contract）**：預先建立 `/tmp/x.mjs`（已知內容）
+  與 `/tmp/q.txt`，餵被 deny 的 `cat > /tmp/x.mjs <<EOF…EOF; node /tmp/x.mjs`、`cat > /tmp/q.txt <<EOF…EOF;
+  cat /tmp/q.txt` 之 hook JSON → 期望 **deny**、`exit 0`，且**兩檔內容與 mtime 均不變**（hook 純決策、不執行任何
+  leaf、WRITE 不發生）。
 
 ### 7.8 全綠
 `deno task check && deno task lint && deno task test`。
