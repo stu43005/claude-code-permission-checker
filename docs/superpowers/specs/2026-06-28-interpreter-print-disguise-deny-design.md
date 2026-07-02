@@ -345,7 +345,19 @@ if (hit) {
 ## 5. 邊界（皆已記錄、安全方向 under-deny；不防刻意繞過）
 
 - **跨 Bash 呼叫拆分**（呼叫1寫檔、呼叫2執行）：per-call 無狀態 → 不偵測。**shipped guarantee 僅及單一呼叫
-  鏈內**。本工具所有 deny 共有的根本邊界，不引入持久 taint（§2.2）。
+  鏈內**。本工具**所有** deny 閘（sleep、遞迴根、print-only）**共有的根本邊界**，且為**任務鎖定不變量**
+  （§2.2）：每次 hook 呼叫都是「first-run／無先前狀態」，**刻意不引入持久 taint／歷史**。
+  - **hook 從不自主放行跨呼叫偽裝**：呼叫2 `node /tmp/x.mjs`（裸 script 執行、當次呼叫無配對 WRITE）之
+    **預設判定為 ask**——`node`/`python` **不在 allowlist**（已查證 `rules/allowlist.ts` 無 `nodeRule`），classify
+    default-deny → ask。唯有使用者**明確**設 `Bash(node *)` 時才升級為 allow；而 `Bash(node *)` 語意即
+    「授權 node 執行任何腳本」，是使用者**自負且與 print 偽裝正交**的 settings 決策，本 hook 忠實沿用
+    （即既有 `(hook=ask, settings=allow) → allow` 設計）。**本功能不新增任何自主 allow 路徑**。
+  - **為何不封此路（三修法皆違反鎖定不變量，故明確非目標）**：(1) 跨呼叫持久 taint → 直接違反鎖定的
+    per-call 無狀態、且引入狀態管理與 race；(2) 讀取 `/tmp/x.mjs` 檔案內容再判 → 違反本工具「**純詞法、
+    永不碰檔案系統**」不變量（`scope.ts` 全程不 stat/不讀檔），且有 TOCTOU（hook 後、執行前檔案可被換掉）、
+    並會誤 deny 合法的全 print 檔；(3) 對「近期寫過的檔」抑制 `Bash(node *)` 升級 → 仍需跨呼叫狀態，同 (1)。
+  - **安全方向**：無 `Bash(node *)` 時呼叫2 恆 ask（人工把關）；此邊界與工具其餘 deny 一致，非本功能獨有，
+    亦非新引入之退化。
 - **定義函式 → 整個閘②′ 跳過**：腳本含 `f(){…}` 即不偵測（非目標常見形態）。這是本版**唯一的 accepted
   regression**（弱化一條已上線的 shell 硬 deny，如 `f(){:;}; echo 假`）——完整回歸事實與接受理由見 §1.2，
   文件同步見 §6、§8。方向安全：只把 deny 降為 ask，絕不新增 allow。
@@ -444,9 +456,15 @@ if (hit) {
   fd1=sink、x 截空）、`if cond; then cat > x; fi; node x`（跨控制流邊界）→ 不 deny。
 
 ### 7.6 不可升級 e2e（`main_test.ts`）
-- settings 含 `Bash(node *)`/`Bash(python *)`/`Bash(echo *)`：載具 A/B/C(a)/C(b)/D 命中仍 **deny**；對照
-  `node -e 'JSON.stringify(x)'` → allow（真實運算可升級）。跨呼叫拆分 e2e：呼叫1 `cat > /tmp/x.mjs <<EOF…EOF`
-  → ask；呼叫2 `node /tmp/x.mjs`＋`Bash(node *)` → allow（已記錄之單呼叫邊界）。
+- settings 含 `Bash(node *)`/`Bash(python *)`/`Bash(echo *)`：載具 A/B/C(a)/C(b)/D 命中（**單一呼叫內**）仍
+  **deny**；對照 `node -e 'JSON.stringify(x)'` → allow（真實運算可升級）。
+- **跨呼叫拆分 / migration 邊界 e2e（回應 review §5）**——驗證 hook **從不自主放行**跨呼叫偽裝：
+  - split create/execute：呼叫1 `cat > /tmp/x.mjs <<EOF…EOF`（全 print WRITE）→ **ask**；呼叫2 `node /tmp/x.mjs`
+    **無** `Bash(node *)`（first-run、無先前狀態）→ **ask**（node 不在 allowlist，default-deny）。
+  - retry-after-ask：呼叫2 重試仍 → **ask**（無持久 taint 不代表變 allow；預設仍 ask）。
+  - 使用者自負升級：呼叫2 `node /tmp/x.mjs`＋`Bash(node *)` → allow（使用者明確授權 node 執行任何腳本；
+    已記錄之單呼叫邊界，非 hook 漏洞）。對照：**同一 payload 於單一呼叫內** `cat > /tmp/x.mjs <<EOF…EOF; node /tmp/x.mjs`
+    ＋`Bash(node *)` → 仍 **deny**（不可升級），凸顯 deny 保證邊界正落在「單一呼叫」。
 
 ### 7.7 Operational verification（build 後）
 - 餵兩步偽裝 JSON（`cat > /tmp/research_query.txt << 'EOF'\n<多行靜態文字>\nEOF\ncat /tmp/research_query.txt`）
@@ -462,6 +480,11 @@ if (hit) {
 
 - **詞法器 fragility**：手寫 tokenizer 對冷僻字串逸脫/多行構造可能誤判——但 fail-safe，誤判方向恆為「不 deny」。
 - **效能**：閘②′ 對每次 Bash 呼叫多一趟 source-order AST 走訪＋（命中時）極小詞法；payload 短，O(指令長度)。
+- **跨呼叫拆分 × `settingsAllows` 是最鋒利的殘留邊界（意識接受，回應 review）**：把 WRITE 與 EXEC 拆到兩次
+  hook 呼叫時，deny 保證消失；若使用者另設 `Bash(node *)`，呼叫2 執行該檔會被升級為 allow。此非本功能引入的
+  漏洞，而是**兩條鎖定不變量的交集結果**：(1) per-call 無狀態（全工具所有 deny 共有、任務鎖定）；(2) 本 hook
+  純詞法、永不讀檔內容。封閉此路需持久 taint 或讀檔（均違反上述不變量、見 §5），故**明確不做**。緩解僅靠：
+  hook 自主預設 ask（不主動 allow）、單一呼叫內硬 deny 不可升級、以及使用者對 `Bash(node *)` 廣域授權的自負。
 - **刻意接受的 under-deny**（§5）：跨呼叫拆分、定義函式、控制流包裝（路徑不敏感）、exec-wrapper、賦值前綴、
   注入旗標、非緊鄰寫→執行、繼承 stdin、多段 pipe。皆安全方向、不防刻意繞過，符合「只擋 agent 常見 print-only
   假驗證」的威脅模型。
