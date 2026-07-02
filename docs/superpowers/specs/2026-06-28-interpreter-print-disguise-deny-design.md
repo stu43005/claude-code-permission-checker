@@ -518,8 +518,13 @@ bash **alias** 同樣能重定義 allowlisted 指令名（`shopt -s expand_alias
   - **兩步偽裝**（`cat > x <<EOF…EOF; cat x`）由「寫入重導向 ask」改**硬 deny**（cat 讀回複合載具）——註記為刻意
     接受的 over-deny narrow exception（詞法上與合法建檔＋讀回不可分、blast radius 限於冗餘讀回半段）。
   - **混載具全 print 鏈**（`echo a; node -e print`）改**硬 deny**。
-  - **`ls; echo 假` / `ls; node -e print` 這類「整鏈含非載具葉」的洗白繞道維持不 deny**（(a) 失敗，落既有判定；
-    使用者定案的整鏈語意取捨——寧洗白也不採 per-leaf 硬 deny 以免誤殺 `ls; echo "done"` 狀態訊息）。
+  - **`ls; echo 假` / `ls; node -e print` 這類「整鏈含非載具葉」的洗白繞道維持不 deny**（(a) 失敗，落既有判定）。
+    這是 **decision 2 明確鎖定的整鏈語意取捨**——寧讓「加一個無關真實/no-op 葉」洗白（降 ask、甚至可被 settings
+    升級），也**不**採 per-leaf 硬 deny（那會誤殺極常見的 `ls; echo "done"`、`make && echo ok` 狀態訊息、違反
+    「絕不誤 deny」）。**審查標記（重要）**：design-soundness reviewer 於 round 4（medium）、round 11（high/no-ship）
+    **兩度**要求對此加硬 deny（per-leaf 或 dataflow 模型）；使用者於 round 11 **明確覆歸、維持全整鏈洗白**——因
+    per-leaf 會大量誤 deny、dataflow 判定不可判定（`ls; echo "done"` 同樣無 dataflow → 仍誤殺）。此為**使用者
+    定案接受的 under-deny**，非未審之疏漏。
   - **名稱重定義 → 硬 deny**（新）：明載其取代舊「函式遮蔽 → ask」、對任何函式定義（含 dead branch/`$()` 內）
     及 alias 類（`alias`/`unalias`/`shopt -s expand_aliases`）皆 deny，屬刻意接受的 over-deny（破壞 name-based
     模型的危險結構）。
@@ -653,6 +658,10 @@ bash **alias** 同樣能重定義 allowlisted 指令名（`shopt -s expand_alias
   寫→執行、繼承 stdin、多段 pipe、**WRITE→EXEC(a) 進入點前含吃值/未知旗標**（§4.3.2(a) fail-safe 放棄定位，
   避免把旗標值誤當進入點而誤 deny）。皆安全方向、不防刻意繞過。（**函式定義已改 node-based fail-closed，動態名亦
   deny、不在此列**。）
+- **整鏈洗白 under-deny（使用者明確覆歸 review，§6）**：`ls; node -e '假'`、`ls; echo 假`、`pwd; echo 假` 加一個
+  非載具葉即不 deny（落既有 ask/settings）。design-soundness reviewer 兩度（round 4/11）要求硬 deny；使用者定案
+  維持整鏈語意（per-leaf 會誤殺 `ls; echo "done"`、dataflow 不可判定）。屬 decision 2 鎖定之刻意 under-deny、
+  非疏漏；本 hook 回 ask 時仍不放行，安全由 Claude Code 端與使用者核准把關。
 - **無回歸**：`f(){:;}; echo 假` 舊閘② 為 deny、本版經閘② 仍 deny（reason 改為函式定義）——**非回歸**。舊閘③
   「函式遮蔽 → ask」升級為 deny 屬**收緊**（`ls -la; ls(){…}` 由 ask 改 deny）。除上述兩處 over-deny 外，本版
   只擴充 deny、不放寬。
