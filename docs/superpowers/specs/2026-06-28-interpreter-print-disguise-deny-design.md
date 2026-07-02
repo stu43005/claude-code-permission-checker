@@ -91,7 +91,9 @@ cat /tmp/q.txt
    **不**把 heredoc/here-string 的**純文字 body**（引號 heredoc body 為 `undefined`；未引號純文字進 `content`）或
    **字串引數文字**當函式定義（已實測：`cat > x.sh <<'EOF'\nf(){…}\nEOF`、`echo 'f(){…}'` → 空集）。動態名
    （`staticValue` 為 null）忽略。walk 的 `case "Function"` 不下降 body，故函式定義**不產生 execution 葉**
-   （正確——函式 body 未執行）。→ 函式偵測靠此 helper，**walk 攤平不需改**。
+   （正確——函式 body 未執行）。**閘② 的 deny 判定改用新的 node-based 姊妹 helper `hasExecutableFunctionDefinition`
+   （§4.6，同走訪、遇任一 `Function` 節點即 true、不依賴靜態名 → fail-closed）**；`definedFunctionNames` 保留供
+   理由文字/測試診斷。兩者皆為唯讀 helper，**walk 攤平不需改**。
 5. hook `permissionDecision: "deny"` 阻止呼叫並回饋 `permissionDecisionReason`，優先序 `deny > ask > allow`；
    deny 理由須含①被禁止的事②為何③替代。
 
@@ -99,8 +101,9 @@ cat /tmp/q.txt
 
 ### 2.1 目標
 
-- **閘②（新，deny）**：`evaluate` 於閘① sleep 之後、閘③ print 之前，`definedFunctionNames(script).size > 0` →
-  deny（`functionDefDenyReason()`）。取代舊閘③「函式遮蔽 → ask」。使用**既有 `definedFunctionNames`**，不改 walk。
+- **閘②（新，deny）**：`evaluate` 於閘① sleep 之後、閘③ print 之前，`hasExecutableFunctionDefinition(script)` →
+  deny（`functionDefDenyReason()`）。取代舊閘③「函式遮蔽 → ask」。判定用**新 node-based、fail-closed helper**
+  （`walk.ts`，與 `definedFunctionNames` 同類唯讀、不改攤平/結構）；`definedFunctionNames` 僅供理由文字/測試診斷。
 - **閘③（合併升級，deny）**：把既有 `isAllPrintOnly` 升級為統一「print 載具」框架，跨 shell/直譯器；命中即整鏈
   deny、`classify` 前短路、不可升級。因函式已由閘② deny，print 閘只跑在無函式腳本 → 其 name-based 判定恆可信、
   **不含任何函式特例**。
@@ -120,9 +123,11 @@ cat /tmp/q.txt
 - **不**處理直譯器以外語言（`bash -c`/`perl -e`/`ruby -e`/`php -r`）。
 - **不**改寫入重導向/賦值前綴/中央前置任何既有判定。除 §1.2(3)(5) 記錄的函式-deny 與 cat 讀回兩處刻意 over-deny
   外，本功能**只擴充 deny、不放寬**。
-- **不**改 `walk.ts` 攤平職責、不改 `CommandInvocation` 結構（函式偵測用既有 `definedFunctionNames`）。
-- **動態函式名**（`staticValue` 為 null，極罕見）→ `definedFunctionNames` 收不到 → 該腳本不被閘② deny（safe
-  under-deny）。
+- **不**改 `walk.ts` 攤平職責、不改 `CommandInvocation` 結構（函式偵測加**唯讀** helper
+  `hasExecutableFunctionDefinition`，與既有 `definedFunctionNames` 同類、不動攤平與結構）。
+- **動態名函式定義不再是破口**：改 node-based fail-closed 偵測後，即使函式名無法靜態還原，只要有可執行位置的
+  `Function` 節點即 deny（§4.6）。故閘② 對函式定義**無 under-deny**；唯一不觸發者是「函式文字為資料」（非 AST
+  `Function` 節點，本就不該 deny）。
 
 ## 3. 架構與資料流
 
@@ -132,7 +137,7 @@ cat /tmp/q.txt
 main.ts → evaluate(command, root, initialCwd, rules, home, trustedReadRoots)
   └─ parse → script；walk(script) → invocations[]
        ├─ 閘①(deny) ：some(name==="sleep") → deny                                   （不變）
-       ├─ 閘②(deny) ：definedFunctionNames(script).size > 0 → deny                   （★新增，取代舊閘③ ask）
+       ├─ 閘②(deny) ：hasExecutableFunctionDefinition(script) → deny                 （★新增，node-based fail-closed，取代舊閘③ ask）
        ├─ invocations.length === 0 → allow（no-op）                                 （★移到閘②之後）
        ├─ 閘③(deny) ：printDisguiseDeny(script, initialCwd) → deny                   （★合併升級）
        └─ combine(invocations.map(classify))                                        （不變）
@@ -355,28 +360,37 @@ if (hit) return { verdict: "deny", reason: printDisguiseDenyReason(hit.kind) };
 ### 4.6 閘②（新）：函式定義 → deny
 
 ```ts
-// 閘②（deny）：任何函式定義——classify 前返回、不可升級
-if (definedFunctionNames(script).size > 0) {
+// 閘②（deny）：任何可執行位置的函式定義——node-based、fail-closed、classify 前返回、不可升級
+if (hasExecutableFunctionDefinition(script)) {
   return { verdict: "deny", reason: functionDefDenyReason() };
 }
 ```
 
-- 使用**既有** `definedFunctionNames(script)`（`walk.ts`）——遞迴掃 AST 收集**可執行位置**的靜態函式名。
-  `size > 0` 即有函式定義 → deny。**不改 walk**。
-- **只收集「可執行位置」的函式定義（回應 review high finding；已實測驗證）**：`definedFunctionNames` 只從
-  **真正的 `Function` AST 節點**與 **`$()`/`<()` 命令替換內層腳本**（會實際執行）收集；**不**把 heredoc/here-string
-  的**純文字 body** 或**字串引數**當函式定義。故**寫含函式的 shell script 不被 deny**——實測：
-  - `cat > deploy.sh <<'EOF'\ndeploy(){ … }\nEOF`（引號 heredoc 純文字）→ `{}` → **不 deny**。
-  - `cat > x.sh <<EOF\nf(){ … }\nEOF`（未引號、無 `$()` 純文字）→ `{}` → **不 deny**。
-  - `echo 'f(){ echo hi; }'`（字串引數）→ `{}` → **不 deny**。
-  - 對照真執行：`f(){ echo hi; }; f`、`f(){:;}`、`cat <<EOF\n$(g(){:;}; g)\nEOF`（`$()` 內定義並執行）→ 收集 →
-    **deny**。此即 reviewer 建議的「executable-context detector，忽略 heredoc/here-string 資料位置」，既有 helper
-    已滿足，無需新增 detector。
+- **判定用 node-based、fail-closed 的新 helper `hasExecutableFunctionDefinition(script)`（回應 review high
+  finding）**，**非** name-based 的 `definedFunctionNames`：只要 AST 中存在**任一可執行位置的 `Function` 節點**
+  即 `true`，**不依賴函式名是否可靜態還原**。這是安全關鍵——閘③ 的 name-based 判定「可信」的前提是「腳本無函式
+  定義」；若改用 `definedFunctionNames(...).size > 0`（name-based）判定，一個**名稱無法靜態還原的 `Function`
+  節點**會被漏收（size 可能為 0）→ fail-**open**、腳本帶著可重定義指令名的函式進入 print/classify pipeline，重新
+  打開 trust-boundary 破口。故 deny 判定改用 node 存在性、fail-**closed**。
+- **`hasExecutableFunctionDefinition(script)`（新，`walk.ts` 唯讀 helper，與 `definedFunctionNames` 同類、不改
+  攤平/`CommandInvocation` 結構）**：沿 `definedFunctionNames` 的相同 AST 走訪（含循序序列、AndOr/Pipeline、
+  subshell/BraceGroup、控制流 clause＋body、Statement、Coproc，以及 word 內 `$()`/`<()` 命令替換的內層腳本），
+  遇到**第一個 `Function` 節點即回 `true`**（忽略其 name 能否 `staticValue`）；否則 `false`。
+- **只涵蓋「可執行位置」（回應 review；已實測驗證，node 偵測與 name 偵測在此一致）**：`Function` 節點只出現在
+  真正的函式定義與 `$()`/`<()` 內層腳本；heredoc/here-string 的**純文字 body**（引號 heredoc body 為 `undefined`、
+  未引號純文字進 `content`，皆非 AST 命令）與**字串引數**內的函式語法**不是 `Function` 節點** → 不觸發。故
+  **寫含函式的 shell script 不被 deny**——實測（`definedFunctionNames` 為空集，node 偵測亦無 `Function` 節點）：
+  - `cat > deploy.sh <<'EOF'\ndeploy(){ … }\nEOF`、`cat > x.sh <<EOF\nf(){ … }\nEOF`、`echo 'f(){ echo hi; }'`
+    → **不 deny**。
+  - 對照真執行：`f(){ echo hi; }; f`、`f(){:;}`、`cat <<EOF\n$(g(){:;}; g)\nEOF` → 有 `Function` 節點 → **deny**。
+- **`definedFunctionNames` 僅供診斷/測試**：deny 理由文字若要點名函式，可用 `definedFunctionNames` 取靜態名
+  （動態名取不到時理由文字泛稱「shell 函式」即可）；**deny 決策不依賴它**。
 - **取代舊閘③「函式遮蔽 → ask」**：舊閘③ 僅在「被呼叫名恰被遮蔽」時 ask；新閘② 對**任何（可執行位置的）函式
-  定義**（含未被呼叫、dead branch、`$()` 內）皆 deny，較 ask 強。
-- **接受的 over-deny（§1.2(3)）**：合法 `helper(){…}; helper`、dead branch 的函式定義（`definedFunctionNames`
-  over-collect）亦 deny。使用者定案接受（agent 不該在 Bash 呼叫內定義函式；函式定義破壞 name-based 模型）。
-- **safe under-deny 邊界**：動態函式名（`staticValue` 為 null）收不到 → 該腳本不被閘② deny，落閘③/classify。
+  定義**（含未被呼叫、dead branch、`$()` 內、**動態名**）皆 deny，較 ask 強。
+- **接受的 over-deny（§1.2(3)）**：合法 `helper(){…}; helper`、dead branch 的函式定義亦 deny。使用者定案接受
+  （agent 不該在 Bash 呼叫內定義函式；函式定義破壞 name-based 模型）。
+- **fail-closed，無函式 under-deny**：改 node-based 後，**動態名函式定義亦被 deny**（不再是 under-deny 破口）；
+  唯一不觸發者是「函式文字為資料」（非 `Function` 節點，本就不該 deny）。
 - `functionDefDenyReason()`：「這個指令定義了 shell 函式（`name(){…}`）。函式可重定義任何指令名（如
   `grep(){ rm -rf; }`）、使本工具的指令名安全分析完全失真，屬危險結構；在單次 Bash 呼叫內定義函式無正當常見
   理由。若需複用邏輯，請直接展開為具體指令、或拆成多次呼叫。」
@@ -390,8 +404,9 @@ if (definedFunctionNames(script).size > 0) {
     print 偽裝正交。**本功能不新增自主 allow 路徑**。
   - **為何不封（三修法皆違反鎖定不變量）**：(1) 跨呼叫持久 taint 違反 per-call 無狀態；(2) 讀檔內容違反「純詞法、
     永不碰檔案系統」不變量（且 TOCTOU、誤 deny 合法全 print 檔）；(3) 對「近期寫過的檔」抑制升級仍需跨呼叫狀態。
-- **函式定義 → deny**（閘②，§4.6）：任何函式定義即 deny（含 dead branch/`$()` 內；接受 over-deny）。動態函式名 →
-  收不到 → under-deny（安全）。
+- **函式定義 → deny**（閘②，§4.6）：任何可執行位置的 `Function` 節點即 deny（含 dead branch/`$()` 內、**動態名**；
+  node-based fail-closed；接受 over-deny）。唯一不觸發者是「函式文字為資料」（heredoc 純文字/字串引數，非 `Function`
+  節點 → 本就不該 deny，故 shell-script 撰寫不受影響）。
 - **控制流路徑不敏感**：clause/guard 與各分支納入同一葉集、覆蓋 (a) 施加於完整集；含 guard/多分支者通常 (a)
   失敗 → 不 deny（§4.4）。
 - **exec-wrapper**（`timeout`/`command`/`env`/`nice`/`nohup`…）：葉名非載具 →（若鏈中尚有非載具葉）覆蓋 (a)
@@ -482,14 +497,15 @@ if (definedFunctionNames(script).size > 0) {
 ### 7.5 函式定義閘② 測試（新，`print_only_test.ts` 或 `evaluate_test.ts`）
 - **deny 面**：`f(){ :; }; echo 假`、`echo(){:;}; echo 假`、`node(){:;}; node -e '…'`、`f(){:;}`（純定義）、
   `g(){ ls; }; g`（合法複用亦 deny，accepted over-deny）、`ls -la; ls(){…}`（原閘③ 為 ask，改 deny）、
-  dead branch `if false; then f(){:;}; fi; echo hi`（`definedFunctionNames` over-collect → deny）、
-  `echo "$(f(){:;}; f)"`（`$()` 內函式定義 → deny）。
+  dead branch `if false; then f(){:;}; fi; echo hi`（AST 有 `Function` 節點 → deny）、
+  `echo "$(f(){:;}; f)"`（`$()` 內函式定義 → deny）、**動態名 `Function` 節點若可構造 → deny**（node-based
+  fail-closed，不依賴靜態名還原）。
 - **不 deny 面——「函式文字為資料」不誤觸（回應 review high finding，關鍵回歸；已實測 `definedFunctionNames` 為空集）**：
   - **寫含函式的 shell script**：`cat > deploy.sh <<'EOF'\ndeploy(){ … }\nEOF`（引號 heredoc）、
     `cat > x.sh <<EOF\nf(){ … }\nEOF`（未引號、無 `$()`）→ **不 deny**（heredoc 純文字非可執行函式定義；
     此為極常見合法工作流，**必須**不 deny）。註：此二例為「寫檔」——落中央前置**寫入重導向 ask**（非閘②/③ deny）。
   - **字串引數**：`echo 'f(){ echo hi; }'`、`printf '%s\n' 'g(){:;}'` → **不 deny**（字串資料非函式定義）。
-  - 動態函式名情境（若可構造）→ under-deny。
+  - 注意：這些是**資料**（無 `Function` 節點）故不 deny；與「動態名 `Function` 節點 → deny」不同（後者有節點）。
 - **理由**：deny reason 為 `functionDefDenyReason()`。
 
 ### 7.6 不可升級 e2e（`main_test.ts`）
@@ -513,7 +529,7 @@ if (definedFunctionNames(script).size > 0) {
 
 - **詞法器 fragility**：手寫 tokenizer 對冷僻字串逸脫/多行構造可能誤判——fail-safe，誤判方向恆為「不 deny」。
 - **效能**：閘③ 對每次 Bash 呼叫多一趟 source-order 走訪＋（命中時）極小詞法；payload 短，O(指令長度)。閘② 為
-  一次 `definedFunctionNames` 掃描，O(AST)。
+  一次 `hasExecutableFunctionDefinition` 掃描（遇首個 `Function` 節點即短路），O(AST)。
 - **跨呼叫拆分 × `settingsAllows`（意識接受）**：WRITE 與 EXEC 拆到兩次呼叫時 deny 消失；配 `Bash(node *)` 呼叫2
   升級 allow。此為兩條鎖定不變量（per-call 無狀態、純詞法不讀檔）的交集、非本功能引入的漏洞；封閉需 taint/讀檔
   （違反不變量）故不做。緩解：hook 自主預設 ask、單呼叫內硬 deny 不可升級、使用者對 `Bash(node *)` 自負。
@@ -525,7 +541,8 @@ if (definedFunctionNames(script).size > 0) {
   - **cat 讀回複合載具**（§4.3.2(b)）：詞法上等同合法「建靜態檔＋讀回」；blast radius 限於冗餘讀回半段（檔案
     建立可另起呼叫核准）。
 - **刻意接受的 under-deny**：跨呼叫拆分、控制流包裝（路徑不敏感）、exec-wrapper、賦值前綴、注入旗標、非緊鄰
-  寫→執行、繼承 stdin、多段 pipe、動態函式名。皆安全方向、不防刻意繞過。
+  寫→執行、繼承 stdin、多段 pipe。皆安全方向、不防刻意繞過。（**函式定義已改 node-based fail-closed，動態名亦
+  deny、不在此列**。）
 - **無回歸**：`f(){:;}; echo 假` 舊閘② 為 deny、本版經閘② 仍 deny（reason 改為函式定義）——**非回歸**。舊閘③
   「函式遮蔽 → ask」升級為 deny 屬**收緊**（`ls -la; ls(){…}` 由 ask 改 deny）。除上述兩處 over-deny 外，本版
   只擴充 deny、不放寬。
