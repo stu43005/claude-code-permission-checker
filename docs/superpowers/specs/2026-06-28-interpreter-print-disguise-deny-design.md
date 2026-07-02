@@ -226,8 +226,9 @@ re-export），因其同被葉載具判定、WRITE→EXEC 的 WRITE 內容還原
 - **deno**：`deno eval <payload>` → inline；`deno run -`（裸 dash，`-` 是 stdin 標記）→ heredoc-stdin；
   `deno run <file>` → 下述 WRITE→EXEC 的 EXEC。
 - **bun**：`bun run <file>` → EXEC（同 `<file>` 執行）；裸 `bun` 配 heredoc/here-string → heredoc-stdin。
-  **`bun run -` 的 `-` 是否為 stdin 標記待實作前以 research subagent 查證 bun 版本行為**（若非 stdin 標記則不
-  觸發、屬 under-deny，安全）；§7.4 的 `bun run -` 測試須以查證結果為準、或改用裸 `bun <<'EOF'` 形式。
+  **確定決策：不特案 `bun run -`**（bun 的 `-` 是否為 stdin 標記未查證；不特案 = 保守 under-deny，安全）——
+  bun 的 stdin 偵測**只認裸 `bun <<'EOF'`／here-string 形式**。若日後確認 `bun run -` 為 stdin，可另加、方向只會
+  更嚴。（測試一律用裸 `bun <<'EOF'`，不用 `bun run -`。）
 - **node/python/ts-node**：裸直譯器配 heredoc/here-string → heredoc-stdin（無專屬 `run` 子指令）。
 
 #### 4.3.2 複合載具（跨葉 pattern）
@@ -447,12 +448,20 @@ bash **alias** 同樣能重定義 allowlisted 指令名（`shopt -s expand_alias
 同屬破壞 name-based 模型的機制。**使用者定案：一律 deny**。
 
 - **`hasAliasRedefinition(invocations)`（新，純函式、以 walk 攤平的 `invocations[]` 判定，如同 sleep 閘的
-  name-based 偵測）** → `true` 當任一葉指令：
-  - `inv.name === "alias"` 或 `inv.name === "unalias"`（定義/移除 alias），**或**
-  - `inv.name === "shopt"` 且其 argv 靜態值含 `-s`（set）與 `expand_aliases`（僅擋**啟用 alias 展開**的形式；
+  name-based 偵測）** → `true` 當任一葉指令，**先解 `builtin`/`command` 分派器包裝取「有效 alias-builtin 名＋其後
+  argv」**（見下），再判：
+  - 有效名 === `alias` 或 `unalias`（定義/移除 alias），**或**
+  - 有效名 === `shopt` 且其 argv 靜態值含 `-s`（set）與 `expand_aliases`（僅擋**啟用 alias 展開**的形式；
     `shopt -s globstar`、`shopt -u expand_aliases`（停用）、`shopt expand_aliases`（查詢）**不擋**）。
-- **位置無關**：alias/unalias/shopt 出現在控制流/`$()`/subshell 內皆被 walk 攤平進 `invocations[]` → 一體偵測
-  （與 sleep 閘同）。
+- **解 `builtin`/`command` 包裝（回應 review high finding；已驗證 `builtin alias`/`command alias` 確實建 alias）**：
+  若 `inv.name ∈ {builtin, command}`，取其**第一個非旗標靜態 argv token** 為「有效名」、其餘為有效 argv，再套上述
+  判定（可遞迴解多層，如 `command builtin alias`）。故 `builtin alias x=y`、`command alias x=y`、`builtin unalias a`、
+  `command shopt -s expand_aliases`、`builtin shopt -s expand_aliases` **皆 deny**。有效名/argv 為動態 → under-deny。
+  - **`command` 旗標**：`command -p alias …`（`-p` 用預設 PATH）等旗標略過後仍取到 `alias` → deny。
+- **位置無關**：alias/unalias/shopt（含 builtin/command 包裝）出現在控制流/`$()`/subshell 內皆被 walk 攤平進
+  `invocations[]` → 一體偵測（與 sleep 閘同）。
+- **仍 out-of-scope 的間接形式**：`eval 'alias grep=x'`（eval 巢狀直譯器，屬既有「巢狀直譯器 → ask、可升級」邊界）、
+  `source`/`.` 匯入含 alias 的檔——歸 §5 既有 command-resolution mutator out-of-scope，本閘不宣稱涵蓋。
 - **「alias 文字為資料」不觸發**：`cat > setup.sh <<'EOF'\nalias grep=x\nEOF`（heredoc 資料）、`echo 'alias grep=x'`
   → alias 文字非葉指令 invocation → **不 deny**（寫含 alias 的 script 安全，與函式資料一致）。
 - **動態指令名**（`inv.name === null`）→ 收不到 → under-deny（安全；與 sleep 閘同邊界）。
@@ -521,10 +530,11 @@ bash **alias** 同樣能重定義 allowlisted 指令名（`shopt -s expand_alias
   - **`ls; echo 假` / `ls; node -e print` 這類「整鏈含非載具葉」的洗白繞道維持不 deny**（(a) 失敗，落既有判定）。
     這是 **decision 2 明確鎖定的整鏈語意取捨**——寧讓「加一個無關真實/no-op 葉」洗白（降 ask、甚至可被 settings
     升級），也**不**採 per-leaf 硬 deny（那會誤殺極常見的 `ls; echo "done"`、`make && echo ok` 狀態訊息、違反
-    「絕不誤 deny」）。**審查標記（重要）**：design-soundness reviewer 於 round 4（medium）、round 11（high/no-ship）
-    **兩度**要求對此加硬 deny（per-leaf 或 dataflow 模型）；使用者於 round 11 **明確覆歸、維持全整鏈洗白**——因
-    per-leaf 會大量誤 deny、dataflow 判定不可判定（`ls; echo "done"` 同樣無 dataflow → 仍誤殺）。此為**使用者
-    定案接受的 under-deny**，非未審之疏漏。
+    「絕不誤 deny」）。**審查標記（重要，standing objection）**：design-soundness reviewer **持續多輪**（round 4
+    medium、round 11/12 high/no-ship）要求對此加硬 deny（per-leaf、dataflow、或「含 print 載具則禁 settings 升級」）；
+    使用者於 round 11 **明確覆歸、維持全整鏈洗白**（含「可被 settings 升級」亦知悉接受）——因 per-leaf 會大量誤 deny、
+    dataflow 判定不可判定（`ls; echo "done"` 同樣無 dataflow → 仍誤殺）。此為**使用者定案接受的 under-deny**、
+    工具最終權威為使用者；reviewer 之標記為 advisory，非疏漏。
   - **名稱重定義 → 硬 deny**（新）：明載其取代舊「函式遮蔽 → ask」、對任何函式定義（含 dead branch/`$()` 內）
     及 alias 類（`alias`/`unalias`/`shopt -s expand_aliases`）皆 deny，屬刻意接受的 over-deny（破壞 name-based
     模型的危險結構）。
@@ -558,8 +568,8 @@ bash **alias** 同樣能重定義 allowlisted 指令名（`shopt -s expand_alias
   - **分離值/未知旗標 → 放棄、不 deny（回應 review medium finding，須斷言不 deny）**：`node --title -e 'console.log("x")'`
     （`--title` 非已知 nullary、可能吃走 `-e` → 放棄 inline 定位）、`node --unknown-flag val -e '<print>'` → **不 deny**
     （保守 arity 避免把旗標值誤當 `-e` 標記而誤 deny）。
-- **葉載具 heredoc-stdin（B）**：裸 `node <<'EOF'<print>EOF`/`python <<'EOF'`/`deno run -`/`bun run -` → deny；
-  `< file`/無 fd0（繼承）→ 不 deny。
+- **葉載具 heredoc-stdin（B）**：裸 `node <<'EOF'<print>EOF`/`python <<'EOF'`/`deno run -`/裸 `bun <<'EOF'` → deny；
+  `< file`/無 fd0（繼承）→ 不 deny；`bun run -` **不特案**（保守 under-deny，§4.3.1）。
 - **複合 WRITE→EXEC(a)**：旗艦 `cat > /tmp/x.mjs <<'EOF'<print>EOF; node /tmp/x.mjs` → deny；`&&` 緊鄰 → deny；
   `echo '<print>' > f; node f` → deny。
   - **進入點負面——P 是程式 argv（須斷言不 deny）**：`echo 'console.log("fixture")' > fixture.js;
@@ -609,9 +619,13 @@ bash **alias** 同樣能重定義 allowlisted 指令名（`shopt -s expand_alias
 - **alias 類 deny 面**：`alias grep='rm -rf'; grep x`、`shopt -s expand_aliases; alias cat=x; cat f`、
   `unalias -a`、`alias`（列出形，accepted 小 over-deny）、`if true; then alias a=b; fi`（`$()`/控制流內亦攤平偵測）→ **deny**、
   reason `alias`。
-- **alias 類不 deny 面**：`shopt -s globstar`、`shopt -u expand_aliases`（停用）、`shopt expand_aliases`（查詢）→
-  **不 deny**（非啟用 alias 展開）；`cat > setup.sh <<'EOF'\nalias grep=x\nEOF`、`echo 'alias grep=x'` → **不 deny**
-  （alias 文字為資料、非 invocation；寫含 alias 的 script 安全）。
+- **builtin/command 包裝 deny 面（回應 review high finding）**：`builtin alias x=y`、`command alias x=y`、
+  `builtin unalias a`、`command shopt -s expand_aliases; cat f`、`command builtin alias x=y`（多層）、
+  `command -p alias x=y`（`command` 旗標略過後仍取到 alias）→ **deny**（解包裝後有效名為 alias/unalias/shopt）。
+- **alias 類不 deny 面**：`shopt -s globstar`、`shopt -u expand_aliases`（停用）、`shopt expand_aliases`（查詢）、
+  `command ls`/`builtin cd x`（有效名非 alias 類）→ **不 deny**；`cat > setup.sh <<'EOF'\nalias grep=x\nEOF`、
+  `echo 'alias grep=x'` → **不 deny**（alias 文字為資料、非 invocation；寫含 alias 的 script 安全）；
+  `eval 'alias grep=x'`（eval 巢狀直譯器 → 既有 ask 邊界、非本閘）、`source aliases.sh`（out-of-scope）→ 非本閘 deny。
 - **理由**：deny reason 為 `nameRedefinitionDenyReason("function")` / `nameRedefinitionDenyReason("alias")`。
 
 ### 7.6 不可升級 e2e（`main_test.ts`）
@@ -658,10 +672,10 @@ bash **alias** 同樣能重定義 allowlisted 指令名（`shopt -s expand_alias
   寫→執行、繼承 stdin、多段 pipe、**WRITE→EXEC(a) 進入點前含吃值/未知旗標**（§4.3.2(a) fail-safe 放棄定位，
   避免把旗標值誤當進入點而誤 deny）。皆安全方向、不防刻意繞過。（**函式定義已改 node-based fail-closed，動態名亦
   deny、不在此列**。）
-- **整鏈洗白 under-deny（使用者明確覆歸 review，§6）**：`ls; node -e '假'`、`ls; echo 假`、`pwd; echo 假` 加一個
-  非載具葉即不 deny（落既有 ask/settings）。design-soundness reviewer 兩度（round 4/11）要求硬 deny；使用者定案
-  維持整鏈語意（per-leaf 會誤殺 `ls; echo "done"`、dataflow 不可判定）。屬 decision 2 鎖定之刻意 under-deny、
-  非疏漏；本 hook 回 ask 時仍不放行，安全由 Claude Code 端與使用者核准把關。
+- **整鏈洗白 under-deny（使用者明確覆歸 review，§6；standing objection）**：`ls; node -e '假'`、`ls; echo 假`、
+  `pwd; echo 假` 加一個非載具葉即不 deny（落既有 ask/settings）。design-soundness reviewer **持續多輪**
+  （round 4/11/12）要求硬 deny；使用者定案維持整鏈語意（per-leaf 會誤殺 `ls; echo "done"`、dataflow 不可判定）。
+  屬 decision 2 鎖定之刻意 under-deny、非疏漏；本 hook 回 ask 時仍不放行，安全由 Claude Code 端與使用者核准把關。
 - **無回歸**：`f(){:;}; echo 假` 舊閘② 為 deny、本版經閘② 仍 deny（reason 改為函式定義）——**非回歸**。舊閘③
   「函式遮蔽 → ask」升級為 deny 屬**收緊**（`ls -la; ls(){…}` 由 ask 改 deny）。除上述兩處 over-deny 外，本版
   只擴充 deny、不放寬。
