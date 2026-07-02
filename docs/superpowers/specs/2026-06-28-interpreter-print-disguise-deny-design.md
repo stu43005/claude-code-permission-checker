@@ -61,11 +61,16 @@ cat /tmp/q.txt
 - **不需擋的**：**駭客刻意包裝 bash 繞過偵測器**。agent 不會為了 print-only 而故意做函式遮蔽、exec-wrapper
   包裝、加冷僻旗標來閃避偵測。
 - **核心原則（決定整個簡化）**：
-  1. 指令若含**非偵測目標的結構**（定義函式、exec-wrapper、賦值前綴、會注入碼的旗標、冷僻控制流…）→
-     **跳過偵測**（不 deny、落既有 ask）。**不**為了攔截這些而過度解析。
-  2. **不影響「會執行什麼」的旗標**（如 `--transpile-only`、`--experimental-*`、deno `--allow-*`，對只有
+  1. 指令若含**非偵測目標的結構**（定義函式、exec-wrapper、賦值前綴、會注入碼的旗標…）→ **不偵測**
+     （不 deny、落既有 ask）。**不**為了攔截這些而過度解析。其中**只有「定義函式」是整閘全域跳過**
+     （§4.4）；其餘（exec-wrapper/賦值前綴/注入旗標）是**該葉不算載具**、再由整鏈覆蓋收斂。
+  2. **控制流（`if`/`for`/`while`/`case`）不是全域跳過**：其 clause/guard 與各分支經 `walk` 攤平進同一
+     `invocations[]`，由**整鏈覆蓋**統一處理——含 guard/多分支引入非載具葉時覆蓋失敗 → 不 deny（安全 under-deny）；
+     退化的全載具控制流（如 `for x in a b; do echo 假; done`，clause 無非載具葉）仍 deny（§4.4）。
+  3. **不影響「會執行什麼」的旗標**（如 `--transpile-only`、`--experimental-*`、deno `--allow-*`，對只有
      `console.log` 的腳本毫無影響）→ **無視該旗標、繼續偵測**（不是跳過）。
-  3. 方向恆安全：跳過＝更保守（多漏 deny），**絕不誤 deny、絕不新增 allow 路徑**。
+  4. 方向恆安全：不偵測＝更保守（多漏 deny）；**除 cat 讀回複合載具此一意識接受的 narrow exception 外
+     （§4.3.2(b)），絕不誤 deny、絕不新增 allow 路徑**。
 - **相對舊閘②，本版對純 shell 鏈的行為變更僅一處，且為明確接受的回歸（accepted regression）**：
   **腳本定義任何函式 → 閘②′ 整體跳過**（決策見 §4.4 全域跳過閘），故 `f(){ :; }; echo 假` 由**舊 deny 改為
   不 deny**（退回 ask）。其餘純 shell 鏈行為完全不變（見 §7 回歸）。
@@ -183,7 +188,10 @@ main.ts → evaluate(command, root, initialCwd, rules, home, trustedReadRoots)
 - `echoOutput(inv)`：echo 靜態 payload → 還原輸出字串（沿用 `isEchoPrintOnly` 的合格判定與 `-e`/`-E`/反斜線
   carve-out；不合格回 `null`）。
 - `printfOutput(inv)`：printf 靜態格式 → 還原輸出（沿用 `isPrintfPrintOnly` 的 carve-out；含格式化轉換符/動態 → `null`）。
-- `heredocOutput(redirect)`：cat/tac heredoc/here-string body（`isHeredocPrintEligible` 為真）→ 還原文字；否則 `null`。
+- `commandOutput(inv)`：對 `cat`/`tac` 之 heredoc/here-string passthrough（`isCatPassthrough`＋`isHeredocPrintEligible`
+  為真、fd0「最後者勝」）→ 還原其**實際 stdout**：**`cat` 原序**、**`tac` 需將 body 按行反轉**（tac 反向逐行輸出）；
+  不合格回 `null`。內部可用底層 `heredocOutput(redirect)` 取 body 原文，再依 `inv.name` 決定是否套 tac 反轉。
+  此為統一入口——葉載具（echo/printf/cat/tac）皆經此取具體輸出字串。
 
 `wordPrintEligible` / `isHeredocPrintEligible` / fd0「最後者勝」判定自 `print_only.ts` 移入本檔（或於此定義、
 `print_only.ts` re-export），因為它們同時被葉載具判定、WRITE→EXEC 的 WRITE 內容還原、與 pipe producer 輸出還原共用。
@@ -222,9 +230,21 @@ main.ts → evaluate(command, root, initialCwd, rules, home, trustedReadRoots)
   **EXEC** 成對；EXEC 有兩種：
   - **(a) 直譯器執行同檔**：EXEC 葉 `name ∈ INTERPRETERS`、為「script 執行」形態（非 inline、非 stdin），
     其 argv 某靜態 token 等於 WRITE 寫出的路徑 P，且 **WRITE 內容須過 `payloadIsAllStaticPrint`**（lang 由該直譯器決定）。
-  - **(b) cat/tac 讀回同檔**（**新增**）：EXEC 葉 `name ∈ {cat, tac}`、其唯一操作元為 WRITE 寫出的路徑 P、
-    無蓋過的 fd0 輸入重導向；**WRITE 內容為任何可靜態還原的文字即可、不需過 payload 述詞**（因整個 composite
-    的淨效果就是靜態吐字）。此支封掉 `cat > /tmp/q.txt <<'EOF'…EOF; cat /tmp/q.txt` 兩步偽裝（目前僅落寫入重導向 ask）。
+  - **(b) cat/tac 讀回同檔**（**新增；意識接受的 narrow 誤-deny exception**）：EXEC 葉 `name ∈ {cat, tac}`、
+    其唯一操作元為 WRITE 寫出的路徑 P、無蓋過的 fd0 輸入重導向；**WRITE 內容為任何可靜態還原的文字即可、
+    不需過 payload 述詞**（因整個 composite 的淨效果就是把「同呼叫內剛靜態寫死的文字」原樣吐回 stdout）。
+    此支封掉 `cat > /tmp/q.txt <<'EOF'…EOF; cat /tmp/q.txt` 兩步偽裝（目前僅落寫入重導向 ask）。
+    - **rationale（使用者定案）**：讀回的內容在**同一呼叫內**已被靜態寫死、寫它的模型早已握有該內容 →
+      再讀回一次只是「把已知結論繞經 tool 輸入再原樣拿回」的浪費 token 假工作，正是本閘要擋的。
+    - **與「絕不誤 deny」的關係（回應 review high finding）**：cat 讀回在詞法上與**合法**的「建立靜態檔再
+      檢視」（`cat > config.yaml <<EOF…EOF; cat config.yaml`、建 fixture/README 再 cat）**無法區分**，故此為
+      對嚴格「絕不誤 deny」刻意開的**唯一** narrow 例外。**blast radius 受限**：deny 的是**同一呼叫內
+      寫死＋立即讀回同檔**這半段冗餘；**合法的檔案「建立」本身不被永久阻擋**——單獨下 WRITE
+      （`cat > config.yaml <<EOF…EOF`）＝寫入重導向 ask（可核准），需要檢視時另起一次 `cat config.yaml`
+      （純讀取、通常 allow/ask）。使用者僅需**把寫與讀拆到兩次呼叫**或**省去多餘讀回**即可。
+    - **鑑別器落差（明載）**：直譯器版 (a) 有 `payloadIsAllStaticPrint` 當鑑別器（全 `console.log` 的 .mjs 交給
+      node 執行是強偽裝訊號）；(b) 無任何鑑別器（任何靜態文字皆命中），故 (b) 的誤-deny 面較 (a) 廣——此差異
+      為使用者知悉並接受。
   - **WRITE 定義**：緊鄰前一個 sibling 葉指令，名 ∈ {`cat`,`tac`,`echo`,`printf`}、無賦值前綴、其**唯一有效
     fd1 目標**為截斷 `>`/`>|` 到靜態路徑 P、內容可由 `static_output.ts` 靜態還原（cat/tac heredoc body 或
     echo/printf 靜態輸出）。`>>` append、多重輸出重導向、`1>&2` 等 → 非 WRITE。
@@ -266,22 +286,28 @@ main.ts → evaluate(command, root, initialCwd, rules, home, trustedReadRoots)
 
 否則做**兩階段**判定（**非** per-leaf 短路——這是本版對舊 spec 的關鍵修正）：
 
-**階段 1（分類，走訪完整鏈）**：先完整走訪整條指令，對**每個**葉指令記錄其**載具身分**：
-{葉載具｜複合載具成員（WRITE 或 EXEC）｜setup 白名單葉｜以上皆非}，並記錄是否存在 ≥1 個 WRITE→EXEC 複合載具。
+**階段 1（分類，走訪完整鏈）**：先完整走訪整條指令，對**每個**葉指令記錄其**載具身分**，取值為下列之一：
+{`葉載具`｜`複合成員:write-exec`（WRITE 或 EXEC 葉）｜`複合成員:pipe`（producer 或 consumer 葉）｜
+`setup 白名單葉`｜`以上皆非`}，並記錄是否存在 ≥1 個 **WRITE→EXEC** 複合載具（供 (a) 的 setup 豁免；
+**pipe 不觸發 setup 豁免**）。
 - **葉載具**（§4.3.1）逐指令判定、與位置無關。
 - **複合載具成員**（§4.3.2）由一趟 source-order AST 走訪識別：沿循序序列（`Script.commands`/`CompoundList`/
   `BraceGroup`/`&&`/`;` 的 `AndOr`）thread cwd（由 `initialCwd`；遇 `cd` 後標 unknown）、維護「緊鄰前一個
-  sibling 的靜態 WRITE」`prevWrite`，成對後把 WRITE 葉與 EXEC 葉各自標記為複合成員。WRITE→EXEC 與 pipe
-  **僅在循序序列/pipeline 節點上判**，**不跨控制流/subshell 邊界**。
+  sibling 的靜態 WRITE」`prevWrite`。
+  - **WRITE→EXEC 成對**：成對後把 WRITE 葉與 EXEC 葉各自標記為 `複合成員:write-exec`。
+  - **pipe 成對（回應 review medium）**：`Pipeline` 節點且 §4.3.2 pipe 條件成立時，**把 producer 與 consumer
+    兩個葉都標記為 `複合成員:pipe`**。此為必要契約——consumer（裸直譯器讀 stdin、無 fd0 重導向）本身**非**葉載具，
+    唯有成對後被標為複合成員才使 (a) 覆蓋通過；否則 `echo 'console.log(1)' | node` 會因 node 非載具而覆蓋失敗。
+  - WRITE→EXEC 與 pipe **僅在循序序列/pipeline 節點上判**，**不跨控制流/subshell 邊界**。
 - **分類的葉全集＝ `walk` 攤平的 `invocations[]`**（同一 leaf 集合，含 `$()`/控制流 clause＋各分支 body 內層）。
   分類完成前**不做任何 deny 決定**。
 
 **階段 2（判定，走訪結束後才決定）**：**整鏈 deny ⟺ 同時滿足下列三者**：
 
-- **(a) 覆蓋**：**`invocations[]` 中每個葉指令** ∈ { 葉載具, 複合載具成員 }。**唯一例外**：若鏈中含 ≥1 個
-  **WRITE→EXEC 複合載具**，則額外允許 **setup 白名單** `{mkdir, cd, true, :}` 的葉（**裸 print 鏈——不含
-  WRITE→EXEC——不吃此豁免**）。setup 白名單葉若處於**否定（`!`）之下**不算 setup（`! true` 排除——否定的
-  true 不是 setup）。
+- **(a) 覆蓋**：**`invocations[]` 中每個葉指令**身分 ∈ { `葉載具`, `複合成員:write-exec`, `複合成員:pipe` }。
+  **唯一例外**：若鏈中含 ≥1 個 **WRITE→EXEC 複合載具**，則額外允許 **setup 白名單** `{mkdir, cd, true, :}` 的葉
+  （**裸 print 鏈與 pipe 鏈——不含 WRITE→EXEC——不吃此豁免**）。setup 白名單葉若處於**否定（`!`）之下**不算
+  setup（`! true` 排除——否定的 true 不是 setup）。
 - **(b) 存在**：至少一個 print 載具存在（葉載具或複合載具）。
 - **(c) 未遮蔽**：載具名未被同腳本函式定義遮蔽——已由全域跳過閘（更強：任何函式定義即整閘跳過）保證。
 
@@ -289,9 +315,11 @@ main.ts → evaluate(command, root, initialCwd, rules, home, trustedReadRoots)
 與**所有分支** body 一併攤平進 `invocations[]`；聚合覆蓋 (a) 施加於此**完整扁平集**、**不**區分互斥執行路徑。
 後果：任何含 guard 或多分支的控制流包裝，只要引入一個非載具葉（如 `command -v node` guard），覆蓋 (a) 即失敗
 → **不 deny**。故 `if command -v node; then node -e '<print>'; else echo 假; fi` **不 deny**（guard 為非載具）；
-`if true; then echo 假; fi` 也不 deny（clause `true` 非載具）。此為刻意接受的 under-deny，符合威脅模型
-「冷僻控制流 → 跳過偵測」；退化的全載具控制流（如 `for x in a b; do echo 假; done`，clause 無非載具葉）
-仍 deny，且與舊閘② `isAllPrintOnly` 行為一致（無回歸）。
+`if true; then echo 假; fi` 也不 deny（clause `true` 非載具）。**控制流本身不是全域跳過**（唯一全域跳過是函式
+定義）——它與其他指令一樣受整鏈覆蓋約束：含 guard/多分支引入非載具葉即 (a) 失敗（安全 under-deny）；退化的
+全載具控制流（如 `for x in a b; do echo 假; done`，clause 無非載具葉、body 全載具）**仍 deny**，且與舊閘②
+`isAllPrintOnly` 行為一致（無回歸）。此「有 guard/分支即不 deny」為刻意接受的 under-deny（agent 常見假驗證
+不會包在 feature-detection 控制流內）。
 
 **行為對照**（每案於 §7 有對應測試）：
 
@@ -312,6 +340,8 @@ main.ts → evaluate(command, root, initialCwd, rules, home, trustedReadRoots)
 | `echo 假; ls` / `node -e '<print>'; ls` | 載具＋ls（非載具）| 不 deny | **兩階段**：走完全鏈才判；前綴載具不因後綴 ls 出現前就誤 deny |
 | `if command -v node; then node -e '<print>'; else echo 假; fi` | guard（非載具）＋分支載具 | 不 deny | 控制流路徑不敏感：guard 非載具 → (a) 失敗 |
 | `for x in a b; do echo 假; done` | 僅 echo（clause 無非載具葉）| **deny** | 退化全載具控制流；與舊閘② 一致（無回歸）|
+| `echo 'console.log(1)' \| node` | producer＋consumer（皆 `複合成員:pipe`）| **deny** | pipe；成對後 node 才被覆蓋 |
+| `grep x f \| node` / 三段 pipe | grep（非載具 producer）/多段 | 不 deny | producer 非靜態 print / 非恰兩段 → 不成對，node 仍非載具 |
 
 判定在**階段 2、走訪整條指令之後**才做出（**非** per-leaf 短路）；命中時回 `{ kind }`（主要命中形態，見 §4.5），
 否則回 `null`。唯一的提前退出是 **fail-safe**：分析途中拋例外 → 由 `evaluate` 既有 try/catch 收斂為 ask
@@ -328,7 +358,10 @@ if (hit) {
 ```
 
 - `printDisguiseDeny` 回 `null`（不 deny）或 `{ kind }`，`kind ∈ { "shell-print", "interp-inline",
-  "write-exec", "cat-readback", "pipe" }`（依最終使聚合條件成立的主要命中形態）。
+  "write-exec", "cat-readback", "pipe" }`。**kind 決定性優先序**（同一鏈可能同時含多形態時，理由取最具體者，
+  使 deny reason 測試可預期）：`write-exec` > `cat-readback` > `pipe` > `interp-inline` > `shell-print`
+  （即：存在 WRITE→EXEC(a) 直譯器複合 → `write-exec`；否則存在 cat 讀回複合 → `cat-readback`；否則存在 pipe
+  複合 → `pipe`；否則存在直譯器 inline/stdin 葉 → `interp-inline`；否則純 shell 葉載具 → `shell-print`）。
 - `script`/`invocations`/`initialCwd` 皆 `evaluate` 既有；無新狀態穿透。
 - **兩階段、走訪後才判**：`printDisguiseDeny` 先分類完整鏈、再依 §4.4 (a)(b)(c) 決定，**不**在走訪途中提前回
   deny；`if (hit)` 之 `hit` 為走訪結束後的最終判定。既有 try/catch 僅在「分析途中拋例外」時退化為 ask（不 deny）。
@@ -373,10 +406,12 @@ if (hit) {
 - 上述「不 deny」多落既有 ask、**可被** `settingsAllows`（`Bash(node *)` 等）升級——屬使用者自負的既有
   settings 行為；本功能不新增此路徑、亦不硬擋。被閘②′命中者**不可**升級。
 
-**零誤 deny 保證**：§4.1 述詞 fail-safe（任何運算/變數/呼叫/模板/import/未閉合 → 不 deny）；§4.4 聚合語意
-**兩階段、走訪完整鏈後才判**且要求**每個葉皆載具/成員**（任一非載具、非 setup 葉即令覆蓋 (a) 失敗 → 不 deny，
-故前綴載具不會在看到後綴非載具葉前誤 deny）；任何非目標結構 → 跳過。故所有「真實工作」payload 與含非單純
-結構的指令一律不被 deny，最差退回既有 ask。
+**誤 deny 面（近零、單一具名例外）**：§4.1 述詞 fail-safe（任何運算/變數/呼叫/模板/import/未閉合 → 不 deny）；
+§4.4 聚合語意**兩階段、走訪完整鏈後才判**且要求**每個葉皆載具/成員**（任一非載具、非 setup 葉即令覆蓋 (a)
+失敗 → 不 deny，故前綴載具不會在看到後綴非載具葉前誤 deny）；任何非目標結構 → 不偵測。故所有「真實工作」
+payload 與含非單純結構的指令一律不被 deny，最差退回既有 ask。**唯一刻意例外**＝**cat 讀回複合載具**（§4.3.2(b)）：
+它會 deny 詞法上等同「同呼叫內建靜態檔＋立即讀回同檔」的合法操作；此為使用者定案接受的 narrow exception，
+blast radius 限於冗餘讀回半段（檔案建立本身可另起呼叫核准，見 §4.3.2(b)）。除此之外，本工具維持嚴格「絕不誤 deny」。
 
 ## 6. CLAUDE.md / 文件同步
 
@@ -389,6 +424,8 @@ if (hit) {
   - node/python/deno/bun/ts-node 的**裸 all-static-print 形態**（inline/heredoc/pipe/寫檔→執行）改**硬 deny**；
     含函式/wrapper/賦值前綴/注入旗標/跨呼叫者維持 ask（明列為刻意 under-deny）。`bash -c`/`perl -e` 等仍 ask。
   - **兩步偽裝**（`cat > x <<EOF…EOF; cat x`）由「寫入重導向 ask」改**硬 deny**（cat 讀回複合載具）。
+    須註記此為**唯一刻意接受的誤-deny narrow exception**：詞法上與合法「建檔＋讀回」不可分，deny 限於同呼叫內
+    冗餘讀回半段、檔案建立本身仍可另起呼叫核准（§4.3.2(b)）；並明載 (b) 無 (a) 的 payload 述詞鑑別器。
   - **混載具全 print 鏈**（`echo a; node -e print`）改**硬 deny**。
   - **`ls; echo 假` 這類「整鏈含真實/非載具葉」的洗白繞道維持不 deny**（聚合 (a) 失敗，落既有判定）——
     仍是「零誤殺、維持乾淨規則」的取捨；此類**非**「預設 ask + 升級」那一類。
@@ -415,7 +452,10 @@ if (hit) {
 - `printExprIsStaticString`：`'"fake"'` true；`'1+1'`/`'os.cpus()'` false。
 
 ### 7.3 靜態輸出還原（`static_output_test.ts`）
-- `echoOutput`/`printfOutput`/`heredocOutput` 對合格 → 具體字串、不合格 → `null`（格式化轉換符、動態、append 等）。
+- `echoOutput`/`printfOutput`/`commandOutput` 對合格 → 具體字串、不合格 → `null`（格式化轉換符、動態、append、
+  有檔案操作元等）。
+- **tac 行反轉**：`commandOutput` 對 `tac <<'EOF'\nA\nB\nEOF` → `"B\nA"`（反序）；對 `cat` 同 body → `"A\nB"`（原序）。
+  驗證反轉真的被套用（餵給 payload 述詞的內容正確）。
 
 ### 7.4 載具/聚合整合測試（`print_only_test.ts` 新增段）
 - **葉載具 inline（A）**：裸 `node -e '<print>'`/`python -c '<print>'`/`deno eval '<print>'`/`bun -e`/`ts-node -e`、
@@ -427,6 +467,10 @@ if (hit) {
 - **複合 WRITE→EXEC(b) cat 讀回（新增）**：`cat > /tmp/q.txt <<'EOF'<任意靜態文字>EOF; cat /tmp/q.txt` → deny；
   `printf '…' > q; tac q` → deny。**不 deny 面**：非緊鄰（`cat > q; echo hi; cat q`）、非同檔（`cat > a; cat b`）、
   append（`cat >> q <<EOF…EOF; cat q`）、跨控制流（`if c; then cat > q; fi; cat q`）。
+  - **accepted 誤-deny exception（§4.3.2(b)，須明確斷言 deny 並註記為刻意例外）**：合法建檔＋讀回
+    `cat > config.yaml <<'EOF'\n<yaml>\nEOF; cat config.yaml` → **deny**（詞法上與偽裝不可分；此為使用者定案接受）。
+    **對照緩解可用**：單獨 `cat > config.yaml <<'EOF'\n<yaml>\nEOF`（無讀回）→ **非閘②′ deny**（落寫入重導向 ask，
+    可核准），驗證檔案建立本身未被永久阻擋。
 - **setup 豁免三案例**：旗艦 `mkdir -p /tmp && cat > x <<EOF…EOF && node x` → **deny**；`cd /tmp; cat > x; node x`
   → **deny**；對照 `mkdir build && echo done` → **不 deny**（無 composite → 不吃豁免）、`true && echo 已驗證`
   → **不 deny**。
@@ -442,6 +486,9 @@ if (hit) {
   對照 `for x in a b; do echo 假; done` → **deny**（clause 無非載具葉、body 全載具，與舊閘② 一致）。
 - **pipe（D）**：`echo 'console.log(1)' | node` → deny；`grep x f | node`/多段 → 不 deny；`echo … | node < real.js`
   （fd0 蓋過）→ 不 deny。
+  - **pipe 覆蓋契約（回應 review medium）**：明確斷言**同一個裸 `node`** 在 pipe 外非載具、pipe 內成對後被覆蓋——
+    `echo 'console.log(1)' | node` → deny（node 經 pipe 成對標為 `複合成員:pipe`）；對照 `node`（裸、無 stdin
+    重導向、非 pipe）落 ask（consumer 未成對 → 非載具）。驗證覆蓋依賴 pipe 成對狀態、而非 node 自身為載具。
 - **良性旗標仍 deny**：`ts-node --transpile-only x.ts`（x.ts 為前驅 all-print WRITE）、
   `node --experimental-default-type=module x.mjs`、`deno run --allow-read x.ts`、
   `node --no-warnings -e 'console.log("fake")'` → **deny**（旗標無視、仍判定）。
@@ -488,6 +535,9 @@ if (hit) {
 - **刻意接受的 under-deny**（§5）：跨呼叫拆分、定義函式、控制流包裝（路徑不敏感）、exec-wrapper、賦值前綴、
   注入旗標、非緊鄰寫→執行、繼承 stdin、多段 pipe。皆安全方向、不防刻意繞過，符合「只擋 agent 常見 print-only
   假驗證」的威脅模型。
+- **唯一 accepted over-deny（誤-deny）＝cat 讀回複合載具**（§4.3.2(b)）：deny 詞法上等同合法「建靜態檔＋讀回同檔」；
+  使用者定案接受（rationale：同呼叫內讀回剛寫死的內容＝浪費 token 假工作），blast radius 限於冗餘讀回半段
+  （檔案建立可另起呼叫核准）。這是本工具對嚴格「絕不誤 deny」開的**唯一**例外。
 - **相對舊閘② 的唯一放寬＝唯一 accepted regression**：函式定義全域跳過（§1.2 附完整回歸事實與接受理由、
   §6/§7.1 文件與測試同步）。此為使用者定案；除此之外本版**只擴充 deny、不放寬**（控制流與前綴等其餘 under-deny
   皆與舊閘② 行為一致、非回歸）。
