@@ -86,9 +86,12 @@ cat /tmp/q.txt
 2. heredoc：引號分隔符（`<<'EOF'`）→ `heredocQuoted === true`、body `undefined`、不展開（靜態）；未引號含展開 →
    `body` 為結構化 Word；純文字 → 文字在 `content`。靜態性沿用 `isHeredocPrintEligible`。
 3. `Pipeline.commands: Statement[]`。`staticValue(word)` 對含展開/未引號 glob 回 `null`（動態）。
-4. **`definedFunctionNames(script)`（`walk.ts` 既有）遞迴掃全 AST（含巢狀、`$()`/`<()`、控制流、heredoc body）
-   收集所有**靜態**函式名；動態名（`staticValue` 為 null）忽略。walk 的 `case "Function"` 不下降 body，故函式
-   定義**不產生 execution 葉**（正確——函式 body 未執行）。→ 函式偵測靠此 helper，**walk 攤平不需改**。
+4. **`definedFunctionNames(script)`（`walk.ts` 既有）遞迴掃 AST 收集**可執行位置**的靜態函式名——來源為真正的
+   `Function` AST 節點，以及 heredoc body / word 內**`$()`/`<()` 命令替換所解析出的內層腳本**（會實際執行）。
+   **不**把 heredoc/here-string 的**純文字 body**（引號 heredoc body 為 `undefined`；未引號純文字進 `content`）或
+   **字串引數文字**當函式定義（已實測：`cat > x.sh <<'EOF'\nf(){…}\nEOF`、`echo 'f(){…}'` → 空集）。動態名
+   （`staticValue` 為 null）忽略。walk 的 `case "Function"` 不下降 body，故函式定義**不產生 execution 葉**
+   （正確——函式 body 未執行）。→ 函式偵測靠此 helper，**walk 攤平不需改**。
 5. hook `permissionDecision: "deny"` 阻止呼叫並回饋 `permissionDecisionReason`，優先序 `deny > ask > allow`；
    deny 理由須含①被禁止的事②為何③替代。
 
@@ -358,10 +361,19 @@ if (definedFunctionNames(script).size > 0) {
 }
 ```
 
-- 使用**既有** `definedFunctionNames(script)`（`walk.ts`）——遞迴掃全 AST（含 `$()`/控制流/heredoc/巢狀）收集
-  靜態函式名。`size > 0` 即有函式定義 → deny。**不改 walk**。
-- **取代舊閘③「函式遮蔽 → ask」**：舊閘③ 僅在「被呼叫名恰被遮蔽」時 ask；新閘② 對**任何函式定義**（含未被
-  呼叫、dead branch、`$()` 內）皆 deny，較 ask 強。
+- 使用**既有** `definedFunctionNames(script)`（`walk.ts`）——遞迴掃 AST 收集**可執行位置**的靜態函式名。
+  `size > 0` 即有函式定義 → deny。**不改 walk**。
+- **只收集「可執行位置」的函式定義（回應 review high finding；已實測驗證）**：`definedFunctionNames` 只從
+  **真正的 `Function` AST 節點**與 **`$()`/`<()` 命令替換內層腳本**（會實際執行）收集；**不**把 heredoc/here-string
+  的**純文字 body** 或**字串引數**當函式定義。故**寫含函式的 shell script 不被 deny**——實測：
+  - `cat > deploy.sh <<'EOF'\ndeploy(){ … }\nEOF`（引號 heredoc 純文字）→ `{}` → **不 deny**。
+  - `cat > x.sh <<EOF\nf(){ … }\nEOF`（未引號、無 `$()` 純文字）→ `{}` → **不 deny**。
+  - `echo 'f(){ echo hi; }'`（字串引數）→ `{}` → **不 deny**。
+  - 對照真執行：`f(){ echo hi; }; f`、`f(){:;}`、`cat <<EOF\n$(g(){:;}; g)\nEOF`（`$()` 內定義並執行）→ 收集 →
+    **deny**。此即 reviewer 建議的「executable-context detector，忽略 heredoc/here-string 資料位置」，既有 helper
+    已滿足，無需新增 detector。
+- **取代舊閘③「函式遮蔽 → ask」**：舊閘③ 僅在「被呼叫名恰被遮蔽」時 ask；新閘② 對**任何（可執行位置的）函式
+  定義**（含未被呼叫、dead branch、`$()` 內）皆 deny，較 ask 強。
 - **接受的 over-deny（§1.2(3)）**：合法 `helper(){…}; helper`、dead branch 的函式定義（`definedFunctionNames`
   over-collect）亦 deny。使用者定案接受（agent 不該在 Bash 呼叫內定義函式；函式定義破壞 name-based 模型）。
 - **safe under-deny 邊界**：動態函式名（`staticValue` 為 null）收不到 → 該腳本不被閘② deny，落閘③/classify。
@@ -472,8 +484,12 @@ if (definedFunctionNames(script).size > 0) {
   `g(){ ls; }; g`（合法複用亦 deny，accepted over-deny）、`ls -la; ls(){…}`（原閘③ 為 ask，改 deny）、
   dead branch `if false; then f(){:;}; fi; echo hi`（`definedFunctionNames` over-collect → deny）、
   `echo "$(f(){:;}; f)"`（`$()` 內函式定義 → deny）。
-- **不 deny 面（無函式定義）**：確認閘② 不誤觸——`echo f(){}`（字串字面、非函式定義語法，視 unbash 解析；若解析
-  為非 Function 節點則不觸）等邊界；動態函式名情境（若可構造）→ under-deny。
+- **不 deny 面——「函式文字為資料」不誤觸（回應 review high finding，關鍵回歸；已實測 `definedFunctionNames` 為空集）**：
+  - **寫含函式的 shell script**：`cat > deploy.sh <<'EOF'\ndeploy(){ … }\nEOF`（引號 heredoc）、
+    `cat > x.sh <<EOF\nf(){ … }\nEOF`（未引號、無 `$()`）→ **不 deny**（heredoc 純文字非可執行函式定義；
+    此為極常見合法工作流，**必須**不 deny）。註：此二例為「寫檔」——落中央前置**寫入重導向 ask**（非閘②/③ deny）。
+  - **字串引數**：`echo 'f(){ echo hi; }'`、`printf '%s\n' 'g(){:;}'` → **不 deny**（字串資料非函式定義）。
+  - 動態函式名情境（若可構造）→ under-deny。
 - **理由**：deny reason 為 `functionDefDenyReason()`。
 
 ### 7.6 不可升級 e2e（`main_test.ts`）
@@ -502,8 +518,10 @@ if (definedFunctionNames(script).size > 0) {
   升級 allow。此為兩條鎖定不變量（per-call 無狀態、純詞法不讀檔）的交集、非本功能引入的漏洞；封閉需 taint/讀檔
   （違反不變量）故不做。緩解：hook 自主預設 ask、單呼叫內硬 deny 不可升級、使用者對 `Bash(node *)` 自負。
 - **兩處 accepted over-deny**（觸及「絕不誤 deny」）：
-  - **函式定義 → deny**（§4.6）：合法 `helper(){…}; helper`、dead branch/`$()` 內函式定義亦 deny。使用者定案
-    （agent 不該在 Bash 呼叫內定義函式；函式破壞 name-based 模型）。
+  - **函式定義 → deny**（§4.6）：**僅限可執行位置**（真 `Function` 節點＋`$()`/`<()` 內）；合法 `helper(){…};
+    helper`、dead branch/`$()` 內函式定義亦 deny。使用者定案（agent 不該在 Bash 呼叫內定義函式；函式破壞
+    name-based 模型）。**不涵蓋**「函式文字為資料」——寫含函式的 shell script（`cat > x.sh <<'EOF'…f(){}…EOF`）、
+    字串引數（`echo 'f(){}'`）**不被 deny**（已實測，§4.6/§7.5），故此 over-deny 不波及 shell-script 撰寫。
   - **cat 讀回複合載具**（§4.3.2(b)）：詞法上等同合法「建靜態檔＋讀回」；blast radius 限於冗餘讀回半段（檔案
     建立可另起呼叫核准）。
 - **刻意接受的 under-deny**：跨呼叫拆分、控制流包裝（路徑不敏感）、exec-wrapper、賦值前綴、注入旗標、非緊鄰
