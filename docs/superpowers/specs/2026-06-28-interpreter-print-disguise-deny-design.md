@@ -229,7 +229,13 @@ main.ts → evaluate(command, root, initialCwd, rules, home, trustedReadRoots)
 - **WRITE→EXEC**（原向量 C，緊鄰前驅＋同檔比對規則照舊）：由**緊鄰前一個 sibling 的靜態 WRITE** 與其後
   **EXEC** 成對；EXEC 有兩種：
   - **(a) 直譯器執行同檔**：EXEC 葉 `name ∈ INTERPRETERS`、為「script 執行」形態（非 inline、非 stdin），
-    其 argv 某靜態 token 等於 WRITE 寫出的路徑 P，且 **WRITE 內容須過 `payloadIsAllStaticPrint`**（lang 由該直譯器決定）。
+    其**直譯器 script 進入點**等於 WRITE 寫出的路徑 P，且 **WRITE 內容須過 `payloadIsAllStaticPrint`**（lang
+    由該直譯器決定）。
+    - **進入點＝略過旗標/子指令後的第一個位置參數**（回應 review high finding）：依 §4.3.3 略過良性旗標
+      （含其值）與注入旗標偵測、deno 的 `run` 子指令後，取**第一個非旗標位置 token** 為進入點；**該進入點之後
+      的所有 token 是傳給程式的 argv、不參與比對**。故只有「node/python/deno 真正執行的那個檔＝P」才成對——
+      `node runner.js generated.js`（進入點 runner.js ≠ P=generated.js）、`python runner.py fixture.py`、
+      `deno run runner.ts fixture.ts` **皆不成對、不 deny**（generated/fixture 只是程式引數，非被執行的腳本）。
   - **(b) cat/tac 讀回同檔**（**新增；意識接受的 narrow 誤-deny exception**）：EXEC 葉 `name ∈ {cat, tac}`、
     其唯一操作元為 WRITE 寫出的路徑 P、無蓋過的 fd0 輸入重導向；**WRITE 內容為任何可靜態還原的文字即可、
     不需過 payload 述詞**（因整個 composite 的淨效果就是把「同呼叫內剛靜態寫死的文字」原樣吐回 stdout）。
@@ -301,6 +307,11 @@ main.ts → evaluate(command, root, initialCwd, rules, home, trustedReadRoots)
   - WRITE→EXEC 與 pipe **僅在循序序列/pipeline 節點上判**，**不跨控制流/subshell 邊界**。
 - **分類的葉全集＝ `walk` 攤平的 `invocations[]`**（同一 leaf 集合，含 `$()`/控制流 clause＋各分支 body 內層）。
   分類完成前**不做任何 deny 決定**。
+  - **AST 葉 ↔ `invocations[]` 對應（實作註記）**：葉載具與 setup 白名單身分**可直接逐一對 `invocations[]` 判定**
+    （依 `name`/`argv`/`redirects`/`assignments`，位置無關），不需 AST。只有複合成員（WRITE→EXEC、pipe）需 AST
+    識別相鄰/pipeline 結構；實作時 `printDisguiseDeny` 的 source-order 走訪應以與 `walk` **相同的葉列舉順序**
+    產生葉序列（兩者皆前序、同一下降規則），即可用序列索引把「AST 走訪判定的複合成員」對位回 `invocations[]`。
+    覆蓋 (a) 最終以 `invocations[]` 為權威葉集。若兩序列長度不一致（理論上不應發生）→ fail-safe 不 deny。
 
 **階段 2（判定，走訪結束後才決定）**：**整鏈 deny ⟺ 同時滿足下列三者**：
 
@@ -427,8 +438,15 @@ blast radius 限於冗餘讀回半段（檔案建立本身可另起呼叫核准�
     須註記此為**唯一刻意接受的誤-deny narrow exception**：詞法上與合法「建檔＋讀回」不可分，deny 限於同呼叫內
     冗餘讀回半段、檔案建立本身仍可另起呼叫核准（§4.3.2(b)）；並明載 (b) 無 (a) 的 payload 述詞鑑別器。
   - **混載具全 print 鏈**（`echo a; node -e print`）改**硬 deny**。
-  - **`ls; echo 假` 這類「整鏈含真實/非載具葉」的洗白繞道維持不 deny**（聚合 (a) 失敗，落既有判定）——
-    仍是「零誤殺、維持乾淨規則」的取捨；此類**非**「預設 ask + 升級」那一類。
+  - **`ls; echo 假` / `pwd; echo fake` / `ls; node -e '<print>'` 這類「整鏈含真實/非載具葉」的洗白繞道維持
+    不 deny**（聚合 (a) 失敗，落既有 allow/ask 判定；其中 `node -e` 部分本就 ask）——這是**整鏈語意的核心取捨、
+    使用者定案**：寧可讓「加一個無關真實/no-op 葉」洗白（降為 ask、甚至可被 `Bash(node *)` 升級），也**不**採
+    per-leaf 硬 deny（那會誤殺合法的 `ls; echo "done"` 狀態訊息、違反「絕不誤 deny」）。**回應 review medium
+    downgrade 顧慮**：(1) 此非本功能新引入——shell 洗白繞道早為 CLAUDE.md「已接受繞道」記錄；本版僅把同一整鏈
+    語意延伸到直譯器載具。(2) reviewer 建議「硬 deny 無關 pwd/ls/true 前後綴」需要「哪個葉是實質工作」的詞法
+    不可判定分析，且會製造誤 deny，與整鏈設計與「絕不誤 deny」直接衝突，故不採。(3) 方向安全：洗白只把 deny
+    降為既有 ask（人工把關）或使用者自負的 settings 升級，**不**新增自主 allow。此類**非**「預設 ask + 升級」
+    那一類、而是「落既有判定」。
   - **函式定義 → 閘②′ 全域跳過**列為**刻意放寬／accepted regression**：明載其弱化了一條已上線的 shell 硬 deny
     （`f(){:;}; echo 假` 由 deny 改 ask），並附接受理由（威脅模型只擋 agent 常見形態、函式使 name 分析不可信、
     方向安全只降為 ask）。**不得**以「行為不變」帶過。
@@ -464,6 +482,10 @@ blast radius 限於冗餘讀回半段（檔案建立本身可另起呼叫核准�
   `< file`/無 fd0（繼承）→ 不 deny。
 - **複合 WRITE→EXEC(a) 直譯器**：**旗艦** `cat > /tmp/x.mjs <<'EOF'<print>EOF; node /tmp/x.mjs` → deny；
   `&&` 緊鄰 → deny；`echo '<print>' > f; node f` → deny；寫專案內同理。
+  - **進入點比對負面（回應 review high finding，須斷言不 deny）**：`echo 'console.log("fixture")' > fixture.js; node runner.js fixture.js`、
+    `printf '…' > fixture.py; python runner.py fixture.py`、`echo '<print>' > f.ts; deno run runner.ts f.ts`
+    → **不 deny**（P＝被寫檔，但直譯器進入點是 runner.*，P 只是程式 argv、非進入點）。對照 `node /tmp/x.mjs`
+    （P＝進入點）→ deny。
 - **複合 WRITE→EXEC(b) cat 讀回（新增）**：`cat > /tmp/q.txt <<'EOF'<任意靜態文字>EOF; cat /tmp/q.txt` → deny；
   `printf '…' > q; tac q` → deny。**不 deny 面**：非緊鄰（`cat > q; echo hi; cat q`）、非同檔（`cat > a; cat b`）、
   append（`cat >> q <<EOF…EOF; cat q`）、跨控制流（`if c; then cat > q; fi; cat q`）。
