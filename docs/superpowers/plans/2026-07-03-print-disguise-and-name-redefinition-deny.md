@@ -656,7 +656,7 @@ export function catTacText(cmd: Command): string | null {
   const c = inv(cmd);
   if (c.name !== "cat" && c.name !== "tac") return null;
   if (hasFileOperand(c.name, c.argv)) return null;
-  const body = effectiveHeredocBody(c.redirects);
+  const body = heredocStdinText(c.redirects);
   if (body === null) return null;
   if (c.name === "tac") {
     const trailing = body.endsWith("\n");
@@ -667,8 +667,9 @@ export function catTacText(cmd: Command): string | null {
   return body;
 }
 
-/** fd0 最後者勝的有效 heredoc/here-string body 原文；非 passthrough → null。 */
-function effectiveHeredocBody(redirects: Redirect[]): string | null {
+/** fd0 最後者勝的有效 heredoc/here-string 靜態文字（含 `<<<` 補換行、`<<-` 去 tab、拒結構化 body）；否則 null。
+ *  供 cat/tac passthrough 與直譯器 heredoc-stdin 共用，確保兩處還原規則一致。 */
+export function heredocStdinText(redirects: Redirect[]): string | null {
   const fd0 = redirects.filter((r) =>
     (r.operator === "<" || r.operator === "<<" || r.operator === "<<-" ||
       r.operator === "<<<" || r.operator === "<&") &&
@@ -715,11 +716,13 @@ export function writtenContent(cmd: Command): string | null {
 在 `src/engine/print_only.ts` **刪除**已移入 static_output 的十個函式定義（`hasLeadingTilde`/`wordPrintEligible`/`topPartEligible`/`heredocBodyEligible`/`isHeredocPrintEligible`/`isEchoPrintOnly`/`isPrintfPrintOnly`/`hasFormatterConversion`/`isCatPassthrough`/`hasFileOperand`）。頂部改為**只 import 本檔此刻用得到的**（`isPrintOnlyForm` 需 echo/printf/cat 三判定 + 既有 `hasWriteRedirect`；`wordPrintEligible` re-export 給既有測試）：
 
 ```typescript
+import type { CommandInvocation } from "../types.ts";   // isAllPrintOnly / isPrintOnlyForm 仍需
+import { hasWriteRedirect } from "./redirect.ts";       // isPrintOnlyForm 需（原本應已 import）
 import { isCatPassthrough, isEchoPrintOnly, isPrintfPrintOnly } from "./static_output.ts";
 export { wordPrintEligible } from "./static_output.ts";   // 既有 print_only_test.ts 由 print_only 匯入
 ```
 
-（`hasWriteRedirect` 若原本已從 `./redirect.ts` import 則保留。）`isPrintOnlyForm` 與 `isAllPrintOnly` **保留在 print_only.ts**、改用 import 的三判定。**不在 Task 2 import `hasFileOperand`/`isHeredocPrintEligible`**（那些在 Task 5/6 需要時才 import，避免此刻 lint 報未使用）。確認無重複定義（否則 `deno check` 重複宣告錯誤）。
+**保留** print_only.ts 原有仍被使用的型別 import（尤其 `CommandInvocation`）。`isPrintOnlyForm` 與 `isAllPrintOnly` **保留在 print_only.ts**、改用 import 的三判定。**不在 Task 2 import `hasFileOperand`/`isHeredocPrintEligible`**（Task 5/6 需要時才 import，避免此刻 lint 報未使用）。確認無重複定義（否則 `deno check` 重複宣告錯誤）。
 
 - [ ] **Step 6: 跑測試（新測試 + 既有 print_only 回歸全綠）**
 
@@ -1077,6 +1080,7 @@ Deno.test("leafCarrier: 直譯器 heredoc-stdin（B）", () => {
   assertEquals(lc(`node`), null);
   assertEquals(lc(`node < real.js`), null);                                 // fd0 為檔案 → 非靜態 heredoc
   assertEquals(lc(`python < f.py`), null);
+  assertEquals(lc(`node <<EOF\n$(ls)\nEOF`), null);                          // 未引號 $() body → 不可具體還原 → 非載具
   assertEquals(lc(`bun run - <<'EOF'\nconsole.log("x")\nEOF`), null);        // bun run - 不特案
 });
 
@@ -1118,10 +1122,10 @@ import type { CommandInvocation } from "../types.ts";
 import type { Word } from "../deps.ts";
 import { staticValue } from "./word.ts";
 import { payloadIsAllStaticPrint, printExprIsStaticString, type Lang } from "./interp_payload.ts";
-import { isHeredocPrintEligible } from "./static_output.ts";
+import { heredocStdinText } from "./static_output.ts";
 ```
 
-> 把此處 `./static_output.ts` 的 `isHeredocPrintEligible` 與 Task 2 已加的 `./static_output.ts` import（`isCatPassthrough`/`isEchoPrintOnly`/`isPrintfPrintOnly`）**合併成同一行 import**，避免同模組重複 import。
+> 把此處 `./static_output.ts` 的 `heredocStdinText` 與 Task 2 已加的 `./static_output.ts` import（`isCatPassthrough`/`isEchoPrintOnly`/`isPrintfPrintOnly`）**合併成同一行 import**，避免同模組重複 import。
 
 新增：
 
@@ -1225,20 +1229,8 @@ export function recognizeInterpreter(inv: CommandInvocation): { lang: Lang; form
   return mode === "eval" ? { lang, form: { kind: "none" } } : { lang, form: { kind: "stdin" } };
 }
 
-/** 直譯器葉 fd0 靜態 heredoc/here-string body；否則 null。 */
-function interpStdinBody(inv: CommandInvocation): string | null {
-  const fd0 = inv.redirects.filter((r) =>
-    (r.operator === "<" || r.operator === "<<" || r.operator === "<<-" ||
-      r.operator === "<<<" || r.operator === "<&") &&
-    (r.fileDescriptor === undefined || r.fileDescriptor === 0)
-  );
-  if (fd0.length === 0) return null;
-  const eff = fd0[fd0.length - 1];
-  if (eff.operator === "<<<") return eff.target ? staticValue(eff.target) : "";
-  if (eff.operator !== "<<" && eff.operator !== "<<-") return null;
-  if (!isHeredocPrintEligible(eff)) return null;
-  return eff.content ?? "";
-}
+// 直譯器葉 fd0 的靜態 heredoc/here-string 文字沿用 static_output 的 heredocStdinText（同一還原規則：
+// isHeredocPrintEligible 合格判定、`<<<` 補換行、`<<-` 去 tab、結構化 body（含 $()）→ null）。
 
 /** 直譯器葉的 stdout 是否被 fd1 重導向轉走（→ 非「印到 stdout」吐字，不算載具）。 */
 function interpStdoutDiverted(inv: CommandInvocation): boolean {
@@ -1259,7 +1251,7 @@ export function leafCarrier(inv: CommandInvocation): "shell" | "interp" | null {
   if (r.form.kind === "inline") return payloadIsAllStaticPrint(r.form.payload, r.lang) ? "interp" : null;
   if (r.form.kind === "print-expr") return printExprIsStaticString(r.form.expr, r.lang) ? "interp" : null;
   if (r.form.kind === "stdin") {
-    const body = interpStdinBody(inv);
+    const body = heredocStdinText(inv.redirects);
     return body !== null && payloadIsAllStaticPrint(body, r.lang) ? "interp" : null;
   }
   return null;
@@ -1347,10 +1339,11 @@ Deno.test("printDisguiseDeny: WRITE→EXEC(b) cat 讀回", () => {
 });
 
 Deno.test("printDisguiseDeny: setup 豁免 / false / ! true", () => {
-  assertEquals(pd(`mkdir -p /tmp && cat > x <<'EOF'\nconsole.log("f")\nEOF\n && node x`), "write-exec");
+  // heredoc 之後以換行分隔下一指令（`&&` 接在 heredoc 終止行後非法；換行序列同樣傳遞 prevWrite）
+  assertEquals(pd(`mkdir -p /tmp && cat > x <<'EOF'\nconsole.log("f")\nEOF\nnode x`), "write-exec");
   assertEquals(pd(`cd /tmp; cat > x <<'EOF'\nconsole.log("f")\nEOF\nnode x`), "write-exec");
-  assertEquals(pd("false && cat > x && node x"), null);
-  assertEquals(pd(`! true && cat > x <<'EOF'\nconsole.log("f")\nEOF\n && node x`), null);
+  assertEquals(pd("false && cat > x && node x"), null);              // false 非 setup/載具 → (a) 失敗
+  assertEquals(pd(`! true\ncat > x <<'EOF'\nconsole.log("f")\nEOF\nnode x`), null); // 否定 true 為非載具葉 → (a) 失敗
 });
 
 Deno.test("printDisguiseDeny: pipe（D）", () => {
@@ -1360,6 +1353,7 @@ Deno.test("printDisguiseDeny: pipe（D）", () => {
   assertEquals(pd("echo 'console.log(1)' | node < real.js"), null);   // fd0 蓋過
   assertEquals(pd("node"), null);
   assertEquals(pd("echo 'console.log(1)' | node &"), null);           // 背景 → 跳過 pipe
+  assertEquals(pd("{ echo 'console.log(1)' | node; } &"), null);      // 背景複合 → 內層 pipe 亦跳過
   assertEquals(pd("{ echo a | echo b; } > out"), null);               // 整體重導向 → 葉非載具（不誤 deny）
 });
 
@@ -1374,7 +1368,7 @@ Deno.test("printDisguiseDeny: 直譯器輸出被轉走 → 非載具、不 deny"
 });
 ```
 
-> 註：setup 案例的 `EOF\n && node x` 內含 heredoc 終止行後接 `&&`；若 unbash 對某寫法解析不如預期，改為單行 `&&` 連接（如 `mkdir -p /tmp && cat > x <<'EOF'…EOF && node x` 但 heredoc 需自成行）。以 `parseCommand(...).errors.length === 0` 為前提；解析失敗的 fixture 應改寫。
+> 註：所有 fixture 均以 `parseCommand(...).errors.length === 0` 為前提；heredoc 之後接續指令一律用**換行序列**（`;`/newline，seq 會跨換行傳遞 `prevWrite`），不要在 heredoc 終止行後放 `&&`（bash 語法上非法）。
 
 - [ ] **Step 2: 跑測試確認失敗**
 
@@ -1422,13 +1416,14 @@ export function printDisguiseDeny(script: Script, initialCwd: CwdState): { kind:
   let hasWriteExecComposite = false;
 
   // 序列：thread cwd + prevWrite；` ` / `;` / `&&` 連接的 sibling 傳遞 prev；背景/控制流重置。
-  const seq = (statements: Statement[], startCwd: CwdState, inherited: Redirect[], persistent: boolean): CwdState => {
+  // bg：外層是否處於背景（`&`/coproc）——背景時整個子序列停用 pipe 配對、不傳 adjacency。
+  const seq = (statements: Statement[], startCwd: CwdState, inherited: Redirect[], persistent: boolean, bg: boolean): CwdState => {
     let cwd = startCwd;
     let prev: WriteRef | null = null;
     for (const stmt of statements) {
       for (const r of stmt.redirects) enumRedirect(r, cwd);        // 繼承 heredoc 內 $()
       const merged = [...inherited, ...stmt.redirects];
-      if (stmt.background === true) {
+      if (bg || stmt.background === true) {
         node(stmt.command, cwd, merged, false, true, null);        // 背景：不參與 adjacency、跳過 pipe 配對
         prev = null;
         continue;
@@ -1470,37 +1465,37 @@ export function printDisguiseDeny(script: Script, initialCwd: CwdState): { kind:
         return { cwd, prev: null };
       }
       case "Subshell":
-        seq(n.body.commands, cwd, inherited, false);
+        seq(n.body.commands, cwd, inherited, false, bg);
         return { cwd, prev: null };
       case "BraceGroup":
-        return { cwd: seq(n.body.commands, cwd, inherited, true), prev: null };
+        return { cwd: seq(n.body.commands, cwd, inherited, true, bg), prev: null };
       case "CompoundList":
-        return { cwd: seq((n as CompoundList).commands, cwd, inherited, true), prev: null };
+        return { cwd: seq((n as CompoundList).commands, cwd, inherited, true, bg), prev: null };
       case "If":
-        seq(n.clause.commands, cwd, inherited, false);
-        seq(n.then.commands, cwd, inherited, false);
-        if (n.else) n.else.type === "If" ? node(n.else, cwd, inherited, false, false, null) : seq(n.else.commands, cwd, inherited, false);
+        seq(n.clause.commands, cwd, inherited, false, bg);
+        seq(n.then.commands, cwd, inherited, false, bg);
+        if (n.else) n.else.type === "If" ? node(n.else, cwd, inherited, false, bg, null) : seq(n.else.commands, cwd, inherited, false, bg);
         return { cwd: afterControlFlow(cwd, n), prev: null };
       case "For":
       case "Select":
         for (const w of n.wordlist) descendWord(w, cwd);
-        seq(n.body.commands, cwd, inherited, false);
+        seq(n.body.commands, cwd, inherited, false, bg);
         return { cwd: afterControlFlow(cwd, n), prev: null };
       case "While":
-        seq(n.clause.commands, cwd, inherited, false);
-        seq(n.body.commands, cwd, inherited, false);
+        seq(n.clause.commands, cwd, inherited, false, bg);
+        seq(n.body.commands, cwd, inherited, false, bg);
         return { cwd: afterControlFlow(cwd, n), prev: null };
       case "ArithmeticFor":
         descendArith(n.initialize, cwd);
         descendArith(n.test, cwd);
         descendArith(n.update, cwd);
-        seq(n.body.commands, cwd, inherited, false);
+        seq(n.body.commands, cwd, inherited, false, bg);
         return { cwd: afterControlFlow(cwd, n), prev: null };
       case "Case":
         descendWord(n.word, cwd);
         for (const it of n.items) {
           for (const p of it.pattern) descendWord(p, cwd);
-          seq(it.body.commands, cwd, inherited, false);
+          seq(it.body.commands, cwd, inherited, false, bg);
         }
         return { cwd: afterControlFlow(cwd, n), prev: null };
       case "ArithmeticCommand":
@@ -1512,7 +1507,7 @@ export function printDisguiseDeny(script: Script, initialCwd: CwdState): { kind:
       case "Coproc":
         if (n.name) descendWord(n.name, cwd);
         for (const r of n.redirects) enumRedirect(r, cwd);
-        node(n.body, cwd, [...inherited, ...n.redirects], false, false, null);
+        node(n.body, cwd, [...inherited, ...n.redirects], false, true, null);   // coproc 非同步 → 跳過 pipe 配對
         return { cwd, prev: null };
       case "Statement": {
         const st = n as Statement;
@@ -1555,7 +1550,7 @@ export function printDisguiseDeny(script: Script, initialCwd: CwdState): { kind:
     for (const m of members) node(m, cwd, inherited, pl.negated === true, bg, null);
   };
 
-  seq(script.commands, initialCwd, [], true);
+  seq(script.commands, initialCwd, [], true, false);
 
   // 階段 2
   if (leaves.length === 0) return null;
@@ -1636,7 +1631,7 @@ export function printDisguiseDeny(script: Script, initialCwd: CwdState): { kind:
   }
   function descendPart(part: WordPart, cwd: CwdState): void {
     if ((part.type === "CommandExpansion" || part.type === "ProcessSubstitution") && part.script) {
-      seq(part.script.commands, cwd, [], false);   // 內層葉（prev/cwd 不外洩）
+      seq(part.script.commands, cwd, [], false, false);   // 內層葉（prev/cwd 不外洩）
     } else if (part.type === "ArithmeticExpansion") {
       descendArith(part.expression, cwd);
     } else if (part.type === "DoubleQuoted" || part.type === "LocaleString") {
@@ -1646,7 +1641,7 @@ export function printDisguiseDeny(script: Script, initialCwd: CwdState): { kind:
   function descendArith(expr: ArithmeticExpression | undefined, cwd: CwdState): void {
     if (!expr) return;
     switch (expr.type) {
-      case "ArithmeticCommandExpansion": if (expr.script) seq(expr.script.commands, cwd, [], false); return;
+      case "ArithmeticCommandExpansion": if (expr.script) seq(expr.script.commands, cwd, [], false, false); return;
       case "ArithmeticBinary": descendArith(expr.left, cwd); descendArith(expr.right, cwd); return;
       case "ArithmeticUnary": descendArith(expr.operand, cwd); return;
       case "ArithmeticTernary": descendArith(expr.test, cwd); descendArith(expr.consequent, cwd); descendArith(expr.alternate, cwd); return;
@@ -2028,6 +2023,7 @@ git commit -m "test(e2e): unupgradeable deny (settings fixture) + migration + no
 - 「## 架構（評估管線）」段的管線圖：改為 `parse → walk → 閘① sleep → 閘② 名稱重定義 → no-op → 閘③ printDisguiseDeny → classify → combine`；`engine/` 檔案清單補 `static_output.ts`、`interp_payload.ts`，並更新 `print_only.ts` 職責描述（載具框架＋`printDisguiseDeny`）、`walk.ts` 補兩 helper。
 - 「## 核心不變量」段：deny 由三類改四類；閘②③ classify 前返回、不可由 `permissions.allow` 升級。
 - 「### hook 決策 vs settings.json 權限的優先序」與「已接受繞道」段：`node`/`python`/`deno`/`bun`/`ts-node` 的裸 all-static-print 改硬 deny；混載具全 print 改 deny；`ls; echo 假`/`ls; node -e print` 洗白維持不 deny（使用者定案）；函式定義＋alias 類 → deny（取代函式遮蔽 ask）；其他 mutator（`hash`/`enable`/`PATH`/`source`）out-of-scope。**兩處 accepted over-deny 明列**：(1) 名稱重定義（函式/alias），(2) cat 讀回兩步偽裝（`cat > x <<EOF…EOF; cat x` 由寫入重導向 ask 改硬 deny）。
+- **「## 指令」段的測試指令**：`deno task test` 註記改為「已含 `--allow-run --allow-env --allow-read --allow-write --allow-sys=uid`」（Task 8 已在 `deno.json` 加 `--allow-write`，e2e 建臨時檔需要）；若有列出單獨跑 `main_test.ts` 的指令，同步補 `--allow-write`。
 
 （就地融入既有章節，不新增重複章節。）
 
@@ -2092,8 +2088,9 @@ for f, cmd in [(f"{PROJ}/x.mjs", f'cat > {PROJ}/x.mjs <<\'EOF\'\nconsole.log("f"
     ok = ok and good
 sys.exit(0 if ok else 1)
 PY
-echo "exit=$?  (0 = 全部 OK)"
+status=$?
 rm -rf "$PROJ"
+echo "exit=$status  (0 = 全部 OK)"
 ```
 所有行印 `[OK]` 且 `exit=0`。任何 `[FAIL]` 即 regression，回對應 Task 修正後重跑。
 
