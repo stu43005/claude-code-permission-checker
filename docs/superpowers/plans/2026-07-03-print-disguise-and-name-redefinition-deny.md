@@ -1352,6 +1352,7 @@ Deno.test("printDisguiseDeny: pipe（D）", () => {
   assertEquals(pd("grep x f | node"), null);
   assertEquals(pd("echo a | cat | node"), null);                      // 三段 → 不配對
   assertEquals(pd("echo 'console.log(1)' | node < real.js"), null);   // fd0 蓋過
+  assertEquals(pd("echo 'console.log(1)' | node > out"), null);       // 消費端 stdout 轉走
   assertEquals(pd("node"), null);
   assertEquals(pd("echo 'console.log(1)' | node &"), null);           // 背景 → 跳過 pipe
   assertEquals(pd("{ echo 'console.log(1)' | node; } &"), null);      // 背景複合 → 內層 pipe 亦跳過
@@ -1539,7 +1540,8 @@ export function printDisguiseDeny(script: Script, initialCwd: CwdState): { kind:
         const consInv = toInv(cons, cwd, []);
         const source = producerStdout(prod);
         const r = recognizeInterpreter(consInv);
-        const clean = consInv.assignments.length === 0 && r !== null && r.form.kind === "stdin" && !hasFd0Override(consInv);
+        const clean = consInv.assignments.length === 0 && r !== null && r.form.kind === "stdin" &&
+          !hasFd0Override(consInv) && !interpStdoutDiverted(consInv);   // 消費端 stdout 亦不可被轉走
         if (source !== null && clean && payloadIsAllStaticPrint(source, r.lang)) {
           leaves.push({ inv: toInv(prod, cwd, []), cmd: prod, role: "pipe", carrier: null });
           leaves.push({ inv: consInv, cmd: cons, role: "pipe", carrier: null });
