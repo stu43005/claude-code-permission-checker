@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## 這是什麼
 
 一個 Claude Code `PreToolUse`（matcher: `Bash`）hook：用 Deno 寫、`deno compile` 成單一執行檔。
-解析 Bash 指令，只在「純唯讀且全部落在當前專案內」時回 `allow`，其餘回 `ask`。**對以下三類情形回 `deny`（硬性、不可由 `permissions.allow` 解除）：① 遞迴遍歷磁碟根/家目錄根的唯讀指令；② 整鏈 print-only 偽裝（echo/printf/heredoc 靜態輸出，未讀檔/未計算）；③ sleep 輪詢等待。其餘一律維持 `allow` / `ask`、不回 `deny`。**
+解析 Bash 指令，只在「純唯讀且全部落在當前專案內」時回 `allow`，其餘回 `ask`。**對以下四類情形回 `deny`（硬性、不可由 `permissions.allow` 解除）：① 遞迴遍歷磁碟根/家目錄根的唯讀指令；② 整鏈 print-only 偽裝（echo/printf/heredoc 靜態輸出，或跨載具純靜態輸出如 `node -e 'console.log("x")'`，未讀檔/未計算）；③ sleep 輪詢等待；④ 名稱重定義（shell 函式定義、`alias` 類）。其餘一律維持 `allow` / `ask`、不回 `deny`。**
 從 stdin 收 hook JSON、往 stdout 寫 decision JSON、**永遠 `exit 0`**。
 
 此外，會在 runtime 讀取使用者的 `permissions.allow`：對**可升級 ask**（未列入 allowlist、或指令規則自身的
@@ -16,7 +16,7 @@ settings.json 權限的優先序」）。
 ## 指令
 
 ```bash
-deno task test     # 單元 + 整合測試（已含 --allow-run --allow-env --allow-read，e2e 子行程測試需要）
+deno task test     # 單元 + 整合測試（已含 --allow-run --allow-env --allow-read --allow-write --allow-sys=uid，e2e 子行程測試需要）
 deno task check    # 型別檢查
 deno task lint
 deno task build    # 產出 dist/permission-checker(.exe)；dist/ 已 gitignore，不入版控
@@ -25,7 +25,7 @@ deno task build    # 產出 dist/permission-checker(.exe)；dist/ 已 gitignore�
 - 跑單一測試檔：`deno test --allow-env src/engine/scope_test.ts`
 - 跑單一測試：`deno test --allow-env --filter "isWithin" src/engine/scope_test.ts`
 - **`main_test.ts` 是子行程 e2e 測試**，單獨跑時要帶完整權限：
-  `deno test --allow-run --allow-env --allow-read src/main_test.ts`
+  `deno test --allow-run --allow-env --allow-read --allow-write --allow-sys=uid src/main_test.ts`
 
 **Operational verification（改規則後務必做）**：`deno task build` 後直接餵 JSON 給 binary 驗證真實行為，
 不要只信單元測試：
@@ -50,22 +50,20 @@ operational verification 會讀取真實的 settings.json（含使用者 `<confi
 `evaluate(…, rules)`：
 
 ```
-parse.ts (unbash)  →  walk.ts  →  evaluate 三閘  →  classify.ts (每指令)  →  combine.ts (最弱環節)
-   解析成 AST        攤平成      ①sleep→deny         中央前置檢查 +            任一 deny → 整體 deny；否則任一 ask → 整體 ask
-   errors → ask     CommandInvocation[]  ②整鏈 print-only→deny   allowlist rule
-                    (含 redirect.body     ③函式遮蔽→ask
-                     列舉 + definedFunctionNames)
+parse.ts (unbash) → walk.ts → 閘① sleep → 閘② 名稱重定義 → no-op → 閘③ printDisguiseDeny → classify.ts (每指令) → combine.ts (最弱環節)
+   解析成 AST       攤平成     deny         deny            allow   deny                 中央前置檢查 + allowlist rule   任一 deny → 整體 deny；否則任一 ask → 整體 ask
+   errors → ask    CommandInvocation[]
+                   (含 redirect.body 列舉 + hasExecutableFunctionDefinition / hasAliasRedefinition)
 ```
 
 - **`walk.ts`** 把 AST 攤平成 `CommandInvocation[]`，每個葉指令一筆。負責：穿透 cwd（`cd` 在
   `&&`/`BraceGroup` 持久、subshell/pipeline 不持久、控制流含 cd → 之後標 unknown）、列舉
   command substitution `$(…)` 內層指令、把 Statement / 複合結構的重導向繼承給內部指令、對 `git`
   套用 `gitEffectiveCwd`（`-C`/`--git-dir`/`--work-tree`/`-c core.worktree`）。同時列舉 heredoc `redirect.body`
-  中的 command substitution（`$(…)` 展開），以及收集 `definedFunctionNames`（函式定義遮蔽偵測）。
-- **`print_only.ts`** 提供 `isAllPrintOnly(invocations)`：判定整鏈是否每個葉指令皆為「靜態吐字」形態
-  （`echo` / `printf` 靜態輸出，及 `cat`·`tac` 的 heredoc/here-string passthrough）。若是，`evaluate` 閘②
-  回整鏈 deny。注意：`true`/`false`/`:` 等並非 print 形態（鏈中出現即非整鏈 print → 不 deny，落該指令既有判定）；
-  函式遮蔽偵測是 evaluate 閘③ 獨立呼叫 `walk.ts` 的 `definedFunctionNames(script)`，**非** `isAllPrintOnly` 的參數。
+  中的 command substitution（`$(…)` 展開），以及提供名稱重定義偵測 helper：`hasExecutableFunctionDefinition(script)`（shell 函式定義）、`hasAliasRedefinition(invocations)`（alias 類），供 evaluate 閘② 呼叫。
+- **`print_only.ts`** 是「載具框架 ＋ `printDisguiseDeny`」的主入口。`isAllPrintOnly(invocations)` 供既有測試沿用；`leafCarrier(inv)` 識別葉載具（`"shell"` 為 echo/printf/cat·tac heredoc 靜態吐字、`"interp"` 為 node/python/deno/bun/ts-node 裸 all-static-print）；`printDisguiseDeny(script, cwd)` 為 evaluate 閘③ 呼叫的聚合入口，匹配多種 print 偽裝形態（shell-print、interp-inline、write-exec、cat-readback、pipe），命中回 `{ kind }` → deny。依賴 `static_output.ts` 與 `interp_payload.ts`。
+- **`static_output.ts`** 提供 shell 指令靜態輸出工具：`isEchoPrintOnly`/`isPrintfPrintOnly`/`isCatPassthrough`（葉 print 形態判斷）、`producerStdout`（pipeline 生產端靜態文字萃取）、`writtenContent`（重導向寫入內容萃取），供 `print_only.ts` 使用。
+- **`interp_payload.ts`** 提供直譯器 payload 靜態 print 判斷：`payloadIsAllStaticPrint(payload, lang)` 判定 JS/Python payload 是否整段僅含靜態 print 輸出；`printExprIsStaticString(expr, lang)` 判定 `-p` 表達式是否為靜態字串。
 - **`classify.ts`** 單一有序流程：① `name` 為 null（動態）→ 不可升級 ask；② 評估指令規則，其硬 `deny`
   （遞迴遍歷磁碟根/家目錄根）最優先短路、不經中央前置與升級層；③ **四條中央前置規則**（見下）對
   **所有指令**（含未列入 allowlist 者）通用、命中即回**不可升級** ask；④ 可升級 ask（未列入 allowlist、
@@ -106,7 +104,7 @@ parse.ts (unbash)  →  walk.ts  →  evaluate 三閘  →  classify.ts (每指�
 ## 核心不變量（改動時不可違反）
 
 - **default-deny**：未明確判定為安全唯讀的一律 ask。新增指令規則時，未涵蓋的形式必須 fallback 到 ask。
-- **deny 三類**：① 遞迴遍歷磁碟根/家目錄根（find/tree/ls -R/grep -r/rg）；② 整鏈 print-only 偽裝（evaluate 閘②）；③ sleep 輪詢等待（evaluate 閘①）。三閘皆在 `classify` 前短路、不過 `settingsAllows`，不可由 `permissions.allow` 解除。verdict 三態優先序 `deny > ask > allow`。**永遠 `exit 0`**；任何例外都 try/catch 成 ask（fail-safe）。
+- **deny 四類**：① 遞迴遍歷磁碟根/家目錄根（find/tree/ls -R/grep -r/rg）；② 整鏈 print-only 偽裝＋跨載具（evaluate 閘③）；③ sleep 輪詢等待（evaluate 閘①）；④ 名稱重定義（shell 函式定義、alias 類，evaluate 閘②）。閘①②③ 皆在 `classify` 前短路、不過 `settingsAllows`，不可由 `permissions.allow` 解除；其中閘②③ 亦不可由 `permissions.allow` 升級。verdict 三態優先序 `deny > ask > allow`。**永遠 `exit 0`**；任何例外都 try/catch 成 ask（fail-safe）。
 - **deny 為硬性**：`classify` 對 builtin `deny` 短路，**不經** `permissions.allow` 升級層（升級層只把 `ask`
   變 `allow`，永遠碰不到 `deny`）。`classify` 先評估指令規則：其硬 deny 優先於任何中央前置 ask。**四條中央
   前置 ask 亦為硬性**——對所有指令通用、命中即不可升級（升級層只套用於「未列入 allowlist」與「指令規則
@@ -209,7 +207,7 @@ parse.ts (unbash)  →  walk.ts  →  evaluate 三閘  →  classify.ts (每指�
   等會匹配一切的空 prefix、以及無法可靠解析的 pattern 一律不升級（維持 default-deny）。
 - 讀取來源：專案 `.claude/settings.json`、`.claude/settings.local.json`、使用者 `<configDir>/settings.json`
   （**不含** enterprise managed-settings）。讀檔失敗一律 fail-safe 退化為「無此來源規則」。
-- **print-only / sleep 兩類硬 deny 不可由 `permissions.allow` 解除**：三閘在 `classify` 前短路，升級層永遠碰不到。
+- **print-only / 名稱重定義 / sleep 三類 evaluate 硬 deny 不可由 `permissions.allow` 解除**：閘①②③ 在 `classify` 前短路，升級層永遠碰不到。
 
 **升級層執行檔路徑正規化（union raw+canon，比官方寬）**：`settingsAllows` 比對前，指令與 pattern 各保留
 原始（raw）與正規化（canon）兩種形式，命中 ⟺ `(rawCmd vs rawPat) ∨ (canonCmd vs canonPat)`，deny/ask/allow
@@ -221,16 +219,20 @@ token** 做純詞法處理：展開 `~`/`~/`（home 已知時）、折疊中段 
 （deny 對稱）；exec+argv 去引號扁平化屬 `reconstructCommand` 既有性質、由 deny 對稱守護。官方 Claude Code 對
 Bash 不做此正規化，此為本 hook 刻意的加值層。
 
-以下兩種性質不同的「已接受繞道」需分開記錄：
+以下三種性質不同的「已接受繞道」需分開記錄：
 
 **預設 ask、可由使用者自設廣域 `Bash(...)` 升級為 allow（使用者自負）**：
-- 巢狀直譯器（`bash -c`/`eval`/`python -c`/`perl -e`）
+- 巢狀直譯器（`bash -c`/`eval`/`python -c`/`perl -e` 含實際計算）——注意：`node`/`python`/`deno`/`bun`/`ts-node` 的裸 all-static-print（整個指令僅輸出靜態字串，如 `node -e 'console.log("x")'`）現為閘③ 硬 deny，不可由此升級；混載具全 print 同。
 - exec wrapper（`command`/`env`/`nice`/`nohup`/`timeout`）
 - 等價等待原語（`read -t`、`python -c 'time.sleep(...)'`）
 - `tail -f`（現為 ask，可由 `Bash(tail *)` 升級）
 
-**「整鏈 print」洗白繞道**（`pwd; echo 假`、`true && echo 已驗證`、`cat README.md; printf 假`）：
-因鏈中有真實 / no-op 指令而**非全鏈 print**，故**不 deny**，落該真實指令的既有判定（可能是 `allow` 或 `ask`，**非**「預設 ask + 升級」那一類）。此為使用者明確選擇維持乾淨結構規則、零誤殺的取捨。
+**「整鏈 print」洗白繞道**（`ls; echo 假`、`pwd; echo 已驗證`、`ls; node -e 'console.log("done")'`）：
+因鏈中有真實指令（`ls`/`pwd` 等）而**非全鏈 print-carrier**，故**不 deny**，落該真實指令的既有判定（可能是 `allow` 或 `ask`，**非**「預設 ask + 升級」那一類）。此為使用者明確選擇維持乾淨結構規則、零誤殺的取捨。`hash`/`enable`/`PATH` 賦值/`source` 等其他 mutator out-of-scope：尚不偵測，預設 ask 保住安全底線。
+
+**已接受 over-deny（安全方向的誤殺，設計決策）**：
+1. **名稱重定義**（函式/alias）：即使是無害的函式定義，一律閘② deny。要執行 shell 函式直接寫成 `.sh` 腳本檔，讓 Write/Bash tool 分開處理。
+2. **cat 讀回兩步偽裝**（`cat > x <<'EOF'…EOF; cat x`）：cat-readback 模式偵測後由閘③ 硬 deny；寫入重導向本已中央前置 ask 攔截，現在讀回執行的整體形態再提升為 deny。
 
 此外，本檢查器也沿用 `permissions.{allow,deny,ask}` 中的 `Read()/Edit()/Write()` 規則放寬「讀取位置」：
 凡純唯讀指令（allowlist 內）其路徑落在使用者以這些規則 allow 宣告、且未被 deny/ask 否決的外部目錄／
