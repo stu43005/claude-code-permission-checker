@@ -95,10 +95,14 @@ Deno.test("payloadIsAllStaticPrint: js 不命中", () => {
   f('console.log(r"x")');                    // js 無 r 前綴 → r 為識別字 → 非法
   f('console.log("a")console.log("b")');     // 兩敘述無分隔符 → 非法
   f('console.log(0x)');                       // 基底前綴無數字 → 非法
+  f('console.log(0b2)');                       // 二進位含 2 → 非法
+  f('console.log(0o9)');                       // 八進位含 9 → 非法
 });
 
-Deno.test("payloadIsAllStaticPrint: py 不吃 js-only 數字形式", () => {
-  assertEquals(payloadIsAllStaticPrint('print(1n)', "py"), false);   // BigInt 僅 js
+Deno.test("payloadIsAllStaticPrint: py 邊界（前綴需緊鄰、單行、無 js 專屬形式）", () => {
+  assertEquals(payloadIsAllStaticPrint('print(1n)', "py"), false);     // BigInt 僅 js
+  assertEquals(payloadIsAllStaticPrint('print(r "x")', "py"), false);  // 前綴與引號間有空白 → 非法
+  assertEquals(payloadIsAllStaticPrint('print("a\nb")', "py"), false); // 非三引號字串跨行 → 非法
 });
 
 Deno.test("payloadIsAllStaticPrint: py", () => {
@@ -209,10 +213,12 @@ function tokenize(src: string, lang: Lang): Tok[] | null {
     if (DIGIT.test(c) || (c === "." && DIGIT.test(src[i + 1] ?? ""))) {
       let j = i;
       if (src[j] === "0" && /[xXoObB]/.test(src[j + 1] ?? "")) {
+        const base = src[j + 1].toLowerCase();
+        const cls = base === "x" ? /[0-9a-fA-F_]/ : base === "o" ? /[0-7_]/ : /[01_]/;  // 依基底限定數字
         j += 2;
         const s = j;
-        while (j < n && /[0-9a-fA-F_]/.test(src[j])) j++;   // 0x/0o/0b
-        if (j === s) return null;                          // 基底前綴後無數字 → 非法 → 保守 false
+        while (j < n && cls.test(src[j])) j++;
+        if (j === s) return null;                          // 基底前綴後無合法數字（0x_/0b2/0o9）→ 非法
       } else {
         while (j < n && /[0-9_]/.test(src[j])) j++;         // 整數部
         if (src[j] === ".") { j++; while (j < n && /[0-9_]/.test(src[j])) j++; } // 小數
@@ -230,7 +236,16 @@ function tokenize(src: string, lang: Lang): Tok[] | null {
     if (NAME_START.test(c)) {
       let j = i + 1;
       while (j < n && (NAME_CONT.test(src[j]) || (src[j] === "." && NAME_CONT.test(src[j + 1] ?? "")))) j++;
-      push({ kind: "NAME", value: src.slice(i, j) });
+      const nameVal = src.slice(i, j);
+      // py 字串前綴：**必須緊鄰引號、無空白**（`f"…"` / `r'…'`）。f → DYNAMIC；r/b → STRING。
+      if (lang === "py" && /^(f|F|r|b|rb|br|R|B)$/.test(nameVal) && (src[j] === '"' || src[j] === "'")) {
+        const rr = readString(src, j, lang);
+        if (rr === null) return null;
+        push({ kind: /^[fF]$/.test(nameVal) ? "DYNAMIC" : "STRING", value: "" });
+        i = rr.next;
+        continue;
+      }
+      push({ kind: "NAME", value: nameVal });
       i = j;
       continue;
     }
@@ -270,31 +285,10 @@ function readString(src: string, start: number, lang: Lang): { next: number; dyn
   while (i < n) {
     if (src[i] === "\\") { i += 2; continue; }
     if (src[i] === quote) return { next: i + 1, dynamic: false };
-    if (src[i] === "\n" && lang === "js") return null;
+    if (src[i] === "\n") return null;   // 一般（非三引號）字串不可跨行（js/py 皆然）
     i++;
   }
   return null;
-}
-
-// 修正字串前綴（**僅 py**）：f-string → DYNAMIC；r/b 前綴 → 保留 STRING。js 無此語法、原樣返回。
-function applyStringPrefixes(toks: Tok[], lang: Lang): Tok[] {
-  if (lang !== "py") return toks;
-  const out: Tok[] = [];
-  for (let k = 0; k < toks.length; k++) {
-    const t = toks[k];
-    if (t.kind === "NAME" && /^[fF]$/.test(t.value) && toks[k + 1]?.kind === "STRING") {
-      out.push({ kind: "DYNAMIC", value: "" });
-      k++;
-      continue;
-    }
-    if (t.kind === "NAME" && /^(r|b|rb|br|R|B)$/.test(t.value) && toks[k + 1]?.kind === "STRING") {
-      out.push(toks[k + 1]);
-      k++;
-      continue;
-    }
-    out.push(t);
-  }
-  return out;
 }
 
 // 消費一個 ARG：STRING，或（僅文字輸出 API）選擇性 SIGN + NUMBER。回下一個索引或 -1（不合法）。
@@ -314,7 +308,7 @@ export function payloadIsAllStaticPrint(source: string, lang: Lang): boolean {
   if (byteLen(source) > MAX_PAYLOAD_BYTES) return false;
   const raw = tokenize(source, lang);
   if (raw === null) return false;
-  const toks = applyStringPrefixes(raw, lang);
+  const toks = raw;   // 前綴/模板動態性已於 tokenize 處理
   const textFns = TEXT_PRINT_FNS[lang];
   const writeFns = WRITE_PRINT_FNS[lang];
 
@@ -356,7 +350,7 @@ export function printExprIsStaticString(source: string, lang: Lang): boolean {
   if (byteLen(source) > MAX_PAYLOAD_BYTES) return false;
   const raw = tokenize(source, lang);
   if (raw === null) return false;
-  const toks = applyStringPrefixes(raw, lang);
+  const toks = raw;   // 前綴/模板動態性已於 tokenize 處理
   if (toks.length === 0) return false;
   let i = 0;
   if (toks[i]?.kind !== "STRING") return false;
@@ -411,11 +405,14 @@ function cmd(src: string): Command {
   return parse(src).commands[0].command as Command;
 }
 
-Deno.test("echoText: 靜態 → 字串；動態/carve-out → null", () => {
+Deno.test("echoText: 靜態 → 字串；動態/carve-out/~展開 → null", () => {
   assertEquals(echoText(cmd("echo hello world")), "hello world\n");
   assertEquals(echoText(cmd("echo -n hi")), "hi");
   assertEquals(echoText(cmd('echo "$VAR"')), null);
   assertEquals(echoText(cmd('echo -e "a\\tb"')), null);   // -e + 反斜線 → 探測 carve-out
+  assertEquals(echoText(cmd("echo ~")), null);            // ~ 家目錄展開 → 非靜態
+  assertEquals(printfText(cmd("printf '%s\\n' ~")), null);
+  assertEquals(catTacText(cmd("cat <<<~")), null);        // here-string ~ 展開 → 非靜態
 });
 
 Deno.test("printfText: 裸 %s/%b → 還原；數值/帶寬度轉換 → null", () => {
@@ -590,6 +587,7 @@ export function echoText(cmd: Command): string | null {
   const parts: string[] = [];
   let seenOperand = false;
   for (const w of c.argv) {
+    if (!wordPrintEligible(w)) return null;   // 排除 ~ 展開 / glob / 變數等（非靜態吐字）
     const v = staticValue(w);
     if (v === null) return null;
     if (!seenOperand && /^-[neE]+$/.test(v)) {
@@ -611,6 +609,7 @@ export function echoText(cmd: Command): string | null {
 export function printfText(cmd: Command): string | null {
   const c = inv(cmd);
   if (c.name !== "printf") return null;
+  if (c.argv.some((w) => !wordPrintEligible(w))) return null;   // 排除 ~ / glob / 變數
   const vals = c.argv.map((w) => staticValue(w));
   if (vals.some((v) => v === null)) return null;
   const args = vals as string[];
@@ -677,21 +676,17 @@ function effectiveHeredocBody(redirects: Redirect[]): string | null {
   );
   if (fd0.length === 0) return null;
   const eff = fd0[fd0.length - 1];
-  // here-string（`<<<`）：bash 於內容後補一個換行；靜態才還原（含 $() 的 target → staticValue 為 null）。
+  if (!isHeredocPrintEligible(eff)) return null;    // 沿用既有合格判定（擋 ~/glob/變數/含 $ 的 content）
+  // here-string（`<<<`）：bash 於內容後補一個換行。
   if (eff.operator === "<<<") {
     const s = eff.target ? staticValue(eff.target) : "";
     return s === null ? null : s + "\n";
   }
   if (eff.operator !== "<<" && eff.operator !== "<<-") return null;
-  // 只還原「可具體確定」的 body：引號 heredoc（不展開）或純文字（無 $/反引號）；
-  // 含 $() 的 body（結構化 Word 或 content 帶展開字元）→ 無法靜態知其實際輸出 → null。
-  let body: string | null;
-  if (eff.heredocQuoted === true) body = eff.content ?? "";
-  else if (eff.body) body = null;
-  else body = /[$`]/.test(eff.content ?? "") ? null : (eff.content ?? "");
-  if (body === null) return null;
-  // `<<-` 移除每行前導 tab。
-  return eff.operator === "<<-" ? body.replace(/^\t+/gm, "") : body;
+  // print-eligible 但 body 為結構化 Word（含 $() 展開）→ 無法靜態知實際輸出 → null。
+  if (eff.body) return null;
+  const body = eff.content ?? "";
+  return eff.operator === "<<-" ? body.replace(/^\t+/gm, "") : body;   // `<<-` 去每行前導 tab
 }
 
 /** fd1（stdout）是否被任何重導向轉走（含 >/dev/null、>&2）——這類 stdout 不進 pipe。 */
@@ -789,6 +784,9 @@ Deno.test("hasAliasRedefinition: alias/unalias/shopt + builtin/command 包裝 �
   assertEquals(hasAliasRedefinition(nrInvs("command -p alias x=y")), true);
   assertEquals(hasAliasRedefinition(nrInvs("command shopt -s expand_aliases")), true);
   assertEquals(hasAliasRedefinition(nrInvs("builtin shopt -s expand_aliases")), true);
+  assertEquals(hasAliasRedefinition(nrInvs("command -- alias x=y")), true);          // 選項終止符
+  assertEquals(hasAliasRedefinition(nrInvs("command -p -- alias x=y")), true);
+  assertEquals(hasAliasRedefinition(nrInvs("command -- shopt -s expand_aliases")), true);
   assertEquals(hasAliasRedefinition(nrInvs("if true; then alias a=b; fi")), true);
 });
 
@@ -941,7 +939,12 @@ function unwrapDispatcher(name: string | null, argv: Word[]): { name: string; ar
     const v = staticValue(argv[i]);
     if (v === null) return null;
     if (v === "-v" || v === "-V") return null;          // 查詢：不執行 → 非 alias 重定義
-    if (v.startsWith("-") && v !== "-") { i++; continue; }
+    if (v === "--") {                                    // 選項終止符：其後第一個 token 即有效名（不論是否 -）
+      const rest = argv.slice(i + 1);
+      const nm = rest.length > 0 ? staticValue(rest[0]) : null;
+      return nm === null ? null : unwrapDispatcher(nm, rest.slice(1));
+    }
+    if (v.startsWith("-")) { i++; continue; }
     return unwrapDispatcher(v, argv.slice(i + 1));       // 遞迴解多層
   }
   return null;
@@ -1092,6 +1095,13 @@ Deno.test("leafCarrier: run 子指令不吃 inline；未知/注入旗標放棄",
   assertEquals(lc(`node --env-file=.env -e 'console.log("x")'`), null);
   assertEquals(lc(`python -m pytest -c 'print("x")'`), null);               // -m 注入
 });
+
+Deno.test("leafCarrier: 已知 nullary 為 per-interpreter（別家的旗標 → 放棄）", () => {
+  assertEquals(lc(`node --esm -e 'console.log("x")'`), null);        // --esm 非 node nullary → 放棄
+  assertEquals(lc(`python --no-warnings -c 'print("x")'`), null);    // --no-warnings 非 python nullary → 放棄
+  assertEquals(lc(`ts-node --esm -e 'console.log("x")'`), "interp"); // --esm 是 ts-node nullary → 仍偵測
+  assertEquals(lc(`node --no-warnings -e 'console.log("x")'`), "interp"); // node 自家 nullary
+});
 ```
 
 - [ ] **Step 2: 跑測試確認失敗**
@@ -1127,11 +1137,22 @@ const JS_PRINT = new Set(["-p", "--print"]);   // python/deno 無此語意
 const INJECT_FLAGS = new Set([
   "-r", "--require", "--import", "-m", "--preload", "--env-file", "--loader", "--experimental-loader",
 ]);
-const KNOWN_NULLARY = new Set(["--no-warnings", "--no-check", "--esm", "--transpile-only"]);
-// --allow-* / -A 僅對 deno 為已知 nullary；--experimental-* 泛用。
-function isKnownNullaryPrefix(f: string, isDeno: boolean): boolean {
-  if (f.startsWith("--experimental-")) return true;
-  if (isDeno && (f.startsWith("--allow-") || f === "-A")) return true;
+// 每個直譯器各自的「已知 nullary（不吃值）良性旗標」小集合；集合外的分離裸旗標 → 保守放棄。
+const NULLARY_BY_INTERP: Record<string, Set<string>> = {
+  node: new Set(["--no-warnings"]),
+  nodejs: new Set(["--no-warnings"]),
+  bun: new Set(["--no-warnings"]),
+  "ts-node": new Set(["--transpile-only", "--esm", "--no-check", "--no-warnings"]),
+  deno: new Set(["--no-check"]),
+  python: new Set<string>(),
+  python3: new Set<string>(),
+};
+function isKnownNullary(name: string, fn: string, isDeno: boolean): boolean {
+  if (NULLARY_BY_INTERP[name]?.has(fn)) return true;
+  // --experimental-* 僅 js 家族（node/bun/ts-node）；--allow-*/-A 僅 deno。
+  if ((name === "node" || name === "nodejs" || name === "bun" || name === "ts-node") &&
+    fn.startsWith("--experimental-")) return true;
+  if (isDeno && (fn.startsWith("--allow-") || fn === "-A")) return true;
   return false;
 }
 function flagName(tok: string): string {
@@ -1197,7 +1218,7 @@ export function recognizeInterpreter(inv: CommandInvocation): { lang: Lang; form
     }
     if (INJECT_FLAGS.has(fn)) return { lang, form: { kind: "none" } };
     if (v.includes("=")) { i++; continue; }
-    if (KNOWN_NULLARY.has(fn) || isKnownNullaryPrefix(fn, isDeno)) { i++; continue; }
+    if (isKnownNullary(name, fn, isDeno)) { i++; continue; }
     return { lang, form: { kind: "none" } };   // 分離未知裸旗標 → 保守放棄
   }
   // 掃完無位置參數：eval 無 payload → none；否則可能配 heredoc → stdin
@@ -1219,10 +1240,20 @@ function interpStdinBody(inv: CommandInvocation): string | null {
   return eff.content ?? "";
 }
 
+/** 直譯器葉的 stdout 是否被 fd1 重導向轉走（→ 非「印到 stdout」吐字，不算載具）。 */
+function interpStdoutDiverted(inv: CommandInvocation): boolean {
+  return inv.redirects.some((r) =>
+    (r.operator === ">" || r.operator === ">>" || r.operator === ">|" ||
+      r.operator === "&>" || r.operator === "&>>" || r.operator === ">&") &&
+    (r.fileDescriptor === undefined || r.fileDescriptor === 1)
+  );
+}
+
 /** 葉載具：shell 靜態吐字 → "shell"；直譯器 inline/stdin → "interp"；否則 null。 */
 export function leafCarrier(inv: CommandInvocation): "shell" | "interp" | null {
   if (isPrintOnlyForm(inv)) return "shell";
   if (inv.assignments.length > 0) return null;
+  if (interpStdoutDiverted(inv)) return null;   // 直譯器輸出寫檔/轉走 → 非 stdout 吐字
   const r = recognizeInterpreter(inv);
   if (r === null) return null;
   if (r.form.kind === "inline") return payloadIsAllStaticPrint(r.form.payload, r.lang) ? "interp" : null;
@@ -1335,6 +1366,11 @@ Deno.test("printDisguiseDeny: pipe（D）", () => {
 Deno.test("printDisguiseDeny: 注入旗標 EXEC → 不配對", () => {
   assertEquals(pd(`echo 'console.log("f")' > x; node --require=./p.js x`), null); // 注入 → EXEC 非 script
   assertEquals(pd(`echo 'console.log("f")' > x; node --require ./p.js x`), null);
+});
+
+Deno.test("printDisguiseDeny: 直譯器輸出被轉走 → 非載具、不 deny", () => {
+  assertEquals(pd(`node -e 'console.log("x")' > out`), null);        // stdout 寫檔 → 非 stdout 吐字
+  assertEquals(pd(`{ node -e 'console.log("x")'; } > out`), null);   // 整體重導向繼承
 });
 ```
 
@@ -2035,6 +2071,7 @@ cases = [
   ("real compute",     'node -e \'console.log(1+1)\'', "!deny", ""),
   ("washed",           'ls; echo done', "!deny", ""),
   ("write fn script",  f'cat > {PROJ}/d.sh <<\'EOF\'\ndeploy(){ echo hi; }\nEOF', "!deny", ""),
+  ("shopt globstar",   'shopt -s globstar; ls', "!deny", ""),   # 非 alias 的 shopt → 不觸發閘②
 ]
 ok = True
 for name, cmd, want, frag in cases:
