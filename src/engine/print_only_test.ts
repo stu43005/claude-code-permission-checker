@@ -1,7 +1,7 @@
 import { assertEquals } from "@std/assert";
 import { parse } from "../deps.ts";
 import type { Command } from "../deps.ts";
-import { isAllPrintOnly, isPrintOnlyForm, leafCarrier, wordPrintEligible } from "./print_only.ts";
+import { isAllPrintOnly, isPrintOnlyForm, leafCarrier, printDisguiseDeny, wordPrintEligible } from "./print_only.ts";
 import { parseCommand } from "./parse.ts";
 import { walk } from "./walk.ts";
 import type { CwdState } from "../types.ts";
@@ -229,4 +229,86 @@ Deno.test("leafCarrier: 已知 nullary 為 per-interpreter（別家的旗標 →
   assertEquals(lc(`python --no-warnings -c 'print("x")'`), null);    // --no-warnings 非 python nullary → 放棄
   assertEquals(lc(`ts-node --esm -e 'console.log("x")'`), "interp"); // --esm 是 ts-node nullary → 仍偵測
   assertEquals(lc(`node --no-warnings -e 'console.log("x")'`), "interp"); // node 自家 nullary
+});
+
+function pd(src: string): string | null {
+  const hit = printDisguiseDeny(parseCommand(src).script, LC_CWD);
+  return hit ? hit.kind : null;
+}
+
+Deno.test("printDisguiseDeny: 純 shell / 混載具 → deny", () => {
+  assertEquals(pd("echo a; echo b"), "shell-print");
+  assertEquals(pd(`echo a; node -e 'console.log("b")'`), "interp-inline");
+  assertEquals(pd("for x in a b; do echo 假; done"), "shell-print");
+});
+
+Deno.test("printDisguiseDeny: 整鏈洗白 → 不 deny", () => {
+  assertEquals(pd(`ls; node -e 'console.log("假")'`), null);
+  assertEquals(pd("ls; echo 假"), null);
+  assertEquals(pd("pwd; echo 假"), null);
+  assertEquals(pd("true && echo 已驗證"), null);
+  assertEquals(pd("mkdir build && echo done"), null);
+  assertEquals(pd("echo 假; ls"), null);
+  assertEquals(pd(`node -e 'console.log("x")'; ls`), null);
+});
+
+Deno.test("printDisguiseDeny: WRITE→EXEC(a)", () => {
+  assertEquals(pd(`cat > /tmp/x.mjs <<'EOF'\nconsole.log("f")\nEOF\nnode /tmp/x.mjs`), "write-exec");
+  assertEquals(pd(`echo 'console.log("f")' > f; node f`), "write-exec");
+  assertEquals(pd(`echo 'console.log("f")' > fixture.js; node runner.js fixture.js`), null);       // P=argv
+  assertEquals(pd(`printf 'x\\n' > fixture.py; python runner.py fixture.py`), null);               // python P=argv
+  assertEquals(pd(`echo 'x' > f.ts; deno run runner.ts f.ts`), null);                              // deno P=argv
+  assertEquals(pd(`echo 'console.log("x")' > fixture.js; node --loader fixture.js runner.js`), null); // P=旗標值
+  assertEquals(pd(`echo 'x' > cfg.json; ts-node --project cfg.json runner.ts`), null);             // ts-node 吃值旗標
+  assertEquals(pd(`echo 'x' > im.json; deno run --import-map im.json runner.ts`), null);           // deno 吃值旗標
+  assertEquals(pd(`echo 'console.log("f")' > x.mjs; node --experimental-default-type=module x.mjs`), "write-exec");
+  assertEquals(pd(`echo 'console.log("f")' > x.ts; ts-node --transpile-only x.ts`), "write-exec"); // 已知 nullary
+  assertEquals(pd(`echo 'console.log("f")' > x.ts; deno run --allow-read x.ts`), "write-exec");    // deno --allow-read nullary
+});
+
+Deno.test("printDisguiseDeny: cat-readback 邊界 + config over-deny + 控制流", () => {
+  assertEquals(pd(`cat >> q <<'EOF'\nx\nEOF\ncat q`), null);                    // append → 非 WRITE
+  assertEquals(pd(`if c; then cat > q <<'EOF'\nx\nEOF\nfi; cat q`), null);      // 跨控制流
+  assertEquals(pd(`cat > config.yaml <<'EOF'\nk: v\nEOF\ncat config.yaml`), "cat-readback"); // accepted over-deny
+  assertEquals(pd(`if command -v node; then node -e 'console.log("f")'; else echo 假; fi`), null); // guard 非載具
+  assertEquals(pd(`if true; then echo 假; fi`), null);                          // clause true 非載具
+});
+
+Deno.test("printDisguiseDeny: WRITE→EXEC(b) cat 讀回", () => {
+  assertEquals(pd(`cat > /tmp/q.txt <<'EOF'\ndead\nEOF\ncat /tmp/q.txt`), "cat-readback");
+  assertEquals(pd(`printf 'x\\n' > q; tac q`), "cat-readback");
+  assertEquals(pd(`cat > q <<'EOF'\nx\nEOF\necho hi; cat q`), null);   // 非緊鄰
+  assertEquals(pd(`cat > a <<'EOF'\nx\nEOF\ncat b`), null);            // 非同檔
+});
+
+Deno.test("printDisguiseDeny: setup 豁免 / false / ! true", () => {
+  // heredoc 之後以換行分隔下一指令（`&&` 接在 heredoc 終止行後非法；換行序列同樣傳遞 prevWrite）
+  assertEquals(pd(`mkdir -p /tmp && cat > x <<'EOF'\nconsole.log("f")\nEOF\nnode x`), "write-exec");
+  assertEquals(pd(`cd /tmp; cat > x <<'EOF'\nconsole.log("f")\nEOF\nnode x`), "write-exec");
+  assertEquals(pd("false && cat > x && node x"), null);              // false 非 setup/載具 → (a) 失敗
+  assertEquals(pd(`! true\ncat > x <<'EOF'\nconsole.log("f")\nEOF\nnode x`), null); // 否定 true 為非載具葉 → (a) 失敗
+});
+
+Deno.test("printDisguiseDeny: pipe（D）", () => {
+  assertEquals(pd(`echo 'console.log(1)' | node`), "pipe");
+  assertEquals(pd("grep x f | node"), null);
+  assertEquals(pd("echo a | cat | node"), null);                      // 三段 → 不配對
+  assertEquals(pd("echo 'console.log(1)' | node < real.js"), null);   // fd0 蓋過
+  assertEquals(pd("echo 'console.log(1)' | node > out"), null);       // 消費端 stdout 轉走
+  assertEquals(pd("node"), null);
+  assertEquals(pd("echo 'console.log(1)' | node &"), null);           // 背景 → 跳過 pipe
+  assertEquals(pd("{ echo 'console.log(1)' | node; } &"), null);      // 背景複合 → 內層 pipe 亦跳過
+  assertEquals(pd("{ echo a | echo b; } > out"), null);               // 整體重導向 → 葉非載具（不誤 deny）
+});
+
+Deno.test("printDisguiseDeny: 注入旗標 EXEC → 不配對", () => {
+  assertEquals(pd(`echo 'console.log("f")' > x; node --require=./p.js x`), null); // 注入 → EXEC 非 script
+  assertEquals(pd(`echo 'console.log("f")' > x; node --require ./p.js x`), null);
+});
+
+Deno.test("printDisguiseDeny: 直譯器輸出被轉走 → 非載具、不 deny", () => {
+  assertEquals(pd(`node -e 'console.log("x")' > out`), null);        // stdout 寫檔 → 非 stdout 吐字
+  assertEquals(pd(`{ node -e 'console.log("x")'; } > out`), null);   // 整體重導向繼承
+  assertEquals(pd(`cat > x <<'EOF'\nconsole.log("f")\nEOF\nnode x > out`), null); // 複合 EXEC 輸出轉走
+  assertEquals(pd(`cat > q <<'EOF'\ndead\nEOF\ncat q > out`), null);              // cat 讀回輸出轉走
 });
