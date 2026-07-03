@@ -486,3 +486,148 @@ function collectFnsInPart(part: WordPart, out: Set<string>): void {
     for (const child of part.parts) collectFnsInPart(child, out);
   }
 }
+
+/** 是否存在任一「可執行位置」的函式定義（node-based；忽略函式名可否靜態還原）。鏡射 collectFns 走訪。 */
+export function hasExecutableFunctionDefinition(script: Script): boolean {
+  return seqHasFn(script.commands);
+}
+
+function seqHasFn(statements: Statement[]): boolean {
+  return statements.some((s) =>
+    s.redirects.some((r) => wordHasFn(r.target) || wordHasFn(r.body)) || nodeHasFn(s.command)
+  );
+}
+
+function nodeHasFn(node: Node): boolean {
+  switch (node.type) {
+    case "Function":
+      return true;
+    case "Command": {
+      const words: Word[] = [
+        ...(node.name ? [node.name] : []),
+        ...node.suffix,
+        ...node.prefix.flatMap((a) => (a.value ? [a.value] : [])),
+        ...node.redirects.flatMap((r) => (r.target ? [r.target] : [])),
+        ...node.redirects.flatMap((r) => (r.body ? [r.body] : [])),
+      ];
+      return words.some(wordHasFn);
+    }
+    case "AndOr":
+    case "Pipeline":
+      return node.commands.some(nodeHasFn);
+    case "Subshell":
+    case "BraceGroup":
+      return seqHasFn(node.body.commands);
+    case "CompoundList":
+      return seqHasFn(node.commands);
+    case "If":
+      return seqHasFn(node.clause.commands) || seqHasFn(node.then.commands) ||
+        (node.else ? (node.else.type === "If" ? nodeHasFn(node.else) : seqHasFn(node.else.commands)) : false);
+    case "For":
+    case "Select":
+      return node.wordlist.some(wordHasFn) || seqHasFn(node.body.commands);
+    case "While":
+      return seqHasFn(node.clause.commands) || seqHasFn(node.body.commands);
+    case "ArithmeticFor":
+      return arithHasFn(node.initialize) || arithHasFn(node.test) || arithHasFn(node.update) ||
+        seqHasFn(node.body.commands);
+    case "Case":
+      return wordHasFn(node.word) ||
+        node.items.some((it) => it.pattern.some(wordHasFn) || seqHasFn(it.body.commands));
+    case "Statement":
+      return node.redirects.some((r) => wordHasFn(r.target) || wordHasFn(r.body)) || nodeHasFn(node.command);
+    case "ArithmeticCommand":
+      return arithHasFn(node.expression);
+    case "TestCommand":
+      return node.expression ? testHasFn(node.expression) : false;
+    case "Coproc":
+      return (node.name ? wordHasFn(node.name) : false) ||
+        node.redirects.some((r) => wordHasFn(r.target) || wordHasFn(r.body)) ||
+        nodeHasFn(node.body);
+    default:
+      return false;
+  }
+}
+
+function wordHasFn(word: Word | undefined): boolean {
+  if (!word?.parts) return false;
+  return word.parts.some(partHasFn);
+}
+function partHasFn(part: WordPart): boolean {
+  if ((part.type === "CommandExpansion" || part.type === "ProcessSubstitution") && part.script) {
+    return seqHasFn(part.script.commands);
+  }
+  if (part.type === "ArithmeticExpansion") return arithHasFn(part.expression);
+  if (part.type === "DoubleQuoted" || part.type === "LocaleString") return part.parts.some(partHasFn);
+  return false;
+}
+function arithHasFn(expr: ArithmeticExpression | undefined): boolean {
+  if (!expr) return false;
+  switch (expr.type) {
+    case "ArithmeticCommandExpansion":
+      return expr.script ? seqHasFn(expr.script.commands) : false;
+    case "ArithmeticBinary":
+      return arithHasFn(expr.left) || arithHasFn(expr.right);
+    case "ArithmeticUnary":
+      return arithHasFn(expr.operand);
+    case "ArithmeticTernary":
+      return arithHasFn(expr.test) || arithHasFn(expr.consequent) || arithHasFn(expr.alternate);
+    case "ArithmeticGroup":
+      return arithHasFn(expr.expression);
+    default:
+      return false;
+  }
+}
+function testHasFn(expr: TestExpression): boolean {
+  switch (expr.type) {
+    case "TestUnary":
+      return wordHasFn(expr.operand);
+    case "TestBinary":
+      return wordHasFn(expr.left) || wordHasFn(expr.right);
+    case "TestLogical":
+      return testHasFn(expr.left) || testHasFn(expr.right);
+    case "TestNot":
+      return testHasFn(expr.operand);
+    case "TestGroup":
+      return testHasFn(expr.expression);
+    default:
+      return false;
+  }
+}
+
+const ALIAS_BUILTINS = new Set(["alias", "unalias"]);
+
+/** 是否存在 alias 類名稱重定義（含 builtin/command 包裝；-v/-V 查詢不算）。 */
+export function hasAliasRedefinition(invocations: CommandInvocation[]): boolean {
+  return invocations.some((i) => {
+    const eff = unwrapDispatcher(i.name, i.argv);
+    if (eff === null) return false;
+    if (ALIAS_BUILTINS.has(eff.name)) return true;
+    if (eff.name === "shopt") return shoptEnablesAliases(eff.argv);
+    return false;
+  });
+}
+
+function unwrapDispatcher(name: string | null, argv: Word[]): { name: string; argv: Word[] } | null {
+  if (name === null) return null;
+  if (name !== "builtin" && name !== "command") return { name, argv };
+  let i = 0;
+  while (i < argv.length) {
+    const v = staticValue(argv[i]);
+    if (v === null) return null;
+    if (v === "-v" || v === "-V") return null;          // 查詢：不執行 → 非 alias 重定義
+    if (v === "--") {                                    // 選項終止符：其後第一個 token 即有效名（不論是否 -）
+      const rest = argv.slice(i + 1);
+      const nm = rest.length > 0 ? staticValue(rest[0]) : null;
+      return nm === null ? null : unwrapDispatcher(nm, rest.slice(1));
+    }
+    if (v.startsWith("-")) { i++; continue; }
+    return unwrapDispatcher(v, argv.slice(i + 1));       // 遞迴解多層
+  }
+  return null;
+}
+
+function shoptEnablesAliases(argv: Word[]): boolean {
+  const vals = argv.map((w) => staticValue(w));
+  return vals.includes("-s") && vals.includes("expand_aliases");
+}

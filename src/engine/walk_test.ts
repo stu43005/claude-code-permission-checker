@@ -1,6 +1,6 @@
 import { assertEquals } from "@std/assert";
 import { parseCommand } from "./parse.ts";
-import { definedFunctionNames, walk } from "./walk.ts";
+import { definedFunctionNames, hasAliasRedefinition, hasExecutableFunctionDefinition, walk } from "./walk.ts";
 import type { CwdState } from "../types.ts";
 
 const ROOT = "/proj";
@@ -161,4 +161,53 @@ Deno.test("walk 列舉 for/select/case header 位置的命令替換", () => {
 Deno.test("definedFunctionNames 涵蓋 for/select/case header 內的函式定義", () => {
   assertEquals(fns("for x in $(f(){ :; }; f); do :; done"), ["f"]);
   assertEquals(fns("case $(g(){ :; }; g) in foo) :;; esac"), ["g"]);
+});
+
+const NR_CWD = { kind: "known", path: "/proj" } as const;
+function nrScript(src: string) { return parseCommand(src).script; }
+function nrInvs(src: string) { return walk(parseCommand(src).script, NR_CWD, "/proj"); }
+
+Deno.test("hasExecutableFunctionDefinition: 可執行位置 → true", () => {
+  assertEquals(hasExecutableFunctionDefinition(nrScript("f(){ echo hi; }; f")), true);
+  assertEquals(hasExecutableFunctionDefinition(nrScript("f(){:;}")), true);
+  assertEquals(hasExecutableFunctionDefinition(nrScript("if false; then f(){:;}; fi; echo hi")), true);
+  assertEquals(hasExecutableFunctionDefinition(nrScript('echo "$(f(){:;}; f)"')), true);
+  assertEquals(hasExecutableFunctionDefinition(nrScript("cat <<EOF\n$(g(){:;}; g)\nEOF")), true);
+  assertEquals(hasExecutableFunctionDefinition(nrScript("[[ $(h(){:;}; h) ]]")), true);          // TestCommand
+  assertEquals(hasExecutableFunctionDefinition(nrScript("case $(k(){:;}; k) in x) :; esac")), true); // Case 主體
+});
+
+Deno.test("hasExecutableFunctionDefinition: 資料 → false", () => {
+  assertEquals(hasExecutableFunctionDefinition(nrScript("cat > x.sh <<'EOF'\nf(){ :; }\nEOF")), false);
+  assertEquals(hasExecutableFunctionDefinition(nrScript("cat > x.sh <<EOF\nf(){ :; }\nEOF")), false);
+  assertEquals(hasExecutableFunctionDefinition(nrScript("echo 'f(){ echo hi; }'")), false);
+  assertEquals(hasExecutableFunctionDefinition(nrScript("cat <<'EOF'\n$(f(){:;}; f)\nEOF")), false);
+  assertEquals(hasExecutableFunctionDefinition(nrScript("ls -la")), false);
+});
+
+Deno.test("hasAliasRedefinition: alias/unalias/shopt + builtin/command 包裝 → true", () => {
+  assertEquals(hasAliasRedefinition(nrInvs("alias grep='rm -rf'; grep x")), true);
+  assertEquals(hasAliasRedefinition(nrInvs("unalias -a")), true);
+  assertEquals(hasAliasRedefinition(nrInvs("shopt -s expand_aliases; alias c=x")), true);
+  assertEquals(hasAliasRedefinition(nrInvs("builtin alias x=y")), true);
+  assertEquals(hasAliasRedefinition(nrInvs("command alias x=y")), true);
+  assertEquals(hasAliasRedefinition(nrInvs("command builtin alias x=y")), true);
+  assertEquals(hasAliasRedefinition(nrInvs("command -p alias x=y")), true);
+  assertEquals(hasAliasRedefinition(nrInvs("command shopt -s expand_aliases")), true);
+  assertEquals(hasAliasRedefinition(nrInvs("builtin shopt -s expand_aliases")), true);
+  assertEquals(hasAliasRedefinition(nrInvs("command -- alias x=y")), true);          // 選項終止符
+  assertEquals(hasAliasRedefinition(nrInvs("command -p -- alias x=y")), true);
+  assertEquals(hasAliasRedefinition(nrInvs("command -- shopt -s expand_aliases")), true);
+  assertEquals(hasAliasRedefinition(nrInvs("if true; then alias a=b; fi")), true);
+});
+
+Deno.test("hasAliasRedefinition: 非啟用/查詢/資料/非 alias → false", () => {
+  assertEquals(hasAliasRedefinition(nrInvs("shopt -s globstar")), false);
+  assertEquals(hasAliasRedefinition(nrInvs("shopt -u expand_aliases")), false);
+  assertEquals(hasAliasRedefinition(nrInvs("shopt expand_aliases")), false);
+  assertEquals(hasAliasRedefinition(nrInvs("command ls")), false);
+  assertEquals(hasAliasRedefinition(nrInvs("command -v alias")), false);   // 查詢，不執行
+  assertEquals(hasAliasRedefinition(nrInvs("command -V unalias")), false);
+  assertEquals(hasAliasRedefinition(nrInvs("cat > setup.sh <<'EOF'\nalias grep=x\nEOF")), false);
+  assertEquals(hasAliasRedefinition(nrInvs("echo 'alias grep=x'")), false);
 });
