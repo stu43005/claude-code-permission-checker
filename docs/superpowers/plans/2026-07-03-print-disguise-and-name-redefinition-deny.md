@@ -1041,7 +1041,8 @@ git commit -m "feat(rules): add printDisguiseDenyReason + nameRedefinitionDenyRe
 在 `src/engine/print_only_test.ts` 末尾新增：
 
 ```typescript
-import { leafCarrier } from "./print_only.ts";
+// 把 leafCarrier 併入 print_only_test.ts 既有的 ./print_only.ts import（既有已匯入 isAllPrintOnly/
+// isPrintOnlyForm/wordPrintEligible），成單一 import；勿新增第二個 ./print_only.ts import 行。
 // parseCommand / walk / CwdState 若檔頂已 import 則勿重複。
 
 const LC_CWD = { kind: "known", path: "/proj" } as const;
@@ -1283,10 +1284,10 @@ git commit -m "feat(engine): interpreter flag parser + leaf carrier recognition 
 
 - [ ] **Step 1: 寫失敗測試**
 
-在 `src/engine/print_only_test.ts` 末尾新增：
+在 `src/engine/print_only_test.ts` 末尾新增（**把 `printDisguiseDeny` 併入該檔既有的 `./print_only.ts` import**——含 Task 5 加入的 `leafCarrier`、既有的 `isAllPrintOnly`/`isPrintOnlyForm`/`wordPrintEligible`——成單一 import，勿新增第二個 `./print_only.ts` import 行）：
 
 ```typescript
-import { printDisguiseDeny } from "./print_only.ts";
+// 併入既有：import { isAllPrintOnly, isPrintOnlyForm, leafCarrier, printDisguiseDeny, wordPrintEligible } from "./print_only.ts";
 
 function pd(src: string): string | null {
   const hit = printDisguiseDeny(parseCommand(src).script, LC_CWD);
