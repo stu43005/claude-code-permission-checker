@@ -1,4 +1,4 @@
-import { assertEquals, assertStringIncludes } from "@std/assert";
+import { assertEquals, assertNotEquals, assertStringIncludes } from "@std/assert";
 import { evaluate } from "./evaluate.ts";
 import type { CwdState, Verdict } from "../types.ts";
 import { parseBashRule } from "../permissions/matcher.ts";
@@ -131,7 +131,7 @@ Deno.test("閘② print-only 不被後置函式定義降級；前置真實/no-op
   assertEquals(vd('echo "fake"; echo(){ :; }'), "deny");
   // `if false; …` 會讓 walk 額外列舉 `false` 葉指令 → 非整鏈 print；且 echo 被（dead 分支）函式定義
   // 遮蔽 → 落閘③ ask。靜態分析無法判定分支不可達，保守 ask（安全、非靜默 allow）。
-  assertEquals(vd("if false; then echo(){ :; }; fi; echo fake"), "ask");
+  assertEquals(vd("if false; then echo(){ :; }; fi; echo fake"), "deny");
 });
 
 Deno.test("非整鏈 print → 不 deny", () => {
@@ -175,18 +175,18 @@ Deno.test("閘① sleep deny 理由透過 pollingDenyReason 傳出", () => {
   assertStringIncludes(d.reason, "ScheduleWakeup");
 });
 
-Deno.test("閘③ 函式遮蔽 → ask（不可升級）", () => {
-  assertEquals(vd("date(){ sleep 5; }; date"), "ask");
-  assertEquals(vd("pwd(){ echo fake; }; pwd"), "ask");
-  assertEquals(vd("waiter(){ sleep 5; }; waiter"), "ask");
-  assertEquals(vd("date(){ sleep 5; }; date", rulesOf({ allow: ["Bash(date *)"] })), "ask");
-  assertEquals(vd('echo "$(date(){ rm x; }; date)"'), "ask");   // 替換內定義 + 呼叫
-  assertEquals(vd("f(){ :; }; ls -la"), "allow");               // ls 未被遮蔽
-  // 刻意保守：同名函式定義即使在呼叫之後（或 dead 分支），仍 ask（over-ask 為安全方向、非 bug）
-  assertEquals(vd("ls -la; ls(){ :; }"), "ask");   // 定義在呼叫後
-  assertEquals(vd("ls(){ :; }; ls -la"), "ask");   // 定義在呼叫前
-  // 對照：異名函式不影響合法指令
-  assertEquals(vd("ls -la; cd(){ :; }"), "allow");
+Deno.test("閘② 名稱重定義 → deny（不可升級）", () => {
+  assertEquals(vd("date(){ sleep 5; }; date"), "deny");
+  assertEquals(vd("pwd(){ echo fake; }; pwd"), "deny");
+  assertEquals(vd("waiter(){ sleep 5; }; waiter"), "deny");
+  assertEquals(vd("date(){ sleep 5; }; date", rulesOf({ allow: ["Bash(date *)"] })), "deny");
+  assertEquals(vd('echo "$(date(){ rm x; }; date)"'), "deny");   // 替換內定義 + 呼叫
+  assertEquals(vd("f(){ :; }; ls -la"), "deny");               // 含可執行函式定義
+  // 刻意保守：同名函式定義即使在呼叫之後（或 dead 分支），仍 deny
+  assertEquals(vd("ls -la; ls(){ :; }"), "deny");   // 定義在呼叫後
+  assertEquals(vd("ls(){ :; }; ls -la"), "deny");   // 定義在呼叫前
+  // 異名函式亦含函式定義 → deny
+  assertEquals(vd("ls -la; cd(){ :; }"), "deny");
 });
 
 Deno.test("算術 / test / coproc 內的隱藏指令不再被靜默放行（critical 修補）", () => {
@@ -249,4 +249,30 @@ Deno.test("§1.5 已接受『整鏈 print 洗白繞道』：鏈含真實/no-op �
   assertEquals(vd("echo $(pwd >/dev/null; echo fake)"), "allow");
   assertEquals(vd("cat README.md; echo fake"), "allow");
   assertEquals(vd("true && echo fake"), "ask");
+});
+
+const G2_ROOT = "/proj";
+const G2_CWD = { kind: "known", path: "/proj" } as const;
+function g2v(src: string) { return evaluate(src, G2_ROOT, G2_CWD).verdict; }
+
+Deno.test("evaluate 閘②：名稱重定義 → deny", () => {
+  assertEquals(g2v("f(){ :; }; echo 假"), "deny");
+  assertEquals(g2v("f(){:;}"), "deny");
+  assertEquals(g2v("alias grep=x; grep y"), "deny");
+  assertEquals(g2v("builtin alias x=y"), "deny");
+});
+
+Deno.test("evaluate 閘③：print 偽裝 → deny", () => {
+  assertEquals(g2v("echo a; echo b"), "deny");
+  assertEquals(g2v(`node -e 'console.log("f")'`), "deny");
+});
+
+Deno.test("evaluate：整鏈洗白 → 非 deny", () => {
+  assertNotEquals(g2v("ls; echo 假"), "deny");            // ls/echo 皆 allowlist → allow（非 deny）
+  assertNotEquals(g2v(`ls; node -e 'console.log("假")'`), "deny");
+});
+
+Deno.test("evaluate：no-op 空指令 allow；寫含函式 script 非 deny", () => {
+  assertEquals(g2v(""), "allow");
+  assertNotEquals(g2v("cat > x.sh <<'EOF'\nf(){ :; }\nEOF"), "deny");  // 資料 → 落寫入重導向 ask
 });
