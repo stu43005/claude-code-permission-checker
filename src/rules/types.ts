@@ -64,3 +64,30 @@ export function functionShadowReason(): string {
     `函式本體、而非該指令本身——權限檢查無法靜態得知函式本體做什麼。請改為直接執行真正的指令（不要` +
     `用同名函式覆寫），或拆成多次呼叫以便逐一檢查。`;
 }
+
+export type PrintDisguiseKind =
+  | "shell-print" | "interp-inline" | "write-exec" | "cat-readback" | "pipe";
+
+/** 統一 print-only 載具偽裝的 deny 理由（依命中形態客製）。 */
+export function printDisguiseDenyReason(kind: PrintDisguiseKind): string {
+  const head: Record<PrintDisguiseKind, string> = {
+    "shell-print": "整條指令每段都只是 echo/printf/cat 把靜態文字印到 stdout",
+    "interp-inline": "你正用直譯器（-e/-c/-p inline 或 heredoc 餵 stdin）跑一段每行都只是 console.log/print 印死字串的程式",
+    "write-exec": "你先把寫死文字寫進暫存檔、再用直譯器執行同檔把它印出來",
+    "cat-readback": "你先把寫死文字寫進暫存檔、再 cat 讀回印出——與直接 echo 無異",
+    "pipe": "你把寫死文字 pipe 給直譯器印出來",
+  };
+  return `已禁止：${head[kind]}。內容完全寫死、沒讀檔沒計算——偽裝成跑出來的驗證結果。` +
+    `若你已有結論，請直接寫在回覆文字中；若需查證，請實際讀原始碼、跑會真正計算/讀檔的程式或真實測試。`;
+}
+
+/** 名稱重定義（函式定義 / alias 類）的 deny 理由。 */
+export function nameRedefinitionDenyReason(kind: "function" | "alias"): string {
+  if (kind === "function") {
+    return `已禁止：這個指令定義了 shell 函式（name(){…}）。函式可重定義任何指令名（如 grep(){ rm -rf; }）、` +
+      `使本工具的指令名安全分析失真，屬危險構造；在單次 Bash 呼叫內定義函式無正當常見理由。` +
+      `若需複用邏輯，請直接展開為具體指令、或拆成多次呼叫。`;
+  }
+  return `已禁止：這個指令用 alias/unalias/shopt -s expand_aliases 改變指令名的解析，可讓後續 grep/cat 等` +
+    `執行成別的東西、繞過本工具的指令名安全分析。請勿在 Bash 呼叫內設定 alias；直接用真實指令名。`;
+}
