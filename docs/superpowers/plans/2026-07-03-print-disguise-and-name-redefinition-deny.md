@@ -1366,6 +1366,8 @@ Deno.test("printDisguiseDeny: 注入旗標 EXEC → 不配對", () => {
 Deno.test("printDisguiseDeny: 直譯器輸出被轉走 → 非載具、不 deny", () => {
   assertEquals(pd(`node -e 'console.log("x")' > out`), null);        // stdout 寫檔 → 非 stdout 吐字
   assertEquals(pd(`{ node -e 'console.log("x")'; } > out`), null);   // 整體重導向繼承
+  assertEquals(pd(`cat > x <<'EOF'\nconsole.log("f")\nEOF\nnode x > out`), null); // 複合 EXEC 輸出轉走
+  assertEquals(pd(`cat > q <<'EOF'\ndead\nEOF\ncat q > out`), null);              // cat 讀回輸出轉走
 });
 ```
 
@@ -1583,6 +1585,7 @@ export function printDisguiseDeny(script: Script, initialCwd: CwdState): { kind:
 
   function matchExec(inv: CommandInvocation, prev: WriteRef | null): "interp" | "cat" | null {
     if (prev === null || prev.content === null || inv.assignments.length > 0) return null;
+    if (interpStdoutDiverted(inv)) return null;   // EXEC/讀回 stdout 被轉走 → 非 stdout 吐字，不配對
     const r = recognizeInterpreter(inv);
     if (r && r.form.kind === "script") {
       if (!sameFile(r.form.entrypoint, inv.cwd, prev.path, prev.cwd)) return null;
