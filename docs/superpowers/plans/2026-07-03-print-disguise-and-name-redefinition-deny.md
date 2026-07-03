@@ -17,7 +17,7 @@
 - `Command { name?: Word; prefix: AssignmentPrefix[]; suffix: Word[]; redirects: Redirect[] }`。
 - `Redirect { operator: string; target?: Word; content?: string; body?: Word; fileDescriptor?: number; heredocQuoted?: boolean }`——`fileDescriptor` 預設省略（`>` 視 1、`<<` 視 0）；未引號 heredoc 純文字在 `content`，引號 heredoc `heredocQuoted===true` 且 `body` 常為 undefined、`content` 保留原文；含 `$()` 的未引號 heredoc `body` 為結構化 `Word`。
 - `Word.parts[]` 可含 `CommandExpansion`/`ProcessSubstitution`（帶 `.script: Script`），亦可巢狀於 `DoubleQuoted.parts`。
-- `bun run <file>` / `deno run <file>`：`suffix = [run, <file>]`（子指令 `run` 後接進入點）；`deno eval <payload>` 為 inline；`deno run -` / `bun run -` 的 `-` **不特案**（保守 under-deny）。
+- `bun run <file>` / `deno run <file>`：`suffix = [run, <file>]`（子指令 `run` 後接進入點）；`deno eval <payload>` 為 inline；**`deno run -` 的 `-` 為 stdin 標記**（配 heredoc/here-string → heredoc-stdin 載具）；**`bun run -` 不特案**（保守 under-deny）。
 
 **全域約定：**
 - 每個 Task 完成後 `deno task check && deno task lint`，綠燈才 commit。
@@ -158,6 +158,11 @@ const NAME_START = /[A-Za-z_$]/;
 const NAME_CONT = /[A-Za-z0-9_$]/;
 const DIGIT = /[0-9]/;
 
+// UTF-8 位元組長度（DoS 上限用；有界，超標即回值 > 上限）。
+function byteLen(s: string): number {
+  return new TextEncoder().encode(s).length;
+}
+
 function tokenize(src: string, lang: Lang): Tok[] | null {
   const out: Tok[] = [];
   let i = 0;
@@ -188,13 +193,20 @@ function tokenize(src: string, lang: Lang): Tok[] | null {
       continue;
     }
     if (DIGIT.test(c) || (c === "." && DIGIT.test(src[i + 1] ?? ""))) {
-      let j = i + 1;
-      while (j < n && /[0-9a-fA-FxXoObB._n]/.test(src[j])) j++;
-      // 指數 e/E 後可接 +/-
-      if ((src[j] === "e" || src[j] === "E") && /[+\-0-9]/.test(src[j + 1] ?? "")) {
+      let j = i;
+      if (src[j] === "0" && /[xXoObB]/.test(src[j + 1] ?? "")) {
         j += 2;
-        while (j < n && DIGIT.test(src[j])) j++;
+        while (j < n && /[0-9a-fA-F_]/.test(src[j])) j++;   // 0x/0o/0b
+      } else {
+        while (j < n && /[0-9_]/.test(src[j])) j++;         // 整數部
+        if (src[j] === ".") { j++; while (j < n && /[0-9_]/.test(src[j])) j++; } // 小數
+        if (src[j] === "e" || src[j] === "E") {             // 指數（可帶號）
+          let k = j + 1;
+          if (src[k] === "+" || src[k] === "-") k++;
+          if (DIGIT.test(src[k] ?? "")) { j = k; while (j < n && /[0-9_]/.test(src[j])) j++; }
+        }
       }
+      if (src[j] === "n") j++;                              // BigInt
       push({ kind: "NUMBER", value: src.slice(i, j) });
       i = j;
       continue;
@@ -268,9 +280,13 @@ function applyStringPrefixes(toks: Tok[]): Tok[] {
   return out;
 }
 
-// 消費一個 ARG：選擇性 SIGN + (STRING | NUMBER)。textApi=true 才允許 NUMBER。回下一個索引或 -1（不合法）。
+// 消費一個 ARG：STRING，或（僅文字輸出 API）選擇性 SIGN + NUMBER。回下一個索引或 -1（不合法）。
+// SIGN 只對 NUMBER 合法（不允許 -"x" 這種帶號字串）。
 function consumeArg(toks: Tok[], i: number, textApi: boolean): number {
-  if (toks[i]?.kind === "SIGN") i++;               // 帶號
+  if (toks[i]?.kind === "SIGN") {
+    if (textApi && toks[i + 1]?.kind === "NUMBER") return i + 2;
+    return -1;
+  }
   const k = toks[i]?.kind;
   if (k === "STRING") return i + 1;
   if (k === "NUMBER" && textApi) return i + 1;
@@ -278,7 +294,7 @@ function consumeArg(toks: Tok[], i: number, textApi: boolean): number {
 }
 
 export function payloadIsAllStaticPrint(source: string, lang: Lang): boolean {
-  if (source.length > MAX_PAYLOAD_BYTES) return false;
+  if (byteLen(source) > MAX_PAYLOAD_BYTES) return false;
   const raw = tokenize(source, lang);
   if (raw === null) return false;
   const toks = applyStringPrefixes(raw);
@@ -316,7 +332,7 @@ export function payloadIsAllStaticPrint(source: string, lang: Lang): boolean {
 }
 
 export function printExprIsStaticString(source: string, lang: Lang): boolean {
-  if (source.length > MAX_PAYLOAD_BYTES) return false;
+  if (byteLen(source) > MAX_PAYLOAD_BYTES) return false;
   const raw = tokenize(source, lang);
   if (raw === null) return false;
   const toks = applyStringPrefixes(raw);
@@ -325,7 +341,7 @@ export function printExprIsStaticString(source: string, lang: Lang): boolean {
   if (toks[i]?.kind !== "STRING") return false;
   i++;
   while (i < toks.length) {
-    if (toks[i]?.kind !== "OTHER" || toks[i]?.value !== "+") return false;
+    if (toks[i]?.kind !== "SIGN" || toks[i]?.value !== "+") return false;  // `+` 詞法為 SIGN
     i++;
     if (toks[i]?.kind !== "STRING") return false;
     i++;
@@ -407,18 +423,116 @@ Deno.test("writtenContent: 寫檔內容（忽略寫入重導向）", () => {
 Run: `deno test --allow-env src/engine/static_output_test.ts`
 Expected: FAIL（模組不存在）。
 
-- [ ] **Step 3: 從 `print_only.ts` 剪下低層判定、貼入 `static_output.ts` 並 export**
+- [ ] **Step 3: 建立 `static_output.ts` 的低層判定（自 `print_only.ts` 移入，加 `export`）**
 
-從**現有** `src/engine/print_only.ts` 剪下以下函式（**原封不動、加 `export`**）貼入新檔 `src/engine/static_output.ts`：`hasLeadingTilde`、`wordPrintEligible`、`topPartEligible`、`heredocBodyEligible`、`isHeredocPrintEligible`、`isEchoPrintOnly`、`isPrintfPrintOnly`、`hasFormatterConversion`、`isCatPassthrough`、`hasFileOperand`。頂部 import 對齊：
+`src/engine/static_output.ts` 開頭寫入以下 import 與判定函式（這些是**現有** `print_only.ts` 的內容，逐字搬入；`wordPrintEligible`/`isEchoPrintOnly`/`isPrintfPrintOnly`/`isCatPassthrough`/`isHeredocPrintEligible`/`hasFileOperand`/`hasFormatterConversion` 加 `export`）：
 
 ```typescript
 import type { CommandInvocation } from "../types.ts";
 import type { Command, Redirect, Word, WordPart } from "../deps.ts";
 import { isStatic, nestedPartIsDynamic, staticValue, topPartIsDynamic } from "./word.ts";
 import { hasWriteRedirect } from "./redirect.ts";
+
+function hasLeadingTilde(w: Word): boolean {
+  if (!w.parts) return w.value.startsWith("~");
+  const first = w.parts[0];
+  return first?.type === "Literal" && first.value.startsWith("~");
+}
+
+export function wordPrintEligible(w: Word): boolean {
+  if (hasLeadingTilde(w)) return false;
+  if (isStatic(w)) return true;
+  if (!w.parts) return false;
+  return w.parts.every(topPartEligible);
+}
+
+function topPartEligible(p: WordPart): boolean {
+  if (p.type === "CommandExpansion") return true;
+  if (!topPartIsDynamic(p)) return true;
+  if (p.type === "DoubleQuoted" || p.type === "LocaleString") {
+    return p.parts.every((np) => np.type === "CommandExpansion" || !nestedPartIsDynamic(np));
+  }
+  return false;
+}
+
+export function isEchoPrintOnly(inv: CommandInvocation): boolean {
+  let hasEscapeFlag = false;
+  let hasBackslashPayload = false;
+  for (const w of inv.argv) {
+    if (!wordPrintEligible(w)) return false;
+    const v = staticValue(w);
+    if (v === null) continue;
+    if (/^-[neE]*[eE][neE]*$/.test(v)) { hasEscapeFlag = true; continue; }
+    if (v.includes("\\")) hasBackslashPayload = true;
+  }
+  if (hasEscapeFlag && hasBackslashPayload) return false;
+  return true;
+}
+
+export function isPrintfPrintOnly(inv: CommandInvocation): boolean {
+  const first = inv.argv.length > 0 ? staticValue(inv.argv[0]) : null;
+  if (first !== null && first !== "--" && first.startsWith("-")) return false;
+  if (inv.argv.length > 0 && first === null) return false;
+  for (const w of inv.argv) if (!wordPrintEligible(w)) return false;
+  const fmtWord = inv.argv.find((w) => staticValue(w) !== "--");
+  if (!fmtWord) return true;
+  const fmt = staticValue(fmtWord);
+  if (fmt !== null && hasFormatterConversion(fmt)) return false;
+  return true;
+}
+
+export function hasFormatterConversion(fmt: string): boolean {
+  const stripped = fmt.replace(/%%/g, "");
+  return /%[-+ 0#']*[0-9*]*(\.[0-9*]*)?(hh|h|ll|l|L|j|z|t)?[diouxXeEfFgGaAcCqn]/.test(stripped) ||
+    /%\([^)]*\)T/.test(stripped);
+}
+
+export function isCatPassthrough(inv: CommandInvocation): boolean {
+  if (hasFileOperand(inv.name, inv.argv)) return false;
+  const fd0Inputs = inv.redirects.filter((r) =>
+    (r.operator === "<" || r.operator === "<<" || r.operator === "<<-" ||
+      r.operator === "<<<" || r.operator === "<&") &&
+    (r.fileDescriptor === undefined || r.fileDescriptor === 0)
+  );
+  if (fd0Inputs.length === 0) return false;
+  const effective = fd0Inputs[fd0Inputs.length - 1];
+  if (effective.operator !== "<<" && effective.operator !== "<<-" && effective.operator !== "<<<") {
+    return false;
+  }
+  return isHeredocPrintEligible(effective);
+}
+
+export function hasFileOperand(name: string | null, argv: Word[]): boolean {
+  const skipsValue = name === "tac";
+  let afterDoubleDash = false;
+  for (let i = 0; i < argv.length; i++) {
+    const v = staticValue(argv[i]);
+    if (!afterDoubleDash && v === "--") { afterDoubleDash = true; continue; }
+    if (afterDoubleDash) return true;
+    if (v === null || !v.startsWith("-")) return true;
+    if (skipsValue && (v === "-s" || v === "--separator")) {
+      if (argv[i + 1] !== undefined && staticValue(argv[i + 1]) !== null) i++;
+    }
+  }
+  return false;
+}
+
+function heredocBodyEligible(body: Word): boolean {
+  if (!body.parts) return true;
+  return body.parts.every((p) => p.type === "Literal" || p.type === "CommandExpansion");
+}
+
+export function isHeredocPrintEligible(r: Redirect): boolean {
+  if (r.operator === "<<<") {
+    return r.target ? wordPrintEligible(r.target) : true;
+  }
+  if (r.heredocQuoted === true) return true;
+  if (r.body) return heredocBodyEligible(r.body);
+  return !/[$`]/.test(r.content ?? "");
+}
 ```
 
-其中 `wordPrintEligible`、`isEchoPrintOnly`、`isPrintfPrintOnly`、`isCatPassthrough`、`isHeredocPrintEligible`、`hasFileOperand`、`hasFormatterConversion` 加 `export`（其餘保持 module-private）。這些函式簽名沿用現有（吃 `Word`/`CommandInvocation`/`Redirect`）。
+> `isEchoPrintOnly`/`isPrintfPrintOnly`/`isCatPassthrough` 加 `export`（供 print_only 的 `isPrintOnlyForm` 使用）；`hasFileOperand`/`isHeredocPrintEligible` 加 `export`（供 Task 5/6 使用）；`hasFormatterConversion`/`wordPrintEligible` 加 `export`。`hasLeadingTilde`/`topPartEligible`/`heredocBodyEligible` 保持 module-private。
 
 - [ ] **Step 4: 在 `static_output.ts` 末尾新增還原函式**
 
@@ -474,16 +588,33 @@ export function printfText(cmd: Command): string | null {
   if (fmt.startsWith("-") && fmt !== "--") return null;
   if (hasFormatterConversion(fmt)) return null;        // 數值/日期/%q/%n 等 → null
   const operands = args.slice(idx + 1);
-  let out = "";
-  let oi = 0;
-  for (let k = 0; k < fmt.length; k++) {
-    if (fmt[k] === "%" && fmt[k + 1] === "%") { out += "%"; k++; continue; }
-    if (fmt[k] === "%" && (fmt[k + 1] === "s" || fmt[k + 1] === "b")) { out += operands[oi++] ?? ""; k++; continue; }
-    if (fmt[k] === "\\" && fmt[k + 1] === "n") { out += "\n"; k++; continue; }
-    if (fmt[k] === "\\" && fmt[k + 1] === "t") { out += "\t"; k++; continue; }
-    out += fmt[k];
-  }
-  return out;
+  // printf 會循環套用 format 直到 operands 用盡（POSIX）；至少套一次。
+  const applyOnce = (start: number): { text: string; used: number } => {
+    let out = "";
+    let used = 0;
+    for (let k = 0; k < fmt.length; k++) {
+      if (fmt[k] === "%" && fmt[k + 1] === "%") { out += "%"; k++; continue; }
+      if (fmt[k] === "%" && fmt[k + 1] === "s") { out += operands[start + used] ?? ""; used++; k++; continue; }
+      if (fmt[k] === "%" && fmt[k + 1] === "b") { out += interpBackslash(operands[start + used] ?? ""); used++; k++; continue; }
+      if (fmt[k] === "\\" && fmt[k + 1] === "n") { out += "\n"; k++; continue; }
+      if (fmt[k] === "\\" && fmt[k + 1] === "t") { out += "\t"; k++; continue; }
+      out += fmt[k];
+    }
+    return { text: out, used };
+  };
+  let result = "";
+  let pos = 0;
+  do {
+    const r = applyOnce(pos);
+    result += r.text;
+    if (r.used === 0) break;                            // 無轉換符 → 不循環
+    pos += r.used;
+  } while (pos < operands.length);
+  return result;
+}
+
+function interpBackslash(s: string): string {
+  return s.replace(/\\n/g, "\n").replace(/\\t/g, "\t").replace(/\\r/g, "\r").replace(/\\\\/g, "\\");
 }
 
 /** cat/tac 的 stdin passthrough 文字（cat 原序、tac 行反轉）；有檔案操作元/非合格 heredoc → null。 */
@@ -531,17 +662,14 @@ export function writtenContent(cmd: Command): string | null {
 
 - [ ] **Step 5: 改 `print_only.ts` import 移出的判定**
 
-在 `src/engine/print_only.ts` 刪除已移入的函式定義，頂部改為（把原本本檔定義、現由 static_output 提供的識別子改為 import）：
+在 `src/engine/print_only.ts` **刪除**已移入 static_output 的十個函式定義（`hasLeadingTilde`/`wordPrintEligible`/`topPartEligible`/`heredocBodyEligible`/`isHeredocPrintEligible`/`isEchoPrintOnly`/`isPrintfPrintOnly`/`hasFormatterConversion`/`isCatPassthrough`/`hasFileOperand`）。頂部改為**只 import 本檔此刻用得到的**（`isPrintOnlyForm` 需 echo/printf/cat 三判定 + 既有 `hasWriteRedirect`；`wordPrintEligible` re-export 給既有測試）：
 
 ```typescript
-import {
-  hasFileOperand, isCatPassthrough, isEchoPrintOnly, isHeredocPrintEligible,
-  isPrintfPrintOnly, wordPrintEligible,
-} from "./static_output.ts";
-export { wordPrintEligible } from "./static_output.ts";  // 既有測試由 print_only 匯入
+import { isCatPassthrough, isEchoPrintOnly, isPrintfPrintOnly } from "./static_output.ts";
+export { wordPrintEligible } from "./static_output.ts";   // 既有 print_only_test.ts 由 print_only 匯入
 ```
 
-`isPrintOnlyForm`（呼叫 `isEchoPrintOnly`/`isPrintfPrintOnly`/`isCatPassthrough`）與 `isAllPrintOnly` **保留在 print_only.ts**、改用 import 的判定。確認 `print_only.ts` 不再有這些函式的重複定義（否則 `deno check` 重複宣告錯誤）。
+（`hasWriteRedirect` 若原本已從 `./redirect.ts` import 則保留。）`isPrintOnlyForm` 與 `isAllPrintOnly` **保留在 print_only.ts**、改用 import 的三判定。**不在 Task 2 import `hasFileOperand`/`isHeredocPrintEligible`**（那些在 Task 5/6 需要時才 import，避免此刻 lint 報未使用）。確認無重複定義（否則 `deno check` 重複宣告錯誤）。
 
 - [ ] **Step 6: 跑測試（新測試 + 既有 print_only 回歸全綠）**
 
@@ -604,6 +732,8 @@ Deno.test("hasAliasRedefinition: alias/unalias/shopt + builtin/command 包裝 �
   assertEquals(hasAliasRedefinition(nrInvs("command alias x=y")), true);
   assertEquals(hasAliasRedefinition(nrInvs("command builtin alias x=y")), true);
   assertEquals(hasAliasRedefinition(nrInvs("command -p alias x=y")), true);
+  assertEquals(hasAliasRedefinition(nrInvs("command shopt -s expand_aliases")), true);
+  assertEquals(hasAliasRedefinition(nrInvs("builtin shopt -s expand_aliases")), true);
   assertEquals(hasAliasRedefinition(nrInvs("if true; then alias a=b; fi")), true);
 });
 
@@ -681,7 +811,9 @@ function nodeHasFn(node: Node): boolean {
     case "TestCommand":
       return node.expression ? testHasFn(node.expression) : false;
     case "Coproc":
-      return (node.name ? wordHasFn(node.name) : false) || nodeHasFn(node.body);
+      return (node.name ? wordHasFn(node.name) : false) ||
+        node.redirects.some((r) => wordHasFn(r.target) || wordHasFn(r.body)) ||
+        nodeHasFn(node.body);
     default:
       return false;
   }
@@ -802,7 +934,7 @@ export type PrintDisguiseKind =
 export function printDisguiseDenyReason(kind: PrintDisguiseKind): string {
   const head: Record<PrintDisguiseKind, string> = {
     "shell-print": "整條指令每段都只是 echo/printf/cat 把靜態文字印到 stdout",
-    "interp-inline": "你正用 -e/-c/-p 跑一段每行都只是 console.log/print 印死字串的程式",
+    "interp-inline": "你正用直譯器（-e/-c/-p inline 或 heredoc 餵 stdin）跑一段每行都只是 console.log/print 印死字串的程式",
     "write-exec": "你先把寫死文字寫進暫存檔、再用直譯器執行同檔把它印出來",
     "cat-readback": "你先把寫死文字寫進暫存檔、再 cat 讀回印出——與直接 echo 無異",
     "pipe": "你把寫死文字 pipe 給直譯器印出來",
@@ -878,7 +1010,17 @@ Deno.test("leafCarrier: 直譯器 inline（A）per-language", () => {
 Deno.test("leafCarrier: 直譯器 heredoc-stdin（B）", () => {
   assertEquals(lc(`node <<'EOF'\nconsole.log("x")\nEOF`), "interp");
   assertEquals(lc(`python <<'EOF'\nprint("x")\nEOF`), "interp");
+  assertEquals(lc(`deno run - <<'EOF'\nconsole.log("x")\nEOF`), "interp");   // deno run - 為 stdin
+  assertEquals(lc(`bun <<'EOF'\nconsole.log("x")\nEOF`), "interp");          // 裸 bun heredoc
+  assertEquals(lc(`bun -e 'console.log("x")'`), "interp");
+  assertEquals(lc(`ts-node -e 'console.log("x")'`), "interp");
   assertEquals(lc(`node`), null);
+  assertEquals(lc(`bun run - <<'EOF'\nconsole.log("x")\nEOF`), null);        // bun run - 不特案
+});
+
+Deno.test("leafCarrier: 非 deno 的 --allow-* 為未知旗標 → 放棄；deno --allow-* 為 nullary", () => {
+  assertEquals(lc(`node --allow-read -e 'console.log("x")'`), null);         // node 無 --allow-read → 放棄
+  assertEquals(lc(`deno run --allow-read - <<'EOF'\nconsole.log("x")\nEOF`), "interp"); // deno --allow-read nullary
 });
 ```
 
@@ -889,11 +1031,14 @@ Expected: FAIL（`leafCarrier` 未匯出）。
 
 - [ ] **Step 3: 實作旗標解析 + `leafCarrier`（`print_only.ts` 新增；合併既有 import，勿重複宣告 `CommandInvocation`/`Word`/`staticValue`）**
 
-在 `src/engine/print_only.ts` 頂部**合併**新 import（與 Task 2 已加的 import 合併；勿重複 `CommandInvocation`/`Word`/`staticValue`）：
+在 `src/engine/print_only.ts` 頂部**補上**以下 import（Task 2 移出低層判定後，print_only 已不再 import `staticValue` 等；此處明確補回本 Task/Task 6 需要的）。與既有 import 合併、同一模組的 import 合成一行、勿重複：
 
 ```typescript
+import type { CommandInvocation } from "../types.ts";
+import type { Word } from "../deps.ts";
+import { staticValue } from "./word.ts";
 import { payloadIsAllStaticPrint, printExprIsStaticString, type Lang } from "./interp_payload.ts";
-import { isHeredocPrintEligible } from "./static_output.ts";  // 已於 Task 2 import；勿重複
+import { isHeredocPrintEligible } from "./static_output.ts";  // 與 Task 2 的 static_output import 合併成一行
 ```
 
 新增：
@@ -910,9 +1055,12 @@ const JS_PRINT = new Set(["-p", "--print"]);   // python/deno 無此語意
 const INJECT_FLAGS = new Set([
   "-r", "--require", "--import", "-m", "--preload", "--env-file", "--loader", "--experimental-loader",
 ]);
-const KNOWN_NULLARY = new Set(["--no-warnings", "--no-check", "-A", "--esm", "--transpile-only"]);
-function isKnownNullaryPrefix(f: string): boolean {
-  return f.startsWith("--experimental-") || f.startsWith("--allow-");
+const KNOWN_NULLARY = new Set(["--no-warnings", "--no-check", "--esm", "--transpile-only"]);
+// --allow-* / -A 僅對 deno 為已知 nullary；--experimental-* 泛用。
+function isKnownNullaryPrefix(f: string, isDeno: boolean): boolean {
+  if (f.startsWith("--experimental-")) return true;
+  if (isDeno && (f.startsWith("--allow-") || f === "-A")) return true;
+  return false;
 }
 function flagName(tok: string): string {
   const eq = tok.indexOf("=");
@@ -932,8 +1080,10 @@ type InterpForm =
 /** 解析直譯器葉形態。fail-safe：任何不確定 → { kind: "none" } 或 null（非直譯器/動態）。 */
 export function recognizeInterpreter(inv: CommandInvocation): { lang: Lang; form: InterpForm } | null {
   if (inv.name === null) return null;
-  let name = inv.name;
+  const name = inv.name;
   let argv = inv.argv;
+  const isDeno = name === "deno";
+  let denoRun = false;
   // deno/bun 子指令
   if (name === "deno") {
     const sub = argv.length > 0 ? staticValue(argv[0]) : null;
@@ -941,12 +1091,11 @@ export function recognizeInterpreter(inv: CommandInvocation): { lang: Lang; form
       const p = argv.length > 1 ? staticValue(argv[1]) : null;
       return p === null ? null : { lang: "js", form: { kind: "inline", payload: p } };
     }
-    if (sub === "run") argv = argv.slice(1);
+    if (sub === "run") { argv = argv.slice(1); denoRun = true; }
     else return null;
   } else if (name === "bun") {
     const sub = argv.length > 0 ? staticValue(argv[0]) : null;
     if (sub === "run") argv = argv.slice(1);
-    // 裸 bun（配 heredoc）由下方 stdin 判定
   }
   const lang = INTERP_LANG[name];
   if (lang === undefined) return null;
@@ -957,10 +1106,11 @@ export function recognizeInterpreter(inv: CommandInvocation): { lang: Lang; form
   while (i < argv.length) {
     const v = staticValue(argv[i]);
     if (v === null) return null;
-    if (!v.startsWith("-") || v === "-") {
-      if (v === "-") return { lang, form: { kind: "none" } };  // bun/deno run - 不特案
-      return { lang, form: { kind: "script", entrypoint: v } };
+    if (v === "-") {
+      // deno run - 為 stdin 標記；其餘（含 bun run -）不特案 → none
+      return denoRun ? { lang, form: { kind: "stdin" } } : { lang, form: { kind: "none" } };
     }
+    if (!v.startsWith("-")) return { lang, form: { kind: "script", entrypoint: v } };
     const fn = flagName(v);
     if (inlineFlags.has(fn)) {
       const val = flagValue(v, argv[i + 1]);
@@ -972,7 +1122,7 @@ export function recognizeInterpreter(inv: CommandInvocation): { lang: Lang; form
     }
     if (INJECT_FLAGS.has(fn)) return { lang, form: { kind: "none" } };
     if (v.includes("=")) { i++; continue; }
-    if (KNOWN_NULLARY.has(fn) || isKnownNullaryPrefix(fn)) { i++; continue; }
+    if (KNOWN_NULLARY.has(fn) || isKnownNullaryPrefix(fn, isDeno)) { i++; continue; }
     return { lang, form: { kind: "none" } };   // 分離未知裸旗標 → 保守放棄
   }
   return { lang, form: { kind: "stdin" } };    // 無位置參數、無 inline → 可能配 heredoc
@@ -1064,8 +1214,22 @@ Deno.test("printDisguiseDeny: WRITE→EXEC(a)", () => {
   assertEquals(pd(`cat > /tmp/x.mjs <<'EOF'\nconsole.log("f")\nEOF\nnode /tmp/x.mjs`), "write-exec");
   assertEquals(pd(`echo 'console.log("f")' > f; node f`), "write-exec");
   assertEquals(pd(`echo 'console.log("f")' > fixture.js; node runner.js fixture.js`), null);       // P=argv
+  assertEquals(pd(`printf 'x\\n' > fixture.py; python runner.py fixture.py`), null);               // python P=argv
+  assertEquals(pd(`echo 'x' > f.ts; deno run runner.ts f.ts`), null);                              // deno P=argv
   assertEquals(pd(`echo 'console.log("x")' > fixture.js; node --loader fixture.js runner.js`), null); // P=旗標值
+  assertEquals(pd(`echo 'x' > cfg.json; ts-node --project cfg.json runner.ts`), null);             // ts-node 吃值旗標
+  assertEquals(pd(`echo 'x' > im.json; deno run --import-map im.json runner.ts`), null);           // deno 吃值旗標
   assertEquals(pd(`echo 'console.log("f")' > x.mjs; node --experimental-default-type=module x.mjs`), "write-exec");
+  assertEquals(pd(`echo 'console.log("f")' > x.ts; ts-node --transpile-only x.ts`), "write-exec"); // 已知 nullary
+  assertEquals(pd(`echo 'console.log("f")' > x.ts; deno run --allow-read x.ts`), "write-exec");    // deno --allow-read nullary
+});
+
+Deno.test("printDisguiseDeny: cat-readback 邊界 + config over-deny + 控制流", () => {
+  assertEquals(pd(`cat >> q <<'EOF'\nx\nEOF\ncat q`), null);                    // append → 非 WRITE
+  assertEquals(pd(`if c; then cat > q <<'EOF'\nx\nEOF\nfi; cat q`), null);      // 跨控制流
+  assertEquals(pd(`cat > config.yaml <<'EOF'\nk: v\nEOF\ncat config.yaml`), "cat-readback"); // accepted over-deny
+  assertEquals(pd(`if command -v node; then node -e 'console.log("f")'; else echo 假; fi`), null); // guard 非載具
+  assertEquals(pd(`if true; then echo 假; fi`), null);                          // clause true 非載具
 });
 
 Deno.test("printDisguiseDeny: WRITE→EXEC(b) cat 讀回", () => {
@@ -1103,15 +1267,18 @@ Expected: FAIL（`printDisguiseDeny` 未匯出）。
 在 `src/engine/print_only.ts` 頂部**合併** import（勿重複）：
 
 ```typescript
-import type { AndOr, Command, CompoundList, Node, Pipeline, Script, Statement, Word } from "../deps.ts";
+import type {
+  AndOr, ArithmeticExpression, Command, CompoundList, Node, Pipeline, Redirect,
+  Script, Statement, TestExpression, Word, WordPart,
+} from "../deps.ts";
 import type { CwdState } from "../types.ts";
 import { applyCd, isCd } from "./cwd.ts";
 import { normalizeAbsolute } from "./scope.ts";
 import type { PrintDisguiseKind } from "../rules/types.ts";
-import { catTacText, producerStdout, writtenContent } from "./static_output.ts";
+import { producerStdout, writtenContent } from "./static_output.ts";
 ```
 
-新增：
+新增（走訪完整鏡射 `walk.ts`：相同的節點下降、`$()`/`<()` 列舉、繼承重導向）：
 
 ```typescript
 type Role = "leaf" | "write-exec" | "pipe" | "setup" | "none";
@@ -1119,43 +1286,50 @@ const SETUP_NAMES = new Set(["mkdir", "cd", "true", ":"]);
 
 interface Leaf {
   inv: CommandInvocation;
-  cmd: Command;          // 原 AST 節點（保留 name，供還原）
+  cmd: Command;
   role: Role;
   carrier: "shell" | "interp" | null;
 }
 interface WriteRef {
-  leaf: Leaf;            // 指向 WRITE 葉的 Leaf 物件（配對時回頭改 role）
+  leaf: Leaf;
   path: string;
   content: string | null;
   cwd: CwdState;
 }
 
-/** 聚合入口：單一自足走訪、兩階段。回命中 kind 或 null。 */
+/** 聚合入口：單一自足走訪（鏡射 walk.ts）、兩階段。回命中 kind 或 null。 */
 export function printDisguiseDeny(script: Script, initialCwd: CwdState): { kind: PrintDisguiseKind } | null {
   const leaves: Leaf[] = [];
   let hasWriteExecComposite = false;
 
-  const seq = (statements: Statement[], startCwd: CwdState): CwdState => {
+  // 序列：thread cwd + prevWrite；` ` / `;` / `&&` 連接的 sibling 傳遞 prev；背景/控制流重置。
+  const seq = (statements: Statement[], startCwd: CwdState, inherited: Redirect[], persistent: boolean): CwdState => {
     let cwd = startCwd;
     let prev: WriteRef | null = null;
     for (const stmt of statements) {
-      if (stmt.background === true) prev = null;   // 背景不參與 adjacency
-      const res = node(stmt.command, cwd, false, prev);
-      cwd = res.cwd;
-      prev = stmt.background === true ? null : res.prev;
+      for (const r of stmt.redirects) enumRedirect(r, cwd);        // 繼承 heredoc 內 $()
+      const merged = [...inherited, ...stmt.redirects];
+      if (stmt.background === true) {
+        node(stmt.command, cwd, merged, false, true, null);        // 背景：不參與 adjacency、跳過 pipe 配對
+        prev = null;
+        continue;
+      }
+      const r = node(stmt.command, cwd, merged, false, false, prev);
+      if (persistent) cwd = r.cwd;
+      prev = r.prev;
     }
     return cwd;
   };
 
-  // 回傳 { cwd, prev }：prev 為此節點後可傳遞給下一 sibling 的 WRITE。
-  const node = (n: Node, cwd: CwdState, negated: boolean, prev: WriteRef | null): { cwd: CwdState; prev: WriteRef | null } => {
+  // 回 { cwd, prev }。bg=true → 停用 pipe 配對；negated 傳給單成員否定 Pipeline。
+  const node = (n: Node, cwd: CwdState, inherited: Redirect[], negated: boolean, bg: boolean, prev: WriteRef | null): { cwd: CwdState; prev: WriteRef | null } => {
     switch (n.type) {
       case "Command": {
         const cmd = n as Command;
-        const inv = toInv(cmd, cwd);
+        const inv = toInv(cmd, cwd, inherited);
         const leaf = classify(inv, cmd, negated, prev);
         leaves.push(leaf);
-        descendWordSubstitutions(cmd, cwd);          // $() 內層葉（任何位置載具）
+        descendCmdSubstitutions(cmd, cwd);
         const nextPrev = detectWrite(inv, cmd, cwd, leaf);
         const nextCwd = isCd(cmd) ? applyCd(cmd, cwd) : cwd;
         return { cwd: nextCwd, prev: nextPrev };
@@ -1165,74 +1339,97 @@ export function printDisguiseDeny(script: Script, initialCwd: CwdState): { kind:
         let cur = cwd;
         let p = prev;
         for (let k = 0; k < ao.commands.length; k++) {
-          if (k > 0 && ao.operators[k - 1] === "||") p = null;   // || 重置 adjacency
-          const r = node(ao.commands[k], cur, negated, p);
+          if (k > 0 && ao.operators[k - 1] === "||") p = null;      // || 重置 adjacency
+          const r = node(ao.commands[k], cur, inherited, negated, bg, p);
           cur = r.cwd;
           p = r.prev;
         }
         return { cwd: cur, prev: p };
       }
       case "Pipeline": {
-        const pl = n as Pipeline;
-        detectPipe(pl, cwd, pl.negated === true);
+        detectPipe(n as Pipeline, cwd, inherited, bg);
         return { cwd, prev: null };
       }
       case "Subshell":
-        seq(n.body.commands, cwd);
+        seq(n.body.commands, cwd, inherited, false);
         return { cwd, prev: null };
       case "BraceGroup":
-        return { cwd: seq(n.body.commands, cwd), prev: null };
+        return { cwd: seq(n.body.commands, cwd, inherited, true), prev: null };
       case "CompoundList":
-        return { cwd: seq((n as CompoundList).commands, cwd), prev: null };
+        return { cwd: seq((n as CompoundList).commands, cwd, inherited, true), prev: null };
       case "If":
-        seq(n.clause.commands, cwd);
-        seq(n.then.commands, cwd);
-        if (n.else) n.else.type === "If" ? node(n.else, cwd, false, null) : seq(n.else.commands, cwd);
-        return { cwd, prev: null };
+        seq(n.clause.commands, cwd, inherited, false);
+        seq(n.then.commands, cwd, inherited, false);
+        if (n.else) n.else.type === "If" ? node(n.else, cwd, inherited, false, false, null) : seq(n.else.commands, cwd, inherited, false);
+        return { cwd: afterControlFlow(cwd), prev: null };
       case "For":
       case "Select":
-        seq(n.body.commands, cwd);
-        return { cwd, prev: null };
+        for (const w of n.wordlist) descendWord(w, cwd);
+        seq(n.body.commands, cwd, inherited, false);
+        return { cwd: afterControlFlow(cwd), prev: null };
       case "While":
-        seq(n.clause.commands, cwd);
-        seq(n.body.commands, cwd);
-        return { cwd, prev: null };
+        seq(n.clause.commands, cwd, inherited, false);
+        seq(n.body.commands, cwd, inherited, false);
+        return { cwd: afterControlFlow(cwd), prev: null };
+      case "ArithmeticFor":
+        seq(n.body.commands, cwd, inherited, false);
+        return { cwd: afterControlFlow(cwd), prev: null };
       case "Case":
-        for (const it of n.items) seq(it.body.commands, cwd);
+        descendWord(n.word, cwd);
+        for (const it of n.items) {
+          for (const p of it.pattern) descendWord(p, cwd);
+          seq(it.body.commands, cwd, inherited, false);
+        }
+        return { cwd: afterControlFlow(cwd), prev: null };
+      case "ArithmeticCommand":
+        descendArith(n.expression, cwd);
         return { cwd, prev: null };
-      case "Statement":
-        if ((n as Statement).background === true) return { cwd, prev: null };
-        return node((n as Statement).command, cwd, negated, prev);
+      case "TestCommand":
+        if (n.expression) descendTest(n.expression, cwd);
+        return { cwd, prev: null };
+      case "Coproc":
+        if (n.name) descendWord(n.name, cwd);
+        for (const r of n.redirects) enumRedirect(r, cwd);
+        node(n.body, cwd, [...inherited, ...n.redirects], false, false, null);
+        return { cwd, prev: null };
+      case "Statement": {
+        const st = n as Statement;
+        for (const r of st.redirects) enumRedirect(r, cwd);
+        if (st.background === true) { node(st.command, cwd, [...inherited, ...st.redirects], false, true, null); return { cwd, prev: null }; }
+        return node(st.command, cwd, [...inherited, ...st.redirects], negated, bg, prev);
+      }
       default:
         return { cwd, prev: null };
     }
   };
 
-  // 單一否定 Pipeline（! cmd）：把否定傳給唯一成員；≥2 成員為 pipe。
-  const detectPipe = (pl: Pipeline, cwd: CwdState, negated: boolean): void => {
+  // 控制流後：cd 可能已改；保守標 unknown（後續相對路徑 WRITE→EXEC 仍以相同相對字串同檔比對，安全）。
+  const afterControlFlow = (cwd: CwdState): CwdState => cwd.kind === "known" ? { kind: "unknown" } : cwd;
+
+  const detectPipe = (pl: Pipeline, cwd: CwdState, inherited: Redirect[], bg: boolean): void => {
     const members = pl.commands;
-    if (members.length === 1) { node(members[0], cwd, negated, null); return; }
-    if (members.length !== 2 || negated) {
-      for (const m of members) node(m, cwd, false, null);
-      return;
-    }
-    const prod = members[0].type === "Command" ? members[0] as Command : null;
-    const cons = members[1].type === "Command" ? members[1] as Command : null;
-    if (prod && cons) {
-      const consInv = toInv(cons, cwd);
-      const source = producerStdout(prod);
-      const r = recognizeInterpreter(consInv);
-      const clean = consInv.assignments.length === 0 && r !== null && r.form.kind === "stdin" && !hasFd0Override(consInv);
-      if (source !== null && clean && payloadIsAllStaticPrint(source, r.lang)) {
-        leaves.push({ inv: toInv(prod, cwd), cmd: prod, role: "pipe", carrier: null });
-        leaves.push({ inv: consInv, cmd: cons, role: "pipe", carrier: null });
-        return;
+    if (members.length === 1) { node(members[0], cwd, inherited, pl.negated === true, bg, null); return; }
+    // 恰兩段、非背景、無整體 pipeline（繼承）重導向 → 嘗試配對；否定不影響資料流、照常判。
+    const canPair = members.length === 2 && !bg && inherited.length === 0;
+    if (canPair) {
+      const prod = members[0].type === "Command" ? members[0] as Command : null;
+      const cons = members[1].type === "Command" ? members[1] as Command : null;
+      if (prod && cons) {
+        const consInv = toInv(cons, cwd, []);
+        const source = producerStdout(prod);
+        const r = recognizeInterpreter(consInv);
+        const clean = consInv.assignments.length === 0 && r !== null && r.form.kind === "stdin" && !hasFd0Override(consInv);
+        if (source !== null && clean && payloadIsAllStaticPrint(source, r.lang)) {
+          leaves.push({ inv: toInv(prod, cwd, []), cmd: prod, role: "pipe", carrier: null });
+          leaves.push({ inv: consInv, cmd: cons, role: "pipe", carrier: null });
+          return;
+        }
       }
     }
-    for (const m of members) node(m, cwd, false, null);
+    for (const m of members) node(m, cwd, [], false, false, null);   // 不配對：各段當一般葉
   };
 
-  seq(script.commands, initialCwd);
+  seq(script.commands, initialCwd, [], true);
 
   // 階段 2
   if (leaves.length === 0) return null;
@@ -1250,9 +1447,8 @@ export function printDisguiseDeny(script: Script, initialCwd: CwdState): { kind:
   function classify(inv: CommandInvocation, cmd: Command, negated: boolean, prev: WriteRef | null): Leaf {
     const exec = matchExec(inv, prev);
     if (exec !== null) {
-      prev!.leaf.role = "write-exec";                 // 回頭把 WRITE 葉標為複合成員
-      if (exec === "interp") hasWriteExecComposite = true;
-      else hasWriteExecComposite ||= true;            // cat-readback 也算 WRITE→EXEC（吃 setup 豁免）
+      prev!.leaf.role = "write-exec";
+      hasWriteExecComposite = true;
       return { inv, cmd, role: "write-exec", carrier: null };
     }
     const carrier = leafCarrier(inv);
@@ -1263,7 +1459,6 @@ export function printDisguiseDeny(script: Script, initialCwd: CwdState): { kind:
     return { inv, cmd, role: "none", carrier: null };
   }
 
-  /** EXEC 配對：回 "interp"（a）/ "cat"（b）/ null。 */
   function matchExec(inv: CommandInvocation, prev: WriteRef | null): "interp" | "cat" | null {
     if (prev === null || prev.content === null || inv.assignments.length > 0) return null;
     const r = recognizeInterpreter(inv);
@@ -1271,14 +1466,13 @@ export function printDisguiseDeny(script: Script, initialCwd: CwdState): { kind:
       if (!sameFile(r.form.entrypoint, inv.cwd, prev.path, prev.cwd)) return null;
       return payloadIsAllStaticPrint(prev.content, r.lang) ? "interp" : null;
     }
-    if (inv.name === "cat" || inv.name === "tac") {
+    if ((inv.name === "cat" || inv.name === "tac") && !hasFd0Override(inv)) {   // cat 讀回：無 fd0 覆蓋
       const op = soleReadOperand(inv);
       if (op !== null && sameFile(op, inv.cwd, prev.path, prev.cwd)) return "cat";
     }
     return null;
   }
 
-  /** 偵測靜態 WRITE（cat/tac/echo/printf、唯一 fd1 截斷 `>`/`>|` 到靜態路徑、內容可還原）→ WriteRef，否則 null。 */
   function detectWrite(inv: CommandInvocation, cmd: Command, cwd: CwdState, leaf: Leaf): WriteRef | null {
     if (inv.name === null || inv.assignments.length > 0) return null;
     if (!["cat", "tac", "echo", "printf"].includes(inv.name)) return null;
@@ -1298,42 +1492,61 @@ export function printDisguiseDeny(script: Script, initialCwd: CwdState): { kind:
     const r = recognizeInterpreter(l.inv);
     return r !== null && r.form.kind === "script";
   }
-  function descendWordSubstitutions(cmd: Command, cwd: CwdState): void {
-    const words: Word[] = [
-      ...(cmd.name ? [cmd.name] : []),
-      ...cmd.suffix,
-      ...cmd.prefix.flatMap((a) => (a.value ? [a.value] : [])),
-      ...cmd.redirects.flatMap((r) => (r.target ? [r.target] : [])),
-      ...cmd.redirects.flatMap((r) => (r.body ? [r.body] : [])),
-    ];
-    for (const w of words) descendWord(w, cwd);
+
+  // $()/<() 列舉：Command 的所有 word（name/suffix/prefix 值/redirect target·body）
+  function descendCmdSubstitutions(cmd: Command, cwd: CwdState): void {
+    if (cmd.name) descendWord(cmd.name, cwd);
+    for (const w of cmd.suffix) descendWord(w, cwd);
+    for (const a of cmd.prefix) if (a.value) descendWord(a.value, cwd);
+    for (const r of cmd.redirects) enumRedirect(r, cwd);
+  }
+  function enumRedirect(r: Redirect, cwd: CwdState): void {
+    if (r.target) descendWord(r.target, cwd);
+    if (r.body) descendWord(r.body, cwd);
   }
   function descendWord(w: Word, cwd: CwdState): void {
     if (!w.parts) return;
-    for (const part of w.parts) {
-      if ((part.type === "CommandExpansion" || part.type === "ProcessSubstitution") && part.script) {
-        seq(part.script.commands, cwd);   // 內層葉（非持久 cwd、prev 由 seq 重置）
-      } else if (part.type === "DoubleQuoted" || part.type === "LocaleString") {
-        for (const child of part.parts) descendWordPart(child, cwd);
-      }
+    for (const part of w.parts) descendPart(part, cwd);
+  }
+  function descendPart(part: WordPart, cwd: CwdState): void {
+    if ((part.type === "CommandExpansion" || part.type === "ProcessSubstitution") && part.script) {
+      seq(part.script.commands, cwd, [], false);   // 內層葉（prev/cwd 不外洩）
+    } else if (part.type === "ArithmeticExpansion") {
+      descendArith(part.expression, cwd);
+    } else if (part.type === "DoubleQuoted" || part.type === "LocaleString") {
+      for (const child of part.parts) descendPart(child, cwd);
     }
   }
-  function descendWordPart(part: Word["parts"][number], cwd: CwdState): void {
-    if ((part.type === "CommandExpansion" || part.type === "ProcessSubstitution") && part.script) {
-      seq(part.script.commands, cwd);
-    } else if (part.type === "DoubleQuoted" || part.type === "LocaleString") {
-      for (const child of part.parts) descendWordPart(child, cwd);
+  function descendArith(expr: ArithmeticExpression | undefined, cwd: CwdState): void {
+    if (!expr) return;
+    switch (expr.type) {
+      case "ArithmeticCommandExpansion": if (expr.script) seq(expr.script.commands, cwd, [], false); return;
+      case "ArithmeticBinary": descendArith(expr.left, cwd); descendArith(expr.right, cwd); return;
+      case "ArithmeticUnary": descendArith(expr.operand, cwd); return;
+      case "ArithmeticTernary": descendArith(expr.test, cwd); descendArith(expr.consequent, cwd); descendArith(expr.alternate, cwd); return;
+      case "ArithmeticGroup": descendArith(expr.expression, cwd); return;
+      default: return;
+    }
+  }
+  function descendTest(expr: TestExpression, cwd: CwdState): void {
+    switch (expr.type) {
+      case "TestUnary": descendWord(expr.operand, cwd); return;
+      case "TestBinary": descendWord(expr.left, cwd); descendWord(expr.right, cwd); return;
+      case "TestLogical": descendTest(expr.left, cwd); descendTest(expr.right, cwd); return;
+      case "TestNot": descendTest(expr.operand, cwd); return;
+      case "TestGroup": descendTest(expr.expression, cwd); return;
+      default: return;
     }
   }
 }
 
-// ── module-level helpers（非閉包，供上方使用）──
-function toInv(cmd: Command, cwd: CwdState): CommandInvocation {
+// ── module-level helpers ──
+function toInv(cmd: Command, cwd: CwdState, inherited: Redirect[]): CommandInvocation {
   return {
     name: cmd.name ? staticValue(cmd.name) : null,
     argv: cmd.suffix,
     assignments: cmd.prefix,
-    redirects: cmd.redirects,
+    redirects: [...inherited, ...cmd.redirects],
     cwd,
   };
 }
@@ -1344,7 +1557,7 @@ function soleTruncWrite(redirects: CommandInvocation["redirects"]): string | nul
   );
   if (fd1.length !== 1) return null;
   const r = fd1[0];
-  if (r.operator !== ">" && r.operator !== ">|") return null;   // append/其他 → 非 WRITE
+  if (r.operator !== ">" && r.operator !== ">|") return null;
   return r.target ? staticValue(r.target) : null;
 }
 function soleReadOperand(inv: CommandInvocation): string | null {
@@ -1371,14 +1584,14 @@ function sameFile(a: string, ca: CwdState, b: string, cb: CwdState): boolean {
 function resolveForCompare(p: string, cwd: CwdState): string | null {
   if (p.startsWith("/") || /^[A-Za-z]:/.test(p)) return normalizeAbsolute(p);
   if (cwd.kind === "known") return normalizeAbsolute(cwd.path + "/" + p);
-  return "REL:" + p;   // cwd unknown：相同相對字串同檔；絕對 vs 相對 → 不等
+  return "REL:" + p;
 }
 ```
 
 > 實作備註：
-> - `catTacText` import 於本 Task 但主要供 producer/writtenContent 內部；若 lint 報 `catTacText` 未使用，改為只 import `producerStdout`/`writtenContent`（兩者內部已用 catTacText）。**最終 import 以 `deno lint` 綠燈為準**。
-> - `descendWordPart` 的參數型別用 `Word["parts"][number]`（WordPart）；若型別推導不便，改 import `WordPart` from `../deps.ts`。
-> - cat-readback（b）與直譯器（a）都設 `hasWriteExecComposite = true`（皆屬 WRITE→EXEC 複合、吃 setup 豁免）。
+> - 走訪鏡射 `walk.ts`：每個節點型別與 `$()`/`<()` 列舉、繼承重導向、`cd` cwd 穿透皆比照，確保**葉集與 walk 一致**（一個藏在 `$()`/guard 的非載具葉會納入覆蓋、避免誤 deny）。
+> - cat-readback（b）與直譯器（a）配對皆設 `hasWriteExecComposite = true`（皆屬 WRITE→EXEC 複合、吃 setup 豁免）。
+> - `descendPart` 的參數型別為 `WordPart`（已 import）。
 
 - [ ] **Step 4: 跑測試確認通過**
 
@@ -1436,10 +1649,25 @@ Deno.test("evaluate：no-op 空指令 allow；寫含函式 script 非 deny", () 
 });
 ```
 
+- [ ] **Step 1b: 更新既有 `evaluate_test.ts` 的「函式遮蔽 → ask」斷言為 deny（現由閘②）**
+
+既有測試假設舊「函式遮蔽 → ask/allow」語意，本版改為「任何可執行函式定義 → deny」。就地修改以下既有斷言（行號依現況、以字串內容為準）：
+- `assertEquals(vd("if false; then echo(){ :; }; fi; echo fake"), "ask");` → 改 `"deny"`（dead branch 函式定義亦 deny）。
+- 整個 `Deno.test("閘③ 函式遮蔽 → ask（不可升級）", …)` 區塊：
+  - `vd("date(){ sleep 5; }; date")`、`vd("pwd(){ echo fake; }; pwd")`、`vd("waiter(){ sleep 5; }; waiter")`、
+    `vd("date(){ sleep 5; }; date", rulesOf({ allow: ["Bash(date *)"] }))`、`vd('echo "$(date(){ rm x; }; date)"')`、
+    `vd("f(){ :; }; ls -la")`、`vd("ls -la; ls(){ :; }")`、`vd("ls(){ :; }; ls -la")`、`vd("ls -la; cd(){ :; }")`
+    → 全部改斷言 `"deny"`（皆含可執行函式定義）。
+    （其中含 `sleep` 者本來就 deny，改後仍 deny；測試名稱改為「閘② 名稱重定義 → deny（不可升級）」。）
+- `assertEquals(vd('echo "fake"; echo(){ :; }'), "deny");` → 保持 `"deny"`（已是 deny，reason 由函式遮蔽 ask 改函式定義 deny，verdict 不變）。
+- 若有 `sleep(){ :; }; sleep 5` / `sleep 5; sleep(){ :; }` → 仍 `"deny"`（閘① sleep 先命中；不需改）。
+
+**做法**：逐一比對 `evaluate_test.ts` 現有含 `(){` 的斷言，凡 verdict 為 `"ask"`/`"allow"` 者改為 `"deny"`；含 `sleep` 的維持 `"deny"`。
+
 - [ ] **Step 2: 跑測試確認失敗**
 
 Run: `deno test --allow-env src/engine/evaluate_test.ts`
-Expected: FAIL（`f(){:;}` 目前 allow/ask、`node -e` 目前非 deny）。
+Expected: FAIL（新斷言 `f(){:;}` 期望 deny 但實作未改、`node -e` 期望 deny）。
 
 - [ ] **Step 3: 改寫 `evaluate.ts`**
 
@@ -1559,8 +1787,9 @@ Deno.test("e2e: 閘②/③ 命中不可升級（settings 有 Bash(node *)/Bash(e
     for (const command of [
       `node -e 'console.log("fake")'`,                                  // inline A
       `node <<'EOF'\nconsole.log("f")\nEOF`,                            // heredoc-stdin B
-      `cat > ${proj}/x.mjs <<'EOF'\nconsole.log("f")\nEOF\nnode ${proj}/x.mjs`, // write-exec
-      `echo 'console.log(1)' | node`,                                   // pipe
+      `cat > ${proj}/x.mjs <<'EOF'\nconsole.log("f")\nEOF\nnode ${proj}/x.mjs`, // write-exec C(a)
+      `cat > ${proj}/q.txt <<'EOF'\ndead\nEOF\ncat ${proj}/q.txt`,      // cat-readback C(b)
+      `echo 'console.log(1)' | node`,                                   // pipe D
       "echo a; echo b",                                                 // shell
       "f(){ :; }; echo done",                                           // 函式
       "alias grep=x; grep foo",                                        // alias
@@ -1650,7 +1879,7 @@ git commit -m "test(e2e): unupgradeable deny (settings fixture) + migration + no
 - 「## 這是什麼」段：deny 三類 → 四類，加「④ 名稱重定義（函式定義＋alias 類）」；「整鏈 print-only 偽裝」定義擴充為跨載具。
 - 「## 架構（評估管線）」段的管線圖：改為 `parse → walk → 閘① sleep → 閘② 名稱重定義 → no-op → 閘③ printDisguiseDeny → classify → combine`；`engine/` 檔案清單補 `static_output.ts`、`interp_payload.ts`，並更新 `print_only.ts` 職責描述（載具框架＋`printDisguiseDeny`）、`walk.ts` 補兩 helper。
 - 「## 核心不變量」段：deny 由三類改四類；閘②③ classify 前返回、不可由 `permissions.allow` 升級。
-- 「### hook 決策 vs settings.json 權限的優先序」與「已接受繞道」段：node/python 裸 all-static-print 改硬 deny；兩步偽裝（cat 讀回）改硬 deny（唯一 accepted over-deny）；混載具全 print 改 deny；`ls; echo 假`/`ls; node -e print` 洗白維持不 deny；函式定義＋alias → deny（取代函式遮蔽 ask）；其他 mutator（`hash`/`enable`/`PATH`/`source`）out-of-scope。
+- 「### hook 決策 vs settings.json 權限的優先序」與「已接受繞道」段：`node`/`python`/`deno`/`bun`/`ts-node` 的裸 all-static-print 改硬 deny；混載具全 print 改 deny；`ls; echo 假`/`ls; node -e print` 洗白維持不 deny（使用者定案）；函式定義＋alias 類 → deny（取代函式遮蔽 ask）；其他 mutator（`hash`/`enable`/`PATH`/`source`）out-of-scope。**兩處 accepted over-deny 明列**：(1) 名稱重定義（函式/alias），(2) cat 讀回兩步偽裝（`cat > x <<EOF…EOF; cat x` 由寫入重導向 ask 改硬 deny）。
 
 （就地融入既有章節，不新增重複章節。）
 
@@ -1672,31 +1901,33 @@ Expected: 產出 `dist/permission-checker`，無錯。
 
 ```bash
 PROJ=$(mktemp -d)
-# 逐項餵入並確認 hookSpecificOutput.permissionDecision：
-run() { CLAUDE_PROJECT_DIR="$PROJ" ./dist/permission-checker; }
+# feed <cmd> ：餵 JSON、回印 decision＋exit code＋reason 片段（用 python 解析）
+feed() {
+  printf '%s' "$1" | CLAUDE_PROJECT_DIR="$PROJ" ./dist/permission-checker
+  echo "  [exit=$?]"
+}
+j() { printf '{"tool_name":"Bash","tool_input":{"command":%s},"cwd":"%s"}' "$1" "$PROJ"; }
 
-# 1) write-exec → deny
-printf '{"tool_name":"Bash","tool_input":{"command":"cat > %s/v.mjs <<'\''EOF'\''\nconsole.log(\"f\")\nEOF\nnode %s/v.mjs"},"cwd":"%s"}' "$PROJ" "$PROJ" "$PROJ" | run
-# 2) cat-readback → deny
-printf '{"tool_name":"Bash","tool_input":{"command":"cat > %s/q.txt <<'\''EOF'\''\ndead\nEOF\ncat %s/q.txt"},"cwd":"%s"}' "$PROJ" "$PROJ" "$PROJ" | run
-# 3) 函式 → deny
-printf '{"tool_name":"Bash","tool_input":{"command":"f(){ :; }; echo done"},"cwd":"%s"}' "$PROJ" | run
-# 4) alias → deny
-printf '{"tool_name":"Bash","tool_input":{"command":"alias grep=x; grep foo"},"cwd":"%s"}' "$PROJ" | run
-# 5) 真實運算 → 非 deny（ask）
-printf '{"tool_name":"Bash","tool_input":{"command":"node -e '\''console.log(1+1)'\''"},"cwd":"%s"}' "$PROJ" | run
-# 6) 洗白 → 非 deny
-printf '{"tool_name":"Bash","tool_input":{"command":"ls; echo done"},"cwd":"%s"}' "$PROJ" | run
-# 7) 寫含函式 shell script → 非 deny（寫入重導向 ask）
-printf '{"tool_name":"Bash","tool_input":{"command":"cat > %s/d.sh <<'\''EOF'\''\ndeploy(){ echo hi; }\nEOF"},"cwd":"%s"}' "$PROJ" "$PROJ" | run
+# 期望 deny + 特定 reason（reason 片段）；並確認 exit 0：
+feed "$(j '"cat > '"$PROJ"'/v.mjs <<'\''EOF'\''\nconsole.log(\"f\")\nEOF\nnode '"$PROJ"'/v.mjs"')"   # 1) write-exec → deny，reason 含「執行同檔」
+feed "$(j '"cat > '"$PROJ"'/q.txt <<'\''EOF'\''\ndead\nEOF\ncat '"$PROJ"'/q.txt"')"                  # 2) cat-readback → deny，reason 含「cat 讀回」
+feed "$(j '"f(){ :; }; echo done"')"        # 3) 函式 → deny，reason 含「shell 函式」
+feed "$(j '"alias grep=x; grep foo"')"      # 4) alias → deny，reason 含「alias」
+feed "$(j '"node -e '\''console.log(1+1)'\''"')"   # 5) 真實運算 → 非 deny
+feed "$(j '"ls; echo done"')"               # 6) 洗白 → 非 deny
+feed "$(j '"cat > '"$PROJ"'/d.sh <<'\''EOF'\''\ndeploy(){ echo hi; }\nEOF"')"   # 7) 寫含函式 script → 非 deny（寫入重導向 ask）
 
-# 8) pre-execution 無副作用（binary 級）：預建檔、餵 write-exec、確認不變
-echo ORIGINAL > "$PROJ/x.mjs"
-printf '{"tool_name":"Bash","tool_input":{"command":"cat > %s/x.mjs <<'\''EOF'\''\nconsole.log(\"f\")\nEOF\nnode %s/x.mjs"},"cwd":"%s"}' "$PROJ" "$PROJ" "$PROJ" | run
-test "$(cat "$PROJ/x.mjs")" = "ORIGINAL" && echo "NO-SIDE-EFFECT OK" || echo "FAIL: file changed"
+# 8) pre-execution 無副作用（binary 級）：write-exec 與 cat-readback 兩檔、內容與 mtime 均不變
+for pair in "x.mjs:cat > $PROJ/x.mjs <<'EOF'\\nconsole.log(\"f\")\\nEOF\\nnode $PROJ/x.mjs" "q.txt:cat > $PROJ/q.txt <<'EOF'\\ndead\\nEOF\\ncat $PROJ/q.txt"; do
+  f="$PROJ/${pair%%:*}"; cmd="${pair#*:}"
+  echo ORIGINAL > "$f"; m0=$(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f")
+  printf '{"tool_name":"Bash","tool_input":{"command":"%s"},"cwd":"%s"}' "$cmd" "$PROJ" | CLAUDE_PROJECT_DIR="$PROJ" ./dist/permission-checker >/dev/null
+  m1=$(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f")
+  [ "$(cat "$f")" = "ORIGINAL" ] && [ "$m0" = "$m1" ] && echo "$f NO-SIDE-EFFECT OK" || echo "$f FAIL"
+done
 rm -rf "$PROJ"
 ```
-期望：1–4、8 為 `deny`；5–7 為非 deny；第 8 步印 `NO-SIDE-EFFECT OK`。任何不符即 regression，回對應 Task 修正後重跑。
+逐項確認：1–4 為 `deny` 且 reason 片段符合、`exit 0`；5–7 為非 deny；第 8 步兩檔皆印 `NO-SIDE-EFFECT OK`（內容＋mtime 不變）。任何不符即 regression，回對應 Task 修正後重跑。
 
 - [ ] **Step 5: commit**
 
