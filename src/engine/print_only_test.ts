@@ -1,7 +1,7 @@
 import { assertEquals } from "@std/assert";
 import { parse } from "../deps.ts";
 import type { Command } from "../deps.ts";
-import { isAllPrintOnly, isPrintOnlyForm, wordPrintEligible } from "./print_only.ts";
+import { isAllPrintOnly, isPrintOnlyForm, leafCarrier, wordPrintEligible } from "./print_only.ts";
 import { parseCommand } from "./parse.ts";
 import { walk } from "./walk.ts";
 import type { CwdState } from "../types.ts";
@@ -166,4 +166,67 @@ Deno.test("已接受邊界：\$(<file) 讀檔簡寫 / fd 複製 heredoc → 非�
   assertEquals(invs("cat <<EOF\n$(<README.md)\nEOF").some((i) => i.name === null), true);
   // fd 複製 heredoc：未模擬 fd 鏈 → 非 passthrough → 漏判 deny 但安全退回 ask
   assertEquals(isAllPrintOnly(invs("cat 3<<EOF\nx\nEOF <&3")), false);
+});
+
+const LC_CWD = { kind: "known", path: "/proj" } as const;
+function lc(src: string) { return leafCarrier(walk(parseCommand(src).script, LC_CWD, "/proj")[0]); }
+
+Deno.test("leafCarrier: shell 靜態吐字", () => {
+  assertEquals(lc("echo hi"), "shell");
+  assertEquals(lc("printf '%s\\n' hi"), "shell");
+  assertEquals(lc("cat <<'EOF'\nhi\nEOF"), "shell");
+  assertEquals(lc("ls"), null);
+});
+
+Deno.test("leafCarrier: 直譯器 inline（A）per-language", () => {
+  assertEquals(lc(`node -e 'console.log("fake")'`), "interp");
+  assertEquals(lc(`python -c 'print("x")'`), "interp");
+  assertEquals(lc(`node -p '"fake"'`), "interp");
+  assertEquals(lc(`deno eval 'console.log("x")'`), "interp");
+  assertEquals(lc(`node -e 'console.log(1+1)'`), null);
+  assertEquals(lc(`node -p '1+1'`), null);
+  assertEquals(lc(`node -c 'console.log("x")'`), null);   // node 無 -c → 非 inline
+  assertEquals(lc(`python -e 'print("x")'`), null);       // python 無 -e
+  assertEquals(lc(`node --no-warnings -e 'console.log("x")'`), "interp");
+  assertEquals(lc(`node --title -e 'console.log("x")'`), null);        // 分離未知旗標 → 放棄
+  assertEquals(lc(`node --require ./p.js -e 'console.log("x")'`), null);
+  assertEquals(lc(`node --require=./p.js -e 'console.log("x")'`), null); // =value 注入
+  assertEquals(lc(`X=1 node -e 'console.log("x")'`), null);            // 賦值前綴
+});
+
+Deno.test("leafCarrier: 直譯器 heredoc-stdin（B）", () => {
+  assertEquals(lc(`node <<'EOF'\nconsole.log("x")\nEOF`), "interp");
+  assertEquals(lc(`python <<'EOF'\nprint("x")\nEOF`), "interp");
+  assertEquals(lc(`deno run - <<'EOF'\nconsole.log("x")\nEOF`), "interp");   // deno run - 為 stdin
+  assertEquals(lc(`bun <<'EOF'\nconsole.log("x")\nEOF`), "interp");          // 裸 bun heredoc
+  assertEquals(lc(`bun -e 'console.log("x")'`), "interp");
+  assertEquals(lc(`ts-node -e 'console.log("x")'`), "interp");
+  assertEquals(lc(`node`), null);
+  assertEquals(lc(`node < real.js`), null);                                 // fd0 為檔案 → 非靜態 heredoc
+  assertEquals(lc(`python < f.py`), null);
+  assertEquals(lc(`node <<EOF\n$(ls)\nEOF`), null);                          // 未引號 $() body → 不可具體還原 → 非載具
+  assertEquals(lc(`bun run - <<'EOF'\nconsole.log("x")\nEOF`), null);        // bun run - 不特案
+});
+
+Deno.test("leafCarrier: 非 deno 的 --allow-* 為未知旗標 → 放棄；deno --allow-* 為 nullary", () => {
+  assertEquals(lc(`node --allow-read -e 'console.log("x")'`), null);         // node 無 --allow-read → 放棄
+  assertEquals(lc(`deno run --allow-read - <<'EOF'\nconsole.log("x")\nEOF`), "interp"); // deno --allow-read nullary
+});
+
+Deno.test("leafCarrier: run 子指令不吃 inline；未知/注入旗標放棄", () => {
+  assertEquals(lc(`deno run -e 'console.log("x")'`), null);   // run 模式：-e 非 inline（-e 被當 script 前的未知旗標）
+  assertEquals(lc(`bun run -e 'console.log("x")'`), null);
+  assertEquals(lc(`bun run -p '"x"'`), null);
+  assertEquals(lc(`node --unknown-flag val -e 'console.log("x")'`), null);   // 未知分離旗標 → 放棄
+  assertEquals(lc(`node --import=./m.mjs -e 'console.log("x")'`), null);     // =value 注入
+  assertEquals(lc(`node --experimental-loader=./l.mjs -e 'console.log("x")'`), null);
+  assertEquals(lc(`node --env-file=.env -e 'console.log("x")'`), null);
+  assertEquals(lc(`python -m pytest -c 'print("x")'`), null);               // -m 注入
+});
+
+Deno.test("leafCarrier: 已知 nullary 為 per-interpreter（別家的旗標 → 放棄）", () => {
+  assertEquals(lc(`node --esm -e 'console.log("x")'`), null);        // --esm 非 node nullary → 放棄
+  assertEquals(lc(`python --no-warnings -c 'print("x")'`), null);    // --no-warnings 非 python nullary → 放棄
+  assertEquals(lc(`ts-node --esm -e 'console.log("x")'`), "interp"); // --esm 是 ts-node nullary → 仍偵測
+  assertEquals(lc(`node --no-warnings -e 'console.log("x")'`), "interp"); // node 自家 nullary
 });
