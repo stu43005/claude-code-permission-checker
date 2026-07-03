@@ -409,3 +409,81 @@ Deno.test("e2e: .. in command stays literal -> ask despite fold-equivalent allow
   );
   assertEquals(JSON.parse(out).hookSpecificOutput.permissionDecision, "ask");
 });
+
+/** 建臨時專案並寫 permissions.allow settings，回專案路徑。 */
+async function projWithAllow(allow: string[]): Promise<string> {
+  const dir = await Deno.makeTempDir();
+  await Deno.mkdir(`${dir}/.claude`, { recursive: true });
+  await Deno.writeTextFile(`${dir}/.claude/settings.json`, JSON.stringify({ permissions: { allow } }));
+  return dir;
+}
+
+Deno.test("e2e: 閘②/③ 命中不可升級（settings 有 Bash(node *)/Bash(echo *)）", async () => {
+  const proj = await projWithAllow(["Bash(node *)", "Bash(python *)", "Bash(echo *)", "Bash(cat *)"]);
+  try {
+    for (const command of [
+      `node -e 'console.log("fake")'`,                                  // inline A
+      `node <<'EOF'\nconsole.log("f")\nEOF`,                            // heredoc-stdin B
+      `cat > ${proj}/x.mjs <<'EOF'\nconsole.log("f")\nEOF\nnode ${proj}/x.mjs`, // write-exec C(a)
+      `cat > ${proj}/q.txt <<'EOF'\ndead\nEOF\ncat ${proj}/q.txt`,      // cat-readback C(b)
+      `echo 'console.log(1)' | node`,                                   // pipe D
+      "echo a; echo b",                                                 // shell
+      "f(){ :; }; echo done",                                           // 函式
+      "alias grep=x; grep foo",                                        // alias
+    ]) {
+      const out = await runHook({ tool_name: "Bash", tool_input: { command }, cwd: proj }, proj);
+      assertEquals(JSON.parse(out).hookSpecificOutput.permissionDecision, "deny", command);
+    }
+    // 對照：真實運算 + Bash(node *) → allow（可升級）
+    const ok = await runHook(
+      { tool_name: "Bash", tool_input: { command: `node -e 'JSON.stringify(x)'` }, cwd: proj }, proj);
+    assertEquals(JSON.parse(ok).hookSpecificOutput.permissionDecision, "allow");
+  } finally {
+    await Deno.remove(proj, { recursive: true });
+  }
+});
+
+Deno.test("e2e: 跨呼叫 migration 邊界", async () => {
+  const bare = await Deno.makeTempDir();
+  const withAllow = await projWithAllow(["Bash(node *)"]);
+  try {
+    // 呼叫1：寫檔（無 allow）→ ask
+    const c1 = await runHook(
+      { tool_name: "Bash", tool_input: { command: `cat > ${bare}/x.mjs <<'EOF'\nconsole.log("f")\nEOF` }, cwd: bare }, bare);
+    assertEquals(JSON.parse(c1).hookSpecificOutput.permissionDecision, "ask");
+    // 呼叫2：執行（無 allow）→ ask
+    const c2 = await runHook(
+      { tool_name: "Bash", tool_input: { command: `node ${bare}/x.mjs` }, cwd: bare }, bare);
+    assertEquals(JSON.parse(c2).hookSpecificOutput.permissionDecision, "ask");
+    // 呼叫2 + Bash(node *) → allow（使用者自負）
+    const c3 = await runHook(
+      { tool_name: "Bash", tool_input: { command: `node ${withAllow}/x.mjs` }, cwd: withAllow }, withAllow);
+    assertEquals(JSON.parse(c3).hookSpecificOutput.permissionDecision, "allow");
+    // 對照：同一 payload 單一呼叫 + Bash(node *) → 仍 deny
+    const c4 = await runHook(
+      { tool_name: "Bash", tool_input: { command: `cat > ${withAllow}/y.mjs <<'EOF'\nconsole.log("f")\nEOF\nnode ${withAllow}/y.mjs` }, cwd: withAllow }, withAllow);
+    assertEquals(JSON.parse(c4).hookSpecificOutput.permissionDecision, "deny");
+  } finally {
+    await Deno.remove(bare, { recursive: true });
+    await Deno.remove(withAllow, { recursive: true });
+  }
+});
+
+Deno.test("e2e: pre-execution 無副作用（write-exec + cat-readback，內容/mtime 不變）", async () => {
+  const dir = await Deno.makeTempDir();
+  try {
+    for (const [file, command] of [
+      [`${dir}/x.mjs`, `cat > ${dir}/x.mjs <<'EOF'\nconsole.log("f")\nEOF\nnode ${dir}/x.mjs`],
+      [`${dir}/q.txt`, `cat > ${dir}/q.txt <<'EOF'\ndead\nEOF\ncat ${dir}/q.txt`],
+    ] as const) {
+      await Deno.writeTextFile(file, "ORIGINAL");
+      const before = (await Deno.stat(file)).mtime?.getTime();
+      const out = await runHook({ tool_name: "Bash", tool_input: { command }, cwd: dir }, dir);
+      assertEquals(JSON.parse(out).hookSpecificOutput.permissionDecision, "deny", command);
+      assertEquals(await Deno.readTextFile(file), "ORIGINAL", command);      // 內容不變
+      assertEquals((await Deno.stat(file)).mtime?.getTime(), before, command); // mtime 不變
+    }
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+});
