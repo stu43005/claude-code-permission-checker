@@ -94,6 +94,11 @@ Deno.test("payloadIsAllStaticPrint: js 不命中", () => {
   f('foo("x")');
   f('console.log(r"x")');                    // js 無 r 前綴 → r 為識別字 → 非法
   f('console.log("a")console.log("b")');     // 兩敘述無分隔符 → 非法
+  f('console.log(0x)');                       // 基底前綴無數字 → 非法
+});
+
+Deno.test("payloadIsAllStaticPrint: py 不吃 js-only 數字形式", () => {
+  assertEquals(payloadIsAllStaticPrint('print(1n)', "py"), false);   // BigInt 僅 js
 });
 
 Deno.test("payloadIsAllStaticPrint: py", () => {
@@ -205,7 +210,9 @@ function tokenize(src: string, lang: Lang): Tok[] | null {
       let j = i;
       if (src[j] === "0" && /[xXoObB]/.test(src[j + 1] ?? "")) {
         j += 2;
+        const s = j;
         while (j < n && /[0-9a-fA-F_]/.test(src[j])) j++;   // 0x/0o/0b
+        if (j === s) return null;                          // 基底前綴後無數字 → 非法 → 保守 false
       } else {
         while (j < n && /[0-9_]/.test(src[j])) j++;         // 整數部
         if (src[j] === ".") { j++; while (j < n && /[0-9_]/.test(src[j])) j++; } // 小數
@@ -215,7 +222,7 @@ function tokenize(src: string, lang: Lang): Tok[] | null {
           if (DIGIT.test(src[k] ?? "")) { j = k; while (j < n && /[0-9_]/.test(src[j])) j++; }
         }
       }
-      if (src[j] === "n") j++;                              // BigInt
+      if (lang === "js" && src[j] === "n") j++;             // BigInt 僅 js
       push({ kind: "NUMBER", value: src.slice(i, j) });
       i = j;
       continue;
@@ -386,7 +393,9 @@ git commit -m "feat(engine): add interp_payload static-print predicate"
 - Test: `src/engine/static_output_test.ts`
 - Modify: `src/engine/print_only.ts`（改 import）
 
-把 `print_only.ts` 現有的低層判定移入 `static_output.ts` 並 `export`，再新增還原函式。**還原函式吃原 `Command` 節點**（保留 `name`）。分兩種語意：`producerStdout`（純 stdout，有寫入重導向 → null，供 pipe producer）與 `writtenContent`（寫檔內容，忽略寫入重導向，供 WRITE 葉）。
+把 `print_only.ts` 現有的低層判定移入 `static_output.ts` 並 `export`，再新增還原函式。**還原函式吃原 `Command` 節點**（保留 `name`）。分兩種語意：`producerStdout`（純 stdout，stdout 被任何重導向轉走 → null，供 pipe producer）與 `writtenContent`（寫檔內容，忽略 fd1 寫入重導向，供 WRITE 葉）。
+
+> **API 命名（相對 spec §4.2 的刻意調整）**：spec §4.2 概念上命名 `echoOutput`/`printfOutput`/`commandOutput`。本實作改為 `echoText`/`printfText`/`catTacText`（**redirect-agnostic 的底層還原**，吃 `Command`）＋兩個對外語意包裝 `producerStdout`（stdout 語意）/`writtenContent`（寫檔語意）。此拆分是為滿足「pipe producer 要純 stdout、WRITE 葉要寫檔內容」兩種不同 redirect 語意（見 round-1/2 review）——語意等價、只是把單一函式拆成「底層還原＋語意包裝」。
 
 - [ ] **Step 1: 寫失敗測試**
 
@@ -409,14 +418,17 @@ Deno.test("echoText: 靜態 → 字串；動態/carve-out → null", () => {
   assertEquals(echoText(cmd('echo -e "a\\tb"')), null);   // -e + 反斜線 → 探測 carve-out
 });
 
-Deno.test("printfText: %s 純字串 → 還原；數值轉換符 → null", () => {
+Deno.test("printfText: 裸 %s/%b → 還原；數值/帶寬度轉換 → null", () => {
   assertEquals(printfText(cmd("printf '%s\\n' hi")), "hi\n");
-  assertEquals(printfText(cmd("printf '%d' 5")), null);
+  assertEquals(printfText(cmd("printf '%s%s' a b")), "ab");     // 循環套用
+  assertEquals(printfText(cmd("printf '%d' 5")), null);         // 數值
+  assertEquals(printfText(cmd("printf '%10s\\n' hi")), null);   // 帶寬度 → 無法精確還原
 });
 
-Deno.test("catTacText: cat 原序、tac 行反轉", () => {
+Deno.test("catTacText: cat 原序、tac 行反轉；here-string 補換行、<<- 去 tab", () => {
   assertEquals(catTacText(cmd("cat <<'EOF'\nA\nB\nEOF")), "A\nB\n");
   assertEquals(catTacText(cmd("tac <<'EOF'\nA\nB\nEOF")), "B\nA\n");
+  assertEquals(catTacText(cmd("cat <<<hi")), "hi\n");           // here-string 補換行
   assertEquals(catTacText(cmd("cat file.txt")), null);
 });
 
@@ -608,6 +620,8 @@ export function printfText(cmd: Command): string | null {
   if (fmt === undefined) return "";
   if (fmt.startsWith("-") && fmt !== "--") return null;
   if (hasFormatterConversion(fmt)) return null;        // 數值/日期/%q/%n 等 → null
+  // 只能具體還原「裸」%s/%b/%%；帶旗標/寬度/精度（如 %10s、%-5b）無法精確重建 → null（保守）。
+  if (/%[^sb%]/.test(fmt.replace(/%%/g, ""))) return null;
   const operands = args.slice(idx + 1);
   // printf 會循環套用 format 直到 operands 用盡（POSIX）；至少套一次。
   const applyOnce = (start: number): { text: string; used: number } => {
@@ -663,14 +677,21 @@ function effectiveHeredocBody(redirects: Redirect[]): string | null {
   );
   if (fd0.length === 0) return null;
   const eff = fd0[fd0.length - 1];
-  // here-string：靜態才還原（含 $() 的 target → staticValue 為 null）
-  if (eff.operator === "<<<") return eff.target ? staticValue(eff.target) : "";
+  // here-string（`<<<`）：bash 於內容後補一個換行；靜態才還原（含 $() 的 target → staticValue 為 null）。
+  if (eff.operator === "<<<") {
+    const s = eff.target ? staticValue(eff.target) : "";
+    return s === null ? null : s + "\n";
+  }
   if (eff.operator !== "<<" && eff.operator !== "<<-") return null;
   // 只還原「可具體確定」的 body：引號 heredoc（不展開）或純文字（無 $/反引號）；
-  // 含 $() 的 body（結構化 Word，或 content 帶展開字元）→ 無法靜態知其實際輸出 → null。
-  if (eff.heredocQuoted === true) return eff.content ?? "";
-  if (eff.body) return null;                      // 結構化 body = 含展開 → 不可具體還原
-  return /[$`]/.test(eff.content ?? "") ? null : (eff.content ?? "");
+  // 含 $() 的 body（結構化 Word 或 content 帶展開字元）→ 無法靜態知其實際輸出 → null。
+  let body: string | null;
+  if (eff.heredocQuoted === true) body = eff.content ?? "";
+  else if (eff.body) body = null;
+  else body = /[$`]/.test(eff.content ?? "") ? null : (eff.content ?? "");
+  if (body === null) return null;
+  // `<<-` 移除每行前導 tab。
+  return eff.operator === "<<-" ? body.replace(/^\t+/gm, "") : body;
 }
 
 /** fd1（stdout）是否被任何重導向轉走（含 >/dev/null、>&2）——這類 stdout 不進 pipe。 */
@@ -933,6 +954,8 @@ function shoptEnablesAliases(argv: Word[]): boolean {
 ```
 
 > `ArithmeticExpression`/`TestExpression`/`Statement`/`Word`/`WordPart`/`Node`/`Script` 已於 `walk.ts` 檔頂 import；`CommandInvocation` 亦已 import。勿重複 import。
+>
+> **動態函式名 fail-closed（回應 coverage）**：`hasExecutableFunctionDefinition` 遇 `case "Function"` **一律回 true、完全不看 `node.name`**，故即使某 `Function` 節點的名字動態/無法靜態還原也照樣 deny（不像 name-based 的 `definedFunctionNames` 會漏收）。實務上 bash 函式名恆為字面（無 `$x(){…}` 語法），unbash 不會產生動態名 `Function` 節點，故此為「不依賴名稱可還原性」的 fail-closed 保證、無需（也無法用 bash 語法構造）額外測試。
 
 - [ ] **Step 4: 跑測試確認通過**
 
@@ -1049,6 +1072,8 @@ Deno.test("leafCarrier: 直譯器 heredoc-stdin（B）", () => {
   assertEquals(lc(`bun -e 'console.log("x")'`), "interp");
   assertEquals(lc(`ts-node -e 'console.log("x")'`), "interp");
   assertEquals(lc(`node`), null);
+  assertEquals(lc(`node < real.js`), null);                                 // fd0 為檔案 → 非靜態 heredoc
+  assertEquals(lc(`python < f.py`), null);
   assertEquals(lc(`bun run - <<'EOF'\nconsole.log("x")\nEOF`), null);        // bun run - 不特案
 });
 
@@ -1083,8 +1108,10 @@ import type { CommandInvocation } from "../types.ts";
 import type { Word } from "../deps.ts";
 import { staticValue } from "./word.ts";
 import { payloadIsAllStaticPrint, printExprIsStaticString, type Lang } from "./interp_payload.ts";
-import { isHeredocPrintEligible } from "./static_output.ts";  // 與 Task 2 的 static_output import 合併成一行
+import { isHeredocPrintEligible } from "./static_output.ts";
 ```
+
+> 把此處 `./static_output.ts` 的 `isHeredocPrintEligible` 與 Task 2 已加的 `./static_output.ts` import（`isCatPassthrough`/`isEchoPrintOnly`/`isPrintfPrintOnly`）**合併成同一行 import**，避免同模組重複 import。
 
 新增：
 
@@ -1302,6 +1329,7 @@ Deno.test("printDisguiseDeny: pipe（D）", () => {
   assertEquals(pd("echo 'console.log(1)' | node < real.js"), null);   // fd0 蓋過
   assertEquals(pd("node"), null);
   assertEquals(pd("echo 'console.log(1)' | node &"), null);           // 背景 → 跳過 pipe
+  assertEquals(pd("{ echo a | echo b; } > out"), null);               // 整體重導向 → 葉非載具（不誤 deny）
 });
 
 Deno.test("printDisguiseDeny: 注入旗標 EXEC → 不配對", () => {
@@ -1487,7 +1515,8 @@ export function printDisguiseDeny(script: Script, initialCwd: CwdState): { kind:
         }
       }
     }
-    for (const m of members) node(m, cwd, [], false, false, null);   // 不配對：各段當一般葉
+    // 不配對：各段當一般葉；保留 inherited（整體 pipeline 重導向使葉成非載具）、negated、bg。
+    for (const m of members) node(m, cwd, inherited, pl.negated === true, bg, null);
   };
 
   seq(script.commands, initialCwd, [], true);
@@ -2019,10 +2048,10 @@ for name, cmd, want, frag in cases:
 for f, cmd in [(f"{PROJ}/x.mjs", f'cat > {PROJ}/x.mjs <<\'EOF\'\nconsole.log("f")\nEOF\nnode {PROJ}/x.mjs'),
                (f"{PROJ}/q2.txt", f'cat > {PROJ}/q2.txt <<\'EOF\'\ndead\nEOF\ncat {PROJ}/q2.txt')]:
     open(f, "w").write("ORIGINAL"); st0 = os.stat(f)
-    run(cmd)
+    rc, dec, _ = run(cmd)
     st1 = os.stat(f)
-    good = open(f).read() == "ORIGINAL" and st0.st_mtime == st1.st_mtime
-    print(f"[{'OK' if good else 'FAIL'}] no-side-effect {os.path.basename(f)}")
+    good = dec == "deny" and rc == 0 and open(f).read() == "ORIGINAL" and st0.st_mtime == st1.st_mtime
+    print(f"[{'OK' if good else 'FAIL'}] no-side-effect {os.path.basename(f)} (decision={dec} exit={rc})")
     ok = ok and good
 sys.exit(0 if ok else 1)
 PY
