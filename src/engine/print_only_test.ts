@@ -317,3 +317,15 @@ Deno.test("printDisguiseDeny: -- 選項終止符不繞過", () => {
   assertEquals(pd(`cat > /tmp/x.mjs <<'EOF'\nconsole.log("f")\nEOF\nnode -- /tmp/x.mjs`), "write-exec");
   assertEquals(pd(`cat > /tmp/q.txt <<'EOF'\ndead\nEOF\ncat -- /tmp/q.txt`), "cat-readback");
 });
+
+Deno.test("printDisguiseDeny: setup/no-op 葉不斷開 WRITE→EXEC/readback；非 setup 葉仍斷開", () => {
+  // setup 葉（true/mkdir/cd/:）介於 WRITE 與 EXEC/readback 之間 → 仍成對 → deny
+  assertEquals(pd(`echo 'console.log("f")' > /tmp/x.mjs; true; node /tmp/x.mjs`), "write-exec");
+  assertEquals(pd(`cat > /tmp/x.mjs <<'EOF'\nconsole.log("f")\nEOF\nmkdir d\nnode /tmp/x.mjs`), "write-exec");
+  assertEquals(pd(`cat > /tmp/q.txt <<'EOF'\ndead\nEOF\ntrue\ncat /tmp/q.txt`), "cat-readback");
+  // 非 setup 葉（echo/ls）介於中間 → 斷開 → 不 deny（回歸保護）
+  assertEquals(pd(`cat > /tmp/q.txt <<'EOF'\nx\nEOF\necho hi\ncat /tmp/q.txt`), null);
+  assertEquals(pd(`cat > /tmp/x.mjs <<'EOF'\nconsole.log("f")\nEOF\nls\nnode /tmp/x.mjs`), null);
+  // cd 到別的目錄後相對路徑不同檔 → 不成對（回歸保護）
+  assertEquals(pd(`cat > x.mjs <<'EOF'\nconsole.log("f")\nEOF\ncd other\nnode x.mjs`), null);
+});

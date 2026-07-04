@@ -225,7 +225,8 @@ export function printDisguiseDeny(script: Script, initialCwd: CwdState): { kind:
         const leaf = classify(inv, cmd, negated, prev);
         leaves.push(leaf);
         descendCmdSubstitutions(cmd, cwd);
-        const nextPrev = detectWrite(inv, cmd, cwd, leaf);
+        const detected = detectWrite(inv, cmd, cwd, leaf);
+        const nextPrev = detected ?? (leaf.role === "setup" ? prev : null);
         const nextCwd = isCd(cmd) ? applyCd(cmd, cwd) : cwd;
         return { cwd: nextCwd, prev: nextPrev };
       }
