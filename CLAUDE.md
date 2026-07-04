@@ -230,6 +230,8 @@ Bash 不做此正規化，此為本 hook 刻意的加值層。
 **「整鏈 print」洗白繞道**（`ls; echo 假`、`pwd; echo 已驗證`、`ls; node -e 'console.log("done")'`）：
 因鏈中有真實指令（`ls`/`pwd` 等）而**非全鏈 print-carrier**，故**不 deny**，落該真實指令的既有判定（可能是 `allow` 或 `ask`，**非**「預設 ask + 升級」那一類）。此為使用者明確選擇維持乾淨結構規則、零誤殺的取捨。`hash`/`enable`/`PATH` 賦值/`source` 等其他 mutator out-of-scope：尚不偵測，預設 ask 保住安全底線。
 
+**bash 語法包裝繞過（out-of-scope，威脅模型明文排除）**：閘②/③ 只擋 agent **常見**的 print-only 假驗證形態，**不防**刻意用 bash 語法包裝來閃避偵測器。已知會落回既有判定（`ask`，或當使用者自設 `Bash(node *)` 等廣域規則時 `allow`）而不觸發硬 deny 的形態包括：pipe producer/consumer 包進 brace group / subshell（`{ echo 'console.log(1)'; } | node`、`( echo … ) | node`）、更深巢狀、以 fd 複製穿插於截斷寫入前（`echo … >&2 > x; node x`）等。**這類形態永遠不比 pre-feature baseline 差**（本工具在此功能之前本就不擋它們），屬使用者定案接受的 out-of-scope under-deny，**不逐一硬化**（否則無底洞、且與「只擋常見形態、不抗刻意包裝」的核心設計相悖）。若日後要收緊特定形態，走 spec → plan 流程明確擴大威脅模型範圍，而非臨時加碼。
+
 **已接受 over-deny（安全方向的誤殺，設計決策）**：
 1. **名稱重定義**（函式/alias）：即使是無害的函式定義，一律閘② deny。要執行 shell 函式直接寫成 `.sh` 腳本檔，讓 Write/Bash tool 分開處理。
 2. **cat 讀回兩步偽裝**（`cat > x <<'EOF'…EOF; cat x`）：cat-readback 模式偵測後由閘③ 硬 deny；寫入重導向本已中央前置 ask 攔截，現在讀回執行的整體形態再提升為 deny。
