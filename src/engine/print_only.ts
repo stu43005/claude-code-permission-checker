@@ -116,6 +116,19 @@ export function recognizeInterpreter(inv: CommandInvocation): { lang: Lang; form
         ? { lang, form: { kind: "inline", payload: v } }
         : { lang, form: { kind: "script", entrypoint: v } };
     }
+    if (v === "--") {
+      // POSIX 選項終止符：之後的第一個 token 為位置參數（不視為旗標）
+      const next = i + 1 < argv.length ? staticValue(argv[i + 1]) : null;
+      if (mode === "eval") {
+        return next !== null
+          ? { lang, form: { kind: "inline", payload: next } }
+          : { lang, form: { kind: "none" } };
+      } else {
+        return next !== null
+          ? { lang, form: { kind: "script", entrypoint: next } }
+          : { lang, form: { kind: "stdin" } };
+      }
+    }
     const fn = flagName(v);
     if (inlineFlags.has(fn)) {
       const val = flagValue(v, argv[i + 1]);
@@ -475,10 +488,12 @@ function soleTruncWrite(redirects: CommandInvocation["redirects"]): string | nul
 }
 function soleReadOperand(inv: CommandInvocation): string | null {
   const ops: string[] = [];
+  let afterDoubleDash = false;
   for (const w of inv.argv) {
     const v = staticValue(w);
     if (v === null) return null;
-    if (v.startsWith("-") && v !== "--") continue;
+    if (!afterDoubleDash && v === "--") { afterDoubleDash = true; continue; }  // POSIX 選項終止符
+    if (!afterDoubleDash && v.startsWith("-")) continue;                        // 旗標
     ops.push(v);
   }
   return ops.length === 1 ? ops[0] : null;

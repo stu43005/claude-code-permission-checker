@@ -312,3 +312,8 @@ Deno.test("printDisguiseDeny: 直譯器輸出被轉走 → 非載具、不 deny"
   assertEquals(pd(`cat > x <<'EOF'\nconsole.log("f")\nEOF\nnode x > out`), null); // 複合 EXEC 輸出轉走
   assertEquals(pd(`cat > q <<'EOF'\ndead\nEOF\ncat q > out`), null);              // cat 讀回輸出轉走
 });
+
+Deno.test("printDisguiseDeny: -- 選項終止符不繞過", () => {
+  assertEquals(pd(`cat > /tmp/x.mjs <<'EOF'\nconsole.log("f")\nEOF\nnode -- /tmp/x.mjs`), "write-exec");
+  assertEquals(pd(`cat > /tmp/q.txt <<'EOF'\ndead\nEOF\ncat -- /tmp/q.txt`), "cat-readback");
+});
