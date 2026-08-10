@@ -74,6 +74,37 @@ const READ_SUBCOMMANDS = new Set<string>([
 const BLAME_PATH_VALUE_FLAGS = ["--contents", "--ignore-revs-file", "-S"];
 
 /**
+ * 比對空格形式的吃路徑值旗標。長選項採**前綴**比對——git 接受唯一前綴縮寫
+ * （實測 `--cont` / `--con` ≡ `--contents`、`--ignore-revs` ≡ `--ignore-revs-file`）。
+ * 前綴有歧義時 git 自己會報錯，本檢查多 ask 一次無害（安全方向）。
+ */
+function matchBlamePathFlag(t: string): string | null {
+  for (const f of BLAME_PATH_VALUE_FLAGS) {
+    if (f.startsWith("--")) {
+      if (t.length > 2 && f.startsWith(t)) return f;
+    } else if (t === f) {
+      return f;
+    }
+  }
+  return null;
+}
+
+/** 比對黏寫形式：`--cont=<file>`（含縮寫）與 `-S<file>`。 */
+function matchBlamePathFlagAttached(t: string): { flag: string; value: string } | null {
+  const eq = t.indexOf("=");
+  if (eq > 2) {
+    const name = t.slice(0, eq);
+    for (const f of BLAME_PATH_VALUE_FLAGS) {
+      if (f.startsWith("--") && f.startsWith(name)) {
+        return { flag: f, value: t.slice(eq + 1) };
+      }
+    }
+  }
+  if (t.startsWith("-S") && t.length > 2) return { flag: "-S", value: t.slice(2) };
+  return null;
+}
+
+/**
  * 判斷 -c 傳入的 config key 是否安全（不會執行外部程式）。
  * 只放行純外觀 / 路徑類的已知安全 key；其餘一律視為不安全。
  */
@@ -241,28 +272,26 @@ function scanRestArgs(
     }
     // blame / annotate 的吃路徑值旗標（僅這兩個子指令適用，見常數註解）
     if (sub === "blame" || sub === "annotate") {
-      // 空格形式：--contents <file> / --ignore-revs-file <file> / -S <file>
-      if (BLAME_PATH_VALUE_FLAGS.includes(t)) {
+      // 空格形式（含唯一前綴縮寫）
+      const spaced = matchBlamePathFlag(t);
+      if (spaced !== null) {
         const valWord = restWords[k + 1];
-        if (valWord === undefined) return ask(`git ${sub}：${t} 缺少路徑值`);
+        if (valWord === undefined) return ask(`git ${sub}：${spaced} 缺少路徑值`);
         const val = staticValue(valWord);
         if (val === null) {
-          return ask(`git ${sub}：${t} 的路徑值為動態，無法判定範圍`);
+          return ask(`git ${sub}：${spaced} 的路徑值為動態，無法判定範圍`);
         }
         if (ctx.resolvePathValue(val) !== "in-project") {
-          return ask(`git ${sub}：${t} 的路徑值超出專案範圍`);
+          return ask(`git ${sub}：${spaced} 的路徑值超出專案範圍`);
         }
         k += 2;
         continue;
       }
-      // 黏寫形式：--contents=<file> / --ignore-revs-file=<file> / -S<file>
-      const attached = BLAME_PATH_VALUE_FLAGS.find((f) =>
-        f.startsWith("--") ? t.startsWith(`${f}=`) : t.startsWith(f) && t.length > f.length
-      );
-      if (attached !== undefined) {
-        const val = t.slice(attached.startsWith("--") ? attached.length + 1 : attached.length);
-        if (ctx.resolvePathValue(val) !== "in-project") {
-          return ask(`git ${sub}：${attached} 的路徑值超出專案範圍`);
+      // 黏寫形式（含縮寫）
+      const attached = matchBlamePathFlagAttached(t);
+      if (attached !== null) {
+        if (ctx.resolvePathValue(attached.value) !== "in-project") {
+          return ask(`git ${sub}：${attached.flag} 的路徑值超出專案範圍`);
         }
         k += 1;
         continue;

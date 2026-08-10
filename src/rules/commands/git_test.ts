@@ -329,3 +329,22 @@ Deno.test("--no-textconv disables the behavior and stays allowed", () => {
   assertEquals(v("git log --no-textconv -p"), "allow");
   assertEquals(v("git diff --no-textconv HEAD"), "allow");
 });
+
+// ── 修補：blame / annotate 唯一前綴縮寫繞道 ─────────────────────────────────
+
+Deno.test("abbreviated blame path flags are also scope-checked", () => {
+  // git expands unique prefixes: --cont / --con ≡ --contents
+  assertEquals(v("git annotate --cont /etc/passwd -- README.md"), "ask");
+  assertEquals(v("git blame --con /etc/passwd -- README.md"), "ask");
+  assertEquals(v("git blame --cont=/etc/passwd -- README.md"), "ask");
+  assertEquals(v("git blame --ignore-revs /etc/passwd README.md"), "ask");
+  // in-project values still allow through the abbreviated form
+  assertEquals(v("git blame --cont src/x.ts -- README.md"), "allow");
+});
+
+Deno.test("ordinary blame flags are not mistaken for path-valued ones", () => {
+  assertEquals(v("git blame -w README.md"), "allow");
+  assertEquals(v("git blame --line-porcelain README.md"), "allow");
+  assertEquals(v("git blame -L 1,10 README.md"), "allow");
+  assertEquals(v("git blame --color-lines README.md"), "allow");
+});
