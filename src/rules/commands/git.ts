@@ -40,7 +40,8 @@ const SAFE_VALUELESS_GLOBAL = new Set<string>([
   "--info-path",
   "--no-lazy-fetch",
   "--version",
-  "--help",
+  // 刻意不含 "--help"：`git --help <sub>` 等同 `git help <sub>`，會 spawn man viewer
+  // （可經 GIT_MAN_VIEWER 指定任意程式）。移除後它落入「未知全域旗標」分支 → ask。
 ]);
 
 /** 純讀取子指令（其餘子指令一律 ask）。 */
@@ -233,6 +234,13 @@ export const gitRule: CommandRule = {
     // --ext-diff 啟用外部 diff driver（在子指令之後的 rest 中）
     if (rest.includes("--ext-diff")) {
       return ask("git：--ext-diff 啟用外部 diff driver（執行外部程式）");
+    }
+
+    // --help 在子指令之後同樣 spawn man viewer（git log --help ≡ git help log）
+    if (rest.includes("--help")) {
+      return ask(
+        `git ${sub}：--help 會 spawn man viewer（可經 GIT_MAN_VIEWER 指定任意程式）`,
+      );
     }
 
     // 讀取子指令的危險 flag：--output= 寫檔；git grep -O 執行任意 pager

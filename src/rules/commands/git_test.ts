@@ -228,3 +228,17 @@ Deno.test("-O edge cases ask", () => {
 Deno.test("-O after -- is a pathspec, not a flag", () => {
   assertEquals(v("git diff HEAD -- -O/etc/passwd"), "allow");
 });
+
+// ── 本次新增：--help 封堵 ─────────────────────────────────────────────────
+
+Deno.test("--help paths ask (equivalent to the excluded help subcommand)", () => {
+  assertEquals(v("git --help log"), "ask"); // 全域位置
+  assertEquals(v("git log --help"), "ask"); // 子指令之後
+  assertEquals(v("git help log"), "ask"); // 既有
+  assertEquals(v("git --help"), "ask"); // 無子指令（over-ask，可接受）
+});
+
+Deno.test("-h prints usage only and still allows", () => {
+  assertEquals(v("git log -h"), "allow");
+  assertEquals(v("git status -h"), "allow");
+});
