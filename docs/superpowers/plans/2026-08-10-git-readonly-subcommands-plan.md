@@ -455,8 +455,12 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 
 兩道防護（`-O` 範圍檢查、`--help` 封堵）都已就位，現在擴充 allowlist 才不會產生不安全的中間狀態。
 
+**本任務含兩項 review 驅動的安全修正**（實作期間由 code-quality 審查抓出、經實測確認後納入本任務範圍，見 Step 6、Step 7）：擴充 allowlist 暴露出兩個放行缺口，都必須在同一個任務內補上，否則這次擴充會產生誤 allow。
+
 **Files:**
-- Modify: `src/rules/commands/git.ts:45-49`
+- Modify: `src/rules/commands/git.ts:45-49`（`READ_SUBCOMMANDS`）
+- Modify: `src/rules/commands/git.ts`（`scanRestArgs`：blame/annotate 路徑旗標）
+- Modify: `src/rules/commands/git.ts`（`evaluate`：`--textconv` 檢查）
 - Test: `src/rules/commands/git_test.ts`
 
 - [ ] **Step 1: Write the failing tests**
@@ -560,7 +564,44 @@ Run: `deno test --allow-env src/rules/commands/git_test.ts`
 
 Expected: PASS（全部測試，含既有的）。
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: 安全修正 A — `blame` / `annotate` 的吃路徑值旗標**
+
+擴充 allowlist 加入 `annotate` 後，code-quality 審查指出 `git annotate --contents /etc/passwd -- README.md` 會讀取任意檔案**並把內容印進 blame 輸出**。實測（git 2.49.0）確認：
+
+- `--contents <file>` / `--contents=<file>` 皆被接受，內容被讀取並印出
+- `-S <file>` / `-S<file>`（revs-file）、`--ignore-revs-file <file>` / `=<file>` 亦讀檔
+- `annotate` 是 `blame` 的別名，而 **`blame` 早已在 allowlist 中** → 這是**既有**缺口，本次擴充只是把它擴大到第二個入口，故一併補上
+- **`git log -S<string>` 是 pickaxe 搜尋字串、不是路徑** → 此檢查必須限定 `blame` / `annotate`，否則會誤殺 `git log -Spattern`
+
+於 `scanRestArgs` 中，在 `-O` 處理之後、fallback 之前，對 `sub === "blame" || sub === "annotate"` 檢查 `BLAME_PATH_VALUE_FLAGS = ["--contents", "--ignore-revs-file", "-S"]` 的空格與黏寫兩形式，值經 `ctx.resolvePathValue` 非 `"in-project"` → ask。`--no-contents` / `--no-ignore-revs-file` 不吃值，落 fallback 即正確。
+
+測試須涵蓋：兩形式的 ask、專案內值仍 allow、`git blame README.md` / `git annotate README.md` 不受影響，以及 `git log -SREAD_SUBCOMMANDS` / `git log -S pattern` 仍 allow（防止過度套用的護欄）。
+
+- [ ] **Step 7: 安全修正 B — 顯式 `--textconv` 旗標**
+
+code-quality 審查指出新放行的 diff 家族可經 `--textconv` 執行外部程式。實測（git 2.49.0，config 已定義 `diff.<driver>.textconv`）確認：
+
+- `git diff-tree -p`（不帶旗標）→ **不執行** textconv
+- `git diff-tree --textconv -p` → **執行** textconv
+
+這使 spec 中 textconv accepted limitation 的 rationale ②（「新增的 plumbing 家族實測不執行 textconv」）在顯式旗標下失效，故該 accepted limitation 不涵蓋此形式（spec 已同步標注此範圍界線）。
+
+於 `evaluate` 中，緊接既有 `--ext-diff` 檢查之後加入同層檢查（`--textconv` 與 `--ext-diff` 同性質：使用者顯式要求執行外部轉換程式）：
+
+```typescript
+    // --textconv 顯式要求執行 config 設定的外部轉換程式（與 --ext-diff 同性質）。
+    // 注意：不帶旗標時由 .gitattributes + config 隱含觸發的 textconv 屬 spec 已裁決的
+    // accepted limitation，不在此擋；本檢查只針對顯式旗標。
+    if (rest.includes("--textconv")) {
+      return ask(`git ${sub}：--textconv 會執行 config 設定的外部轉換程式`);
+    }
+```
+
+精確字串比對即可——`--no-textconv`（關閉）是不同字串、不受影響，且它本就安全。
+
+測試須涵蓋：`git diff-tree --textconv -p HEAD` → ask、`git diff --textconv HEAD` → ask、`git log --no-textconv -p` → allow。
+
+- [ ] **Step 8: Commit**
 
 ```bash
 git add src/rules/commands/git.ts src/rules/commands/git_test.ts

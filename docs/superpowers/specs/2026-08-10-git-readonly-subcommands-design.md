@@ -165,7 +165,8 @@ man viewer 可經 `GIT_MAN_VIEWER` 指定任意程式（§2 取證 9），故這
    - **Decision**：不實作 textconv 閘門，維持本 spec 的 allowlist 擴充。
    - **Rationale**（使用者裁決，依 §2 取證 10 的實測）：① textconv driver **只能定義在 config**，checked-in `.gitattributes` 單獨無法注入指令，故「純粹 clone 一個不受信任的 repo」不足以觸發；② 本次新增的 plumbing 家族（`diff-tree` / `diff-files` / `diff-index`）**實測不執行 textconv**，比既有 allowlist 項更安全，reviewer 所述「擴大入口」對這三項不成立；③ 唯一會執行 textconv 的新增項 `whatchanged` 是 `log --raw` 的別名，而 `git log -p` / `diff` / `show` **早已在既有 allowlist**——攻擊者只需一個入口且該入口早已存在，多一個別名不改變攻擊面。
    - **範圍**：本裁決基於「既有 `diff` / `log` / `show` 維持 allow」這個前提。若日後把這三者收緊或改為 gate，`whatchanged` 應同步處理，此接受限制不再自動適用。
-   - 收緊 textconv（含既有三項）需獨立評估，不在本次範圍。
+   - **本裁決只涵蓋「隱含觸發」的 textconv**（不帶旗標時由 `.gitattributes` + config 自動套用）。**顯式 `--textconv` 旗標不在此列**：實作期間的 code-quality 審查加上實測（git 2.49.0）確認 `git diff-tree --textconv -p` **會**執行 textconv，而同一指令不帶旗標時**不會**——亦即上述 rationale ② 在顯式旗標下失效。顯式 `--textconv` 與既有已擋的 `--ext-diff` 同性質（使用者明確要求執行外部轉換程式），故實作對 `--textconv` 回 ask。
+   - 收緊隱含 textconv（含既有三項）需獨立評估，不在本次範圍。
 3. **有寫入形式的近親子指令不做個案 gate**。`symbolic-ref`、`worktree`、`submodule`、`notes`、`bisect`、`merge-tree` 需比照 `branch` / `stash` 的個案寫法，設計與測試成本高於本次收益，維持 `ask`。
 
 ## 6. 測試計畫（`src/rules/commands/git_test.ts`）
