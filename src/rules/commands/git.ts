@@ -236,8 +236,11 @@ export const gitRule: CommandRule = {
       return ask("git：--ext-diff 啟用外部 diff driver（執行外部程式）");
     }
 
-    // --help 在子指令之後同樣 spawn man viewer（git log --help ≡ git help log）
-    if (rest.includes("--help")) {
+    // --help 在子指令之後同樣 spawn man viewer（git log --help ≡ git help log）。
+    // 只在旗標區偵測：`--` 之後是 pathspec，名為 --help 的路徑不具旗標語義。
+    const dashDash = rest.indexOf("--");
+    const flagRegion = dashDash === -1 ? rest : rest.slice(0, dashDash);
+    if (flagRegion.includes("--help")) {
       return ask(
         `git ${sub}：--help 會 spawn man viewer（可經 GIT_MAN_VIEWER 指定任意程式）`,
       );

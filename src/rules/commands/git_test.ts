@@ -242,3 +242,8 @@ Deno.test("-h prints usage only and still allows", () => {
   assertEquals(v("git log -h"), "allow");
   assertEquals(v("git status -h"), "allow");
 });
+
+Deno.test("--help after -- is a pathspec, not a flag", () => {
+  assertEquals(v("git diff HEAD -- --help"), "allow");
+  assertEquals(v("git log -- --help"), "allow");
+});
