@@ -22,6 +22,8 @@
 | `src/rules/commands/git_test.ts` | Modify | 對應的單元測試。既有測試**不需修改**（已逐一檢視，見下），只追加新測試。 |
 | `CLAUDE.md` | Modify | 專案文件中描述 git 規則的兩處：子指令 allowlist 範圍、以及攻擊面列舉。 |
 
+**本計畫檔案本身的維護**：實作期間的 review 若揭露必要的範圍調整（例如安全修正必須併入某個 Task 才能維持「每個 commit 都是安全中間狀態」），本計畫會被回寫以保持與實作一致，並以獨立的 `docs(plan):` commit 記錄。這類 commit 由 coordinator 維護，**不屬於任何 Task 的產出**，故不受各 Task `Files:` 清單的限制；各 Task implementer 仍只能改自己 `Files:` 列出的檔案。本次已發生兩次：Task 4 併入兩項安全修正、Task 6 同步對應的文件與驗證步驟。
+
 **既有測試檢視結論（spec §6.13 要求）**：`git_test.ts` 中唯一含動態 token 的斷言是 `git $SUB`（第 101 行），屬**子指令位置**動態，`parseSub` 早已回 `dynamic: true` → ask，不受本次「子指令**之後**動態 token → ask」影響。其他測試檔（`evaluate_test.ts`、`cwd_test.ts`、`walk_test.ts`、`matcher_test.ts`、`settings_test.ts`）中的 git 斷言全為靜態 token。`--help` 在 `src/` 中僅出現於 `git.ts:42` 一處，無測試依賴。**因此本計畫不修改任何既有斷言**；若實作時發現有既有測試轉紅，先停下來確認是否為非預期的行為變更。
 
 ---
@@ -766,7 +768,7 @@ Expected: 產出 `dist/permission-checker`（macOS / Linux）或 `dist/permissio
 
 - [ ] **Step 4: Operational verification**
 
-依序執行以下五條，每條都要確認 `permissionDecision` 與 `exit 0`。`$PWD` 需為本專案根目錄。
+依序執行以下七條，每條都要確認 `permissionDecision` 與 `exit 0`。`$PWD` 需為本專案根目錄。
 
 ```bash
 probe() {
@@ -800,7 +802,7 @@ Expected：第 1 條 `"permissionDecision":"allow"`；第 2-7 條 `"permissionDe
 
 註：`probe` 這種 shell 函式定義會被本 hook 自身的「名稱重定義」閘門 deny（設計如此）。實際執行時改用逐條 `printf '%s' '<json>' | CLAUDE_PROJECT_DIR="$PWD" ./dist/permission-checker` 的獨立呼叫。
 
-**若第 2-5 條中任一條回 `allow`，先讀 `permissionDecisionReason`**：若理由為「命中 permissions.allow」，代表該指令被使用者 settings.json 的廣域規則（如 `Bash(git diff *)`）升級了——這是本專案刻意的設計行為（指令規則自身的 ask 屬**可升級** ask），**不是 bug**，以單元測試為準。若理由並非升級所致，則是真正的 regression，回頭檢查對應 Task 的接點順序。
+**若第 2-7 條中任一條回 `allow`，先讀 `permissionDecisionReason`**：若理由為「命中 permissions.allow」，代表該指令被使用者 settings.json 的廣域規則（如 `Bash(git diff *)`）升級了——這是本專案刻意的設計行為（指令規則自身的 ask 屬**可升級** ask），**不是 bug**，以單元測試為準。若理由並非升級所致，則是真正的 regression，回頭檢查對應 Task 的接點順序。
 
 - [ ] **Step 5: 最終完整驗證**
 
@@ -826,7 +828,7 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 ## 完成標準
 
 - `deno task check`、`deno task lint`、`deno task test` 全綠。
-- Operational verification 五條全部符合預期（或 `allow` 已確認為 `permissions.allow` 升級所致）。
+- Operational verification 七條全部符合預期（或 `allow` 已確認為 `permissions.allow` 升級所致）。
 - 既有測試零修改（若有轉紅，停下確認是否為非預期的行為變更）。
 - `CLAUDE.md` 兩處皆與實作一致。
 - 每個 commit 都是安全的中間狀態：兩道防護（`-O` 範圍檢查、`--help` 封堵）皆先於 allowlist 擴充落地。
