@@ -46,7 +46,11 @@ git rev-parse --abbrev-ref @{upstream}
    - `@{upstream}` → **靜態**（`parts: null`、`staticValue` 回 `"@{upstream}"`）。`@{…}` 不含逗號或 `..`，未被解析為 BraceExpansion，故 §1 的目標指令**不**受動態收緊影響。
    - `HEAD~1`、`--`、`src/x.ts` → 靜態。
    - `$BRANCH` → 動態（`SimpleExpansion`）；`*.md`（未引號 glob）→ 動態（`word.ts` 詞法偵測）。
-9. **候選子指令的旗標面**：對 `merge-base`、`rev-list`、`name-rev`、`whatchanged`、`range-diff`、`cherry`、`diff-tree`、`diff-files`、`diff-index`、`check-ignore`、`check-attr`、`check-ref-format`、`count-objects`、`var`、`annotate` 逐一檢視 `-h` 輸出，除上述 `-O` 外未見寫入型（`--output`／`--write`／`-i`）或執行外部程式型旗標。
+9. **`--help` 與 `-h` 行為不同（設計審查 round 2 觸發的實測）**：
+   - `git --help <sub>` 與 `git <sub> --help` **都會 spawn man viewer**（實測 `GIT_MAN_VIEWER=nonexistent-viewer-xyz git --help log` 回「未知的 man 檢視器」警告，證明該環境變數指定的程式確實被當作 viewer 執行）。兩者等價於 `git help <sub>`。
+   - `git <sub> -h`（如 `git log -h`）**只印用法到 stdout**，不 spawn man。
+   - `git --help`（無子指令）只印 git 總用法，不 spawn man。
+10. **候選子指令的旗標面**：對 `merge-base`、`rev-list`、`name-rev`、`whatchanged`、`range-diff`、`cherry`、`diff-tree`、`diff-files`、`diff-index`、`check-ignore`、`check-attr`、`check-ref-format`、`count-objects`、`var`、`annotate` 逐一檢視 `-h` 輸出，除上述 `-O` 外未見寫入型（`--output`／`--write`／`-i`）或執行外部程式型旗標。
 
 ## 3. 已核可的決策
 
@@ -55,7 +59,8 @@ git rev-parse --abbrev-ref @{upstream}
 3. **`help` 與 `verify-commit` / `verify-tag` 不納入**（維持 ask）：兩者不改儲存庫狀態但會 spawn 外部程式（`git help -w` 直接開瀏覽器；verify-\* 呼叫 gpg），非 agent 日常指令，依 allowlist 思維寧可不加。
 4. **程式碼結構**：直接擴充既有 `READ_SUBCOMMANDS`（以註解分行標示 porcelain / plumbing），不新增第二個集合、不改寫成表驅動。
 5. **`-O` orderfile 一併修掉**，且涵蓋現有的 `git diff` / `log` / `show`（不只新增的子指令），避免同類指令行為不一致。
-6. **子指令之後、`--` 之前的動態 token 一律 ask**（設計審查觸發、使用者裁決採納）：靜態分析無法區分 `$FOO` 展開成 branch 名或展開成 `-O/etc/passwd`，若放行動態 token，§4.2 的 `-O` 檢查便可被 `git diff $ARGS HEAD` 這類寫法整個繞過。**此為既有行為的收緊**（現行 `git diff $FOO` 判 `allow`，變更後判 `ask`），代價與範圍見 §4.4。
+6. **堵住 `--help` 這條與被排除的 `help` 等價的路徑**（設計審查 round 2 觸發）：現行 `SAFE_VALUELESS_GLOBAL` 含 `--help`，故 `git --help log` 會被 `parseSub` 跳過旗標、判為子指令 `log` → allow；`git log --help` 則落在 rest、無人檢查。兩者實際都 spawn man viewer（§2 取證 9），與決策 3「排除 `help`」直接矛盾。修法見 §4.5。
+7. **子指令之後、`--` 之前的動態 token 一律 ask**（設計審查觸發、使用者裁決採納）：靜態分析無法區分 `$FOO` 展開成 branch 名或展開成 `-O/etc/passwd`，若放行動態 token，§4.2 的 `-O` 檢查便可被 `git diff $ARGS HEAD` 這類寫法整個繞過。**此為既有行為的收緊**（現行 `git diff $FOO` 判 `allow`，變更後判 `ask`），代價與範圍見 §4.3。
 
 ## 4. 設計
 
@@ -86,7 +91,7 @@ plumbing:  rev-parse, rev-list, merge-base, name-rev, var, cat-file,
 
 1. 取 `t = staticValue(restWords[k])`。
 2. `t === "--"` → **停止掃描**，回 allow 路徑（`--` 之後是 pathspec，`-O` 不再是旗標；見 §2 取證 3）。
-3. `t === null`（動態 token）→ `ask("git <sub>：子指令引數含動態 token，無法排除其展開為 -O 等旗標")`。理由與代價見 §4.4。
+3. `t === null`（動態 token）→ `ask("git <sub>：子指令引數含動態 token，無法排除其展開為 -O 等旗標")`。理由與代價見 §4.3。
 4. `t === "-O"`（空格形式）→ 取值 token `restWords[k + 1]`：
    - 不存在（`-O` 在末尾）→ `ask("git <sub>：-O 缺少 orderfile 值")`。
    - `staticValue` 為 `null`（值為動態）→ `ask("git <sub>：-O 的 orderfile 值為動態，無法判定範圍")`。
@@ -119,6 +124,27 @@ plumbing:  rev-parse, rev-list, merge-base, name-rev, var, cat-file,
 
 因此本次變更只擴大「哪些子指令名稱可放行」，不新增任何繞過路徑。`classify.ts` 的四條中央前置規則（cwd 範圍、寫入型重導向、賦值前綴、範圍外 `<`）位於指令規則之外、對所有指令通用且不可升級，完全不受影響。
 
+### 4.5 `--help` 路徑封堵
+
+決策 3 把 `help` 排除在 allowlist 外，理由是它 spawn man / browser。但 git 提供兩條語義等價的旗標路徑，現行規則都放行：
+
+| 形式 | 現行行為 | 實際效果 |
+|---|---|---|
+| `git help log` | `default: ask` | 開 man |
+| `git --help log` | `--help` 在 `SAFE_VALUELESS_GLOBAL` 被跳過 → 子指令判為 `log` → **allow** | 開 man |
+| `git log --help` | `--help` 落在 rest、無檢查 → **allow** | 開 man |
+
+man viewer 可經 `GIT_MAN_VIEWER` 指定任意程式（§2 取證 9），故這是實質的外部程式執行面，而非單純的說明文字輸出。
+
+**修法**（兩處，缺一不可）：
+
+1. **從 `SAFE_VALUELESS_GLOBAL` 移除 `"--help"`**。移除後它落入 `parseSub` 的「未知全域旗標」分支 → `dangerous` → ask，涵蓋 `git --help log`。
+2. **rest 層新增 `--help` 檢查**，與既有 `--ext-diff` 檢查同層（在 `READ_SUBCOMMANDS.has(sub)` 判定之前）：`rest.includes("--help")` → `ask("git <sub>：--help 會 spawn man viewer（可經 GIT_MAN_VIEWER 指定任意程式）")`，涵蓋 `git log --help`。
+
+**`-h` 不受影響**：`git log -h` 只印用法到 stdout、不 spawn man（§2 取證 9），維持現狀。注意 `-h` 本就不在 `SAFE_VALUELESS_GLOBAL` 中，故 `git -h`（全域位置）現在即為 ask，本次不改變。
+
+**附帶 over-ask**：`git --help`（無子指令）只印 git 總用法、不 spawn man，但移除後也會 ask（`parseSub` 遇未知旗標後無子指令 → 先回「未指定子指令」的 ask）。此為安全方向的輕微誤殺，接受。
+
 ## 5. Non-goals / Accepted limitations
 
 （非目標 / 已接受限制。第 1 項為設計審查中經使用者裁決的 accepted limitation。）
@@ -143,6 +169,7 @@ plumbing:  rev-parse, rev-list, merge-base, name-rev, var, cat-file,
 6. **`--` 終止符**：`git diff HEAD -- -O/etc/passwd` → `allow`（`-O` 為 pathspec，不讀檔）。
 6b. **動態 token（§4.3 收緊）**：`git log $ref` → `ask`；`git diff $BRANCH HEAD` → `ask`；`git diff $(git merge-base HEAD main)` → `ask`；`git log *.md`（未引號 glob）→ `ask`。
 6c. **`--` 之後的動態 token 不 ask**：`git diff HEAD -- $FILE` → `allow`（掃描已於 `--` 停止，pathspec 不可能被解讀為旗標）。
+6d. **`--help` 封堵（§4.5）**：`git --help log` → `ask`；`git log --help` → `ask`；`git help log` → `ask`（既有）；`git --help` → `ask`。對照組 `git log -h` → `allow`（`-h` 不 spawn man，且不得被新檢查誤殺）。
 7. **grep 語意不被覆蓋**：`git grep -O foo` → `ask`，且理由字串仍為既有的 pager 理由（斷言 `reason` 內含 `pager`），確認新檢查未搶先命中。
 8. **全域閘門對新子指令仍生效**：`git -c core.pager=cat merge-base HEAD main` → `ask`；`git --exec-path=/tmp rev-list HEAD` → `ask`；`git --unknown-global merge-base HEAD main` → `ask`。
 9. **回歸**：既有測試全數維持通過（特別是 `git diff HEAD~1`、`git -C sub status` 等靜態形式仍為 `allow`）。**例外**：若既有測試中存在「子指令後帶動態 token 且斷言 `allow`」的案例，依 §4.3 該斷言必須改為 `ask`——這是本次刻意的行為收緊，不是測試被改壞。實作時須逐一檢視 `git_test.ts` 既有斷言並在計畫中列出所有需改動者。
@@ -156,6 +183,7 @@ plumbing:  rev-parse, rev-list, merge-base, name-rev, var, cat-file,
    - `git diff -O/etc/passwd HEAD~1 HEAD` → 期望 `ask`（**不可**為 allow；此為本次修補的缺口）。
    - `git ls-remote origin` → 期望 `ask`。
    - `git log $ref` → 期望 `ask`（§4.3 收緊生效）。
-   - 四者皆須 `exit 0`。
+   - `git --help log` → 期望 `ask`（§4.5 封堵生效；此為本次修補的第二個缺口）。
+   - 五者皆須 `exit 0`。
    - 若某項回 `allow` 而預期 `ask`，先確認是否因 `permissions.allow` 命中而升級（讀 `permissionDecisionReason`）；`-O` 那條若因升級而 allow，屬合法行為（指令規則自身的 ask 屬可升級 ask），以單元測試為準。
 4. 更新 `CLAUDE.md` 中 git 規則的描述（`READ_SUBCOMMANDS` 已擴充、新增 `-O` orderfile 範圍檢查），保持文件與實作一致。
