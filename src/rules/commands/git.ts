@@ -288,6 +288,13 @@ export const gitRule: CommandRule = {
       return ask("git：--ext-diff 啟用外部 diff driver（執行外部程式）");
     }
 
+    // --textconv 顯式要求執行 config 設定的外部轉換程式（與 --ext-diff 同性質）。
+    // 注意：不帶旗標時由 .gitattributes + config 隱含觸發的 textconv 屬 spec 已裁決的
+    // accepted limitation，不在此擋；本檢查只針對顯式旗標。
+    if (rest.includes("--textconv")) {
+      return ask(`git ${sub}：--textconv 會執行 config 設定的外部轉換程式`);
+    }
+
     // --help 在子指令之後同樣 spawn man viewer（git log --help ≡ git help log）。
     // 只在旗標區偵測：`--` 之後是 pathspec，名為 --help 的路徑不具旗標語義。
     const dashDash = rest.indexOf("--");

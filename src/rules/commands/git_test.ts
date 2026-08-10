@@ -316,3 +316,16 @@ Deno.test("log -S is a pickaxe string, not a path (must not be scope-checked)", 
   assertEquals(v("git log -SREAD_SUBCOMMANDS"), "allow");
   assertEquals(v("git log -S pattern"), "allow");
 });
+
+// ── 修補：顯式 --textconv 執行外部轉換程式 ─────────────────────────────────
+
+Deno.test("explicit --textconv asks (runs a configured external program)", () => {
+  assertEquals(v("git diff-tree --textconv -p HEAD"), "ask");
+  assertEquals(v("git diff --textconv HEAD"), "ask");
+  assertEquals(v("git log --textconv -p"), "ask");
+});
+
+Deno.test("--no-textconv disables the behavior and stays allowed", () => {
+  assertEquals(v("git log --no-textconv -p"), "allow");
+  assertEquals(v("git diff --no-textconv HEAD"), "allow");
+});
