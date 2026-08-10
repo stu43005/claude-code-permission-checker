@@ -738,17 +738,24 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 
 - [ ] **Step 2: 更新 CLAUDE.md 的攻擊面列舉**
 
-在「⚠️ 不要再犯的問題 → 安全誤放」段落中，找到以 **git / gh 全域選項是攻擊面** 開頭的項目，在其危險旗標列舉中把 `--ext-diff` 之後補上 `--help`。接著在該項目之後新增兩個同層級的項目：
+在「⚠️ 不要再犯的問題 → 安全誤放」段落中，找到以 **git / gh 全域選項是攻擊面** 開頭的項目，在其危險旗標列舉中把 `--ext-diff` 之後補上 `--help`、`--textconv`。接著在該項目之後新增三個同層級的項目（第二、三項對應 Step 6 / Step 7 的兩項安全修正）：
 
 ```markdown
 - **git 子指令後的引數也是攻擊面**：`git.ts` 的 `scanRestArgs` 走訪子指令之後、`--` 之前的引數。
   動態 token（`git log $ref`）一律 ask——靜態分析無法排除它展開成旗標，放行等於讓旗標檢查可被單一
   變數繞過；`-O <file>` / `-O<file>`（orderfile）會被 git 實際開啟讀取，須 `resolvePathValue`
   範圍檢查。此掃描刻意置於 `git grep -O`（語意是 pager，不是 orderfile）檢查之後、`switch` 之前。
-- **`--help` 等同 `git help`**：無論在全域位置（`git --help log`）或子指令之後（`git log --help`），
-  都會 spawn man viewer，而 `GIT_MAN_VIEWER` 可指定任意程式 → 兩處都要 ask（前者靠把 `--help`
-  排除在 `SAFE_VALUELESS_GLOBAL` 之外，後者靠 `evaluate` 的 rest 層檢查）。`-h` 只印用法到
-  stdout，不受影響。
+- **`--help` / `--textconv` 等同顯式要求執行外部程式**：`--help` 無論在全域位置（`git --help log`）
+  或子指令之後（`git log --help`）都會 spawn man viewer，而 `GIT_MAN_VIEWER` 可指定任意程式 →
+  兩處都要 ask（前者靠把 `--help` 排除在 `SAFE_VALUELESS_GLOBAL` 之外，後者靠 `evaluate` 的 rest
+  層檢查，且該檢查只看 `--` 之前的旗標區）。顯式 `--textconv` 會執行 config 設定的轉換程式（實測
+  `git diff-tree --textconv -p` 會跑、不帶旗標則不會）→ ask，與 `--ext-diff` 同性質；`-h` 只印用法、
+  `--no-textconv` 是關閉，兩者皆不受影響。
+- **`git blame` / `annotate` 有三個吃路徑值的旗標**：`--contents <file>`（會讀取該檔並把內容**印進
+  blame 輸出**）、`-S <file>`（revs-file）、`--ignore-revs-file <file>`，空格與黏寫形式皆須
+  `resolvePathValue` 範圍檢查。**長選項要用前綴比對**——git 接受唯一前綴縮寫（實測 `--cont` / `--con`
+  ≡ `--contents`、`--ignore-revs` ≡ `--ignore-revs-file`），只比對完整拼寫會被縮寫繞過。此檢查
+  **僅限 blame / annotate**：`git log -S<string>` 是 pickaxe 搜尋字串、不是路徑，套用到其他子指令會誤殺。
 ```
 
 - [ ] **Step 3: Build**
@@ -781,9 +788,17 @@ probe '{"tool_name":"Bash","tool_input":{"command":"git log $ref"},"cwd":"'"$PWD
 
 # 5) --help 封堵生效 → 期望 ask
 probe '{"tool_name":"Bash","tool_input":{"command":"git --help log"},"cwd":"'"$PWD"'"}'
+
+# 6) blame 路徑旗標的縮寫繞過已補（Step 6）→ 期望 ask
+probe '{"tool_name":"Bash","tool_input":{"command":"git annotate --cont /etc/passwd -- README.md"},"cwd":"'"$PWD"'"}'
+
+# 7) 顯式 --textconv（Step 7）→ 期望 ask
+probe '{"tool_name":"Bash","tool_input":{"command":"git diff-tree --textconv -p HEAD"},"cwd":"'"$PWD"'"}'
 ```
 
-Expected：第 1 條 `"permissionDecision":"allow"`；第 2-5 條 `"permissionDecision":"ask"`；五條皆 `exit=0`。
+Expected：第 1 條 `"permissionDecision":"allow"`；第 2-7 條 `"permissionDecision":"ask"`；七條皆 `exit=0`。
+
+註：`probe` 這種 shell 函式定義會被本 hook 自身的「名稱重定義」閘門 deny（設計如此）。實際執行時改用逐條 `printf '%s' '<json>' | CLAUDE_PROJECT_DIR="$PWD" ./dist/permission-checker` 的獨立呼叫。
 
 **若第 2-5 條中任一條回 `allow`，先讀 `permissionDecisionReason`**：若理由為「命中 permissions.allow」，代表該指令被使用者 settings.json 的廣域規則（如 `Bash(git diff *)`）升級了——這是本專案刻意的設計行為（指令規則自身的 ask 屬**可升級** ask），**不是 bug**，以單元測試為準。若理由並非升級所致，則是真正的 regression，回頭檢查對應 Task 的接點順序。
 
