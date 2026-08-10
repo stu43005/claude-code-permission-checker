@@ -4,9 +4,9 @@
 
 **Goal:** 讓 16 個純唯讀 git 子指令（`merge-base`、`rev-list`、`diff-tree` 家族等）自動放行，同時堵住兩個既有的放行缺口：`-O <orderfile>` 從未做路徑範圍檢查，以及 `git --help <sub>` / `git <sub> --help` 會 spawn 任意 man viewer。
 
-**Architecture:** 全部變更集中在單一規則檔 `src/rules/commands/git.ts`。`parseSub` 額外回傳 `restWords: Word[]`（子指令之後的原始 Word），供新的 `scanRestArgs` 走訪函式使用——該函式在 `--` 處停止掃描，對動態 token 回 ask，對 `-O` 的兩種寫法做 `resolvePathValue` 範圍檢查。之後才擴充 `READ_SUBCOMMANDS` 集合。`--help` 封堵需要兩處改動：從 `SAFE_VALUELESS_GLOBAL` 移除（涵蓋全域位置），加 rest 層檢查（涵蓋子指令之後）。
+**Architecture:** 全部變更集中在單一規則檔 `src/rules/commands/git.ts`。`parseSub` 額外回傳 `restWords: Word[]`（子指令之後的原始 Word），供新的 `scanRestArgs` 走訪函式使用——該函式在 `--` 處停止掃描，對動態 token 回 ask，對 `-O` 的兩種寫法做 `resolvePathValue` 範圍檢查。`--help` 封堵需要兩處改動：從 `SAFE_VALUELESS_GLOBAL` 移除（涵蓋全域位置），加 rest 層檢查（涵蓋子指令之後）。以上防護全部就位後，最後才擴充 `READ_SUBCOMMANDS` 集合。
 
-**任務順序的安全性理由（重要）：** `-O` 範圍檢查（Task 2）**必須先於** `READ_SUBCOMMANDS` 擴充（Task 3）。反過來做的話，Task 3 的 commit 會產生一個中間狀態：`diff-tree` / `diff-files` / `diff-index` / `range-diff` / `whatchanged` 已被放行，但它們的 `-O` 尚未檢查——等於把既有的 `-O` 缺口擴大到這些新入口。每個 commit 都必須是安全的中間狀態，不能靠「後續 task 會補上」。
+**任務順序的安全性理由（重要）：** 兩道防護——`-O` 範圍檢查（Task 2）與 `--help` 封堵（Task 3）——**都必須先於** `READ_SUBCOMMANDS` 擴充（Task 4）。反過來做的話，擴充的 commit 會產生不安全的中間狀態：新放行的子指令（`diff-tree` / `merge-base` 等）其 `-O` 尚未檢查、其 `--help` 尚未封堵，等於把兩個既有缺口擴大到新入口。**每個 commit 都必須是安全的中間狀態**，不能靠「後續 task 會補上」。
 
 **Tech Stack:** Deno + TypeScript，unbash 4.0.1 AST，`@std/assert` 測試。
 
@@ -140,7 +140,7 @@ function parseSub(
  * 走訪子指令之後的引數。
  *
  * - 遇 `--` 停止：其後是 pathspec，不再有旗標語義。
- * - 動態 token → ask：靜態分析無法排除其展開為 `-O` 等旗標，放行等於讓旗標檢查可被單一變數繞過。
+ * - 動態 token → ask：靜態分析無法排除其展開為旗標，放行等於讓旗標檢查可被單一變數繞過。
  *
  * 回傳 null 代表本掃描無異議（由呼叫端續行既有判定）。
  */
@@ -154,7 +154,7 @@ function scanRestArgs(
     const t = staticValue(restWords[k]);
     if (t === "--") return null; // pathspec 區，停止掃描
     if (t === null) {
-      return ask(`git ${sub}：子指令引數含動態 token，無法排除其展開為 -O 等旗標`);
+      return ask(`git ${sub}：子指令引數含動態 token，無法排除其展開為旗標`);
     }
     k += 1;
   }
@@ -173,7 +173,7 @@ function scanRestArgs(
 然後在既有 `git grep -O` 檢查**之後**、`if (READ_SUBCOMMANDS.has(sub)) return allow();` **之前**插入：
 
 ```typescript
-    // 子指令引數掃描（動態 token / -O orderfile 範圍）。
+    // 子指令引數掃描（動態 token）。
     // 刻意置於 grep -O 檢查之後，使 `git grep -O` 維持既有的「執行任意 pager」理由；
     // 也刻意置於 switch 之前，故 branch / tag / config / stash / remote 同受此掃描。
     const scanned = scanRestArgs(sub, restWords, ctx);
@@ -215,10 +215,10 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 
 `git diff -O<file>` 的 orderfile 會被 git 實際開啟讀取，但現行規則完全未做範圍檢查——`git diff -O/etc/passwd HEAD~1 HEAD` 目前判 `allow`。`-O` 支援黏寫 `-O<file>` 與空格 `-O <file>` 兩種寫法（git 拒絕 `-rO<file>` 這類 bundling，無需處理）。
 
-本任務**只用既有 allowlist 中的子指令**（`diff` / `log` / `show`）測試，因為新子指令尚未加入（Task 3 才加）——用尚未放行的子指令測 `ask` 會得到假陽性（它們此時因 `default: ask` 就會過）。
+本任務**只用既有 allowlist 中的子指令**（`diff` / `log` / `show`）測試，因為新子指令尚未加入（Task 4 才加）——用尚未放行的子指令測 `ask` 會得到假陽性（它們此時因 `default: ask` 就會過）。
 
 **Files:**
-- Modify: `src/rules/commands/git.ts`（`scanRestArgs`）
+- Modify: `src/rules/commands/git.ts`（`scanRestArgs` 與 `evaluate` 的接點註解）
 - Test: `src/rules/commands/git_test.ts`
 
 - [ ] **Step 1: Write the failing tests**
@@ -256,11 +256,11 @@ Run: `deno test --allow-env src/rules/commands/git_test.ts`
 
 Expected: FAIL — `-O orderfile attached form` 與 `-O orderfile space form` 失敗（`git diff -O/etc/passwd HEAD` 目前回 `allow`）。
 
-`-O edge cases ask` 此時可能已 PASS（`"$F"` 是動態 token，Task 1 已涵蓋；`git diff HEAD -O` 則尚未）；`-O after --` 應已 PASS。這些狀態差異是正常的，Step 4 之後全部必須綠。
+`-O edge cases ask` 中 `"$F"` 那條此時已 PASS（動態 token，Task 1 已涵蓋），`git diff HEAD -O` 那條尚未；`-O after --` 應已 PASS。這些狀態差異是正常的，Step 4 之後全部必須綠。
 
 - [ ] **Step 3: 在 `scanRestArgs` 中加入 `-O` 兩種形式的處理**
 
-把 Task 1 建立的 `scanRestArgs` 整個替換為（注意參數 `_ctx` 改名為 `ctx`，並更新 doc comment）：
+把 Task 1 建立的 `scanRestArgs` 整個替換為（注意參數 `_ctx` 改名為 `ctx`，並更新 doc comment 與動態 token 的 ask 理由）：
 
 ```typescript
 /**
@@ -310,19 +310,35 @@ function scanRestArgs(
 }
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [ ] **Step 4: 更新 `evaluate` 接點的註解**
+
+Task 1 插入的註解只提到動態 token，現在掃描也負責 `-O`。把該註解首行：
+
+```typescript
+    // 子指令引數掃描（動態 token）。
+```
+
+改為：
+
+```typescript
+    // 子指令引數掃描（動態 token / -O orderfile 範圍）。
+```
+
+其餘兩行（grep 順序、switch 順序的說明）不變。
+
+- [ ] **Step 5: Run tests to verify they pass**
 
 Run: `deno test --allow-env src/rules/commands/git_test.ts`
 
 Expected: PASS（全部測試）。
 
-- [ ] **Step 5: Type check + lint**
+- [ ] **Step 6: Type check + lint**
 
 Run: `deno task check && deno task lint`
 
 Expected: 兩者皆無錯誤。
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add src/rules/commands/git.ts src/rules/commands/git_test.ts
@@ -342,9 +358,102 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 
 ---
 
-### Task 3: 擴充 `READ_SUBCOMMANDS`
+### Task 3: 封堵 `--help` 兩條路徑
 
-`-O` 防護（Task 2）已就位，現在擴充 allowlist 才不會產生不安全的中間狀態。
+`git help log` 已被排除在 allowlist 外，但 `git --help log`（`--help` 在 `SAFE_VALUELESS_GLOBAL` 被跳過，子指令判為 `log` → allow）與 `git log --help`（落在 rest、無人檢查）語義等價且都會 spawn man viewer。man viewer 可經 `GIT_MAN_VIEWER` 指定任意程式，屬實質的外部程式執行面。
+
+本任務同樣**必須先於** Task 4 的 allowlist 擴充：否則擴充後 `git --help merge-base` / `git merge-base --help` 會變成 allow，把這個缺口擴大到新入口。測試因此只用既有 allowlist 中的子指令（`log`）。
+
+**Files:**
+- Modify: `src/rules/commands/git.ts:26-43`（`SAFE_VALUELESS_GLOBAL`）
+- Modify: `src/rules/commands/git.ts`（`evaluate` 的 rest 層檢查區）
+- Test: `src/rules/commands/git_test.ts`
+
+- [ ] **Step 1: Write the failing tests**
+
+在 `src/rules/commands/git_test.ts` 檔尾追加：
+
+```typescript
+// ── 本次新增：--help 封堵 ─────────────────────────────────────────────────
+
+Deno.test("--help paths ask (equivalent to the excluded help subcommand)", () => {
+  assertEquals(v("git --help log"), "ask"); // 全域位置
+  assertEquals(v("git log --help"), "ask"); // 子指令之後
+  assertEquals(v("git help log"), "ask"); // 既有
+  assertEquals(v("git --help"), "ask"); // 無子指令（over-ask，可接受）
+});
+
+Deno.test("-h prints usage only and still allows", () => {
+  assertEquals(v("git log -h"), "allow");
+  assertEquals(v("git status -h"), "allow");
+});
+```
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+Run: `deno test --allow-env src/rules/commands/git_test.ts`
+
+Expected: FAIL — `--help paths ask` 失敗（`git --help log` 與 `git log --help` 目前皆回 `allow`）。
+
+`-h prints usage only and still allows` 此時**已 PASS**，是防止誤把 `-h` 一起擋掉的護欄。
+
+- [ ] **Step 3: 移除全域安全清單中的 `--help`**
+
+在 `src/rules/commands/git.ts` 的 `SAFE_VALUELESS_GLOBAL` 中，刪除 `"--help",` 這一行，並在原位置留下說明。改動後該常數末段為：
+
+```typescript
+  "--no-lazy-fetch",
+  "--version",
+  // 刻意不含 "--help"：`git --help <sub>` 等同 `git help <sub>`，會 spawn man viewer
+  // （可經 GIT_MAN_VIEWER 指定任意程式）。移除後它落入「未知全域旗標」分支 → ask。
+]);
+```
+
+- [ ] **Step 4: 新增 rest 層 `--help` 檢查**
+
+在 `src/rules/commands/git.ts` 的 `evaluate` 中，緊接既有 `--ext-diff` 檢查之後插入：
+
+```typescript
+    // --help 在子指令之後同樣 spawn man viewer（git log --help ≡ git help log）
+    if (rest.includes("--help")) {
+      return ask(
+        `git ${sub}：--help 會 spawn man viewer（可經 GIT_MAN_VIEWER 指定任意程式）`,
+      );
+    }
+```
+
+插入後該區塊順序為：`--ext-diff` → `--help` → `--output` → `git grep -O` → `scanRestArgs` → `READ_SUBCOMMANDS` → `switch`。
+
+- [ ] **Step 5: Run tests to verify they pass**
+
+Run: `deno test --allow-env src/rules/commands/git_test.ts`
+
+Expected: PASS（全部測試）。
+
+特別確認既有的 `git safe valueless global options allow with read subcommands` 仍 PASS——它不含 `--help`，不受影響。
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add src/rules/commands/git.ts src/rules/commands/git_test.ts
+git commit -m "fix(rules): close --help paths equivalent to the excluded help subcommand
+
+git --help <sub> and git <sub> --help both spawn a man viewer, which
+GIT_MAN_VIEWER can point at an arbitrary program - the same external-execution
+risk that keeps the help subcommand out of the allowlist. Drop --help from
+SAFE_VALUELESS_GLOBAL and add a rest-level check.
+
+-h is unaffected: it only prints usage to stdout. Lands before the allowlist
+expansion so the gap is never widened to newly allowed subcommands.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
+```
+
+---
+
+### Task 4: 擴充 `READ_SUBCOMMANDS`
+
+兩道防護（`-O` 範圍檢查、`--help` 封堵）都已就位，現在擴充 allowlist 才不會產生不安全的中間狀態。
 
 **Files:**
 - Modify: `src/rules/commands/git.ts:45-49`
@@ -389,10 +498,15 @@ Deno.test("excluded subcommands still ask", () => {
   assertEquals(v("git merge-tree a b"), "ask");
 });
 
-Deno.test("-O scope check also covers the newly added subcommands", () => {
+Deno.test("both guards also cover the newly added subcommands", () => {
+  // -O 範圍檢查（Task 2）
   assertEquals(v("git diff-index -Osrc/order.txt HEAD"), "allow");
   assertEquals(v("git diff-tree -O/etc/passwd HEAD"), "ask");
   assertEquals(v("git range-diff -O /tmp/x a..b c..d"), "ask");
+  // --help 封堵（Task 3）
+  assertEquals(v("git --help merge-base"), "ask");
+  assertEquals(v("git merge-base --help"), "ask");
+  assertEquals(v("git merge-base -h"), "allow"); // -h 不受影響
 });
 ```
 
@@ -400,7 +514,7 @@ Deno.test("-O scope check also covers the newly added subcommands", () => {
 
 Run: `deno test --allow-env src/rules/commands/git_test.ts`
 
-Expected: FAIL — `newly added read-only subcommands allow` 失敗（`git merge-base HEAD main` 回 `ask`），`-O scope check also covers the newly added subcommands` 也失敗（`git diff-index -Osrc/order.txt HEAD` 回 `ask`，因 `diff-index` 尚未列入 allowlist）。
+Expected: FAIL — `newly added read-only subcommands allow` 失敗（`git merge-base HEAD main` 回 `ask`）；`both guards also cover the newly added subcommands` 也失敗（`git diff-index -Osrc/order.txt HEAD` 與 `git merge-base -h` 回 `ask`，因這些子指令尚未列入 allowlist）。
 
 `excluded subcommands still ask` 此時**已 PASS**（那些子指令本來就落 `default: ask`）；它是防止 Step 3 誤加的護欄，實作後必須仍綠。
 
@@ -460,98 +574,8 @@ Excludes ls-remote (network), help/verify-* (spawns man/browser/gpg), and
 subcommands with write forms (symbolic-ref, worktree, submodule, notes,
 bisect, merge-tree).
 
-The -O orderfile scope check is already in place, so these new entries do not
-widen that gap.
-
-Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
-```
-
----
-
-### Task 4: 封堵 `--help` 兩條路徑
-
-`git help log` 已被排除，但 `git --help log`（`--help` 在 `SAFE_VALUELESS_GLOBAL` 被跳過，子指令判為 `log` → allow）與 `git log --help`（落在 rest、無人檢查）語義等價且都會 spawn man viewer。man viewer 可經 `GIT_MAN_VIEWER` 指定任意程式，屬實質的外部程式執行面。
-
-**Files:**
-- Modify: `src/rules/commands/git.ts:26-43`（`SAFE_VALUELESS_GLOBAL`）
-- Modify: `src/rules/commands/git.ts`（`evaluate` 的 rest 層檢查區）
-- Test: `src/rules/commands/git_test.ts`
-
-- [ ] **Step 1: Write the failing tests**
-
-在 `src/rules/commands/git_test.ts` 檔尾追加：
-
-```typescript
-// ── 本次新增：--help 封堵 ─────────────────────────────────────────────────
-
-Deno.test("--help paths ask (equivalent to the excluded help subcommand)", () => {
-  assertEquals(v("git --help log"), "ask"); // 全域位置
-  assertEquals(v("git log --help"), "ask"); // 子指令之後
-  assertEquals(v("git help log"), "ask"); // 既有
-  assertEquals(v("git --help"), "ask"); // 無子指令（over-ask，可接受）
-});
-
-Deno.test("-h prints usage only and still allows", () => {
-  assertEquals(v("git log -h"), "allow");
-  assertEquals(v("git merge-base -h"), "allow");
-});
-```
-
-- [ ] **Step 2: Run tests to verify they fail**
-
-Run: `deno test --allow-env src/rules/commands/git_test.ts`
-
-Expected: FAIL — `--help paths ask` 失敗（`git --help log` 與 `git log --help` 目前皆回 `allow`）。
-
-`-h prints usage only and still allows` 此時**已 PASS**（`merge-base` 於 Task 3 已加入 allowlist），是防止誤把 `-h` 一起擋掉的護欄。
-
-- [ ] **Step 3: 移除全域安全清單中的 `--help`**
-
-在 `src/rules/commands/git.ts` 的 `SAFE_VALUELESS_GLOBAL` 中，刪除 `"--help",` 這一行，並在原位置留下說明。改動後該常數末段為：
-
-```typescript
-  "--no-lazy-fetch",
-  "--version",
-  // 刻意不含 "--help"：`git --help <sub>` 等同 `git help <sub>`，會 spawn man viewer
-  // （可經 GIT_MAN_VIEWER 指定任意程式）。移除後它落入「未知全域旗標」分支 → ask。
-]);
-```
-
-- [ ] **Step 4: 新增 rest 層 `--help` 檢查**
-
-在 `src/rules/commands/git.ts` 的 `evaluate` 中，緊接既有 `--ext-diff` 檢查之後插入：
-
-```typescript
-    // --help 在子指令之後同樣 spawn man viewer（git log --help ≡ git help log）
-    if (rest.includes("--help")) {
-      return ask(
-        `git ${sub}：--help 會 spawn man viewer（可經 GIT_MAN_VIEWER 指定任意程式）`,
-      );
-    }
-```
-
-插入後該區塊順序為：`--ext-diff` → `--help` → `--output` → `git grep -O` → `scanRestArgs` → `READ_SUBCOMMANDS`。
-
-- [ ] **Step 5: Run tests to verify they pass**
-
-Run: `deno test --allow-env src/rules/commands/git_test.ts`
-
-Expected: PASS（全部測試）。
-
-特別確認既有的 `git safe valueless global options allow with read subcommands` 仍 PASS——它不含 `--help`，不受影響。
-
-- [ ] **Step 6: Commit**
-
-```bash
-git add src/rules/commands/git.ts src/rules/commands/git_test.ts
-git commit -m "fix(rules): close --help paths equivalent to the excluded help subcommand
-
-git --help <sub> and git <sub> --help both spawn a man viewer, which
-GIT_MAN_VIEWER can point at an arbitrary program - the same external-execution
-risk that keeps the help subcommand out of the allowlist. Drop --help from
-SAFE_VALUELESS_GLOBAL and add a rest-level check.
-
--h is unaffected: it only prints usage to stdout.
+Both guards (-O orderfile scope check, --help closure) are already in place,
+so these new entries do not widen either gap.
 
 Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 ```
@@ -673,14 +697,17 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 
 - [ ] **Step 2: 更新 CLAUDE.md 的攻擊面列舉**
 
-在「⚠️ 不要再犯的問題 → 安全誤放」段落中，找到以 **git / gh 全域選項是攻擊面** 開頭的項目，在其危險旗標列舉中把 `--ext-diff` 之後補上 `--help`。接著在該項目之後新增一個同層級的項目：
+在「⚠️ 不要再犯的問題 → 安全誤放」段落中，找到以 **git / gh 全域選項是攻擊面** 開頭的項目，在其危險旗標列舉中把 `--ext-diff` 之後補上 `--help`。接著在該項目之後新增兩個同層級的項目：
 
 ```markdown
-- **git 子指令後的引數也是攻擊面**：`git.ts` 的 `scanRestArgs` 走訪子指令之後、`--` 之前的引數：
+- **git 子指令後的引數也是攻擊面**：`git.ts` 的 `scanRestArgs` 走訪子指令之後、`--` 之前的引數。
   動態 token（`git log $ref`）一律 ask——靜態分析無法排除它展開成旗標，放行等於讓旗標檢查可被單一
-  變數繞過；`-O <file>` / `-O<file>`（orderfile）會被 git 實際讀取，須 `resolvePathValue` 範圍檢查。
-  `--help`（無論在全域位置或子指令之後）等同 `git help`，會 spawn man viewer（`GIT_MAN_VIEWER`
-  可指定任意程式）→ ask；`-h` 只印用法，不受影響。
+  變數繞過；`-O <file>` / `-O<file>`（orderfile）會被 git 實際開啟讀取，須 `resolvePathValue`
+  範圍檢查。此掃描刻意置於 `git grep -O`（語意是 pager，不是 orderfile）檢查之後、`switch` 之前。
+- **`--help` 等同 `git help`**：無論在全域位置（`git --help log`）或子指令之後（`git log --help`），
+  都會 spawn man viewer，而 `GIT_MAN_VIEWER` 可指定任意程式 → 兩處都要 ask（前者靠把 `--help`
+  排除在 `SAFE_VALUELESS_GLOBAL` 之外，後者靠 `evaluate` 的 rest 層檢查）。`-h` 只印用法到
+  stdout，不受影響。
 ```
 
 - [ ] **Step 3: Build**
@@ -746,4 +773,4 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 - Operational verification 五條全部符合預期（或 `allow` 已確認為 `permissions.allow` 升級所致）。
 - 既有測試零修改（若有轉紅，停下確認是否為非預期的行為變更）。
 - `CLAUDE.md` 兩處皆與實作一致。
-- 每個 commit 都是安全的中間狀態：`-O` 防護先於 allowlist 擴充落地。
+- 每個 commit 都是安全的中間狀態：兩道防護（`-O` 範圍檢查、`--help` 封堵）皆先於 allowlist 擴充落地。
