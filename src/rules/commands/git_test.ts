@@ -205,3 +205,26 @@ Deno.test("static tokens that look exotic are still static", () => {
   assertEquals(v("git rev-parse --abbrev-ref @{upstream}"), "allow");
   assertEquals(v("git log HEAD~1"), "allow");
 });
+
+// ── 本次新增：-O orderfile 範圍檢查 ───────────────────────────────────────
+
+Deno.test("-O orderfile attached form: in-project allows, outside asks", () => {
+  assertEquals(v("git diff -Osrc/order.txt HEAD"), "allow");
+  assertEquals(v("git diff -O/etc/passwd HEAD"), "ask");
+  assertEquals(v("git log -O../outside.txt"), "ask");
+});
+
+Deno.test("-O orderfile space form: in-project allows, outside asks", () => {
+  assertEquals(v("git diff -O src/order.txt HEAD"), "allow");
+  assertEquals(v("git diff -O /etc/passwd HEAD"), "ask");
+  assertEquals(v("git show -O /tmp/x HEAD"), "ask");
+});
+
+Deno.test("-O edge cases ask", () => {
+  assertEquals(v("git diff HEAD -O"), "ask"); // 末尾缺值
+  assertEquals(v('git diff -O "$F" HEAD'), "ask"); // 值為動態
+});
+
+Deno.test("-O after -- is a pathspec, not a flag", () => {
+  assertEquals(v("git diff HEAD -- -O/etc/passwd"), "allow");
+});

@@ -178,21 +178,42 @@ function has(rest: string[], ...flags: string[]): boolean {
  * 走訪子指令之後的引數。
  *
  * - 遇 `--` 停止：其後是 pathspec，不再有旗標語義。
- * - 動態 token → ask：靜態分析無法排除其展開為旗標，放行等於讓旗標檢查可被單一變數繞過。
+ * - 動態 token → ask：靜態分析無法排除其展開為 `-O` 等旗標，放行等於讓旗標檢查可被單一變數繞過。
+ * - `-O <file>` / `-O<file>`（orderfile）：git 會實際開啟讀取該路徑，故做範圍檢查。
+ *   不處理 bundling（`-rO<file>`）——git 本身即拒絕該形式。
  *
  * 回傳 null 代表本掃描無異議（由呼叫端續行既有判定）。
  */
 function scanRestArgs(
   sub: string,
   restWords: Word[],
-  _ctx: RuleContext,
+  ctx: RuleContext,
 ): RuleVerdict | null {
+  const outOfScope = `git ${sub}：-O orderfile 路徑超出專案範圍`;
   let k = 0;
   while (k < restWords.length) {
     const t = staticValue(restWords[k]);
     if (t === "--") return null; // pathspec 區，停止掃描
     if (t === null) {
-      return ask(`git ${sub}：子指令引數含動態 token，無法排除其展開為旗標`);
+      return ask(`git ${sub}：子指令引數含動態 token，無法排除其展開為 -O 等旗標`);
+    }
+    // 空格形式：-O <file>
+    if (t === "-O") {
+      const valWord = restWords[k + 1];
+      if (valWord === undefined) return ask(`git ${sub}：-O 缺少 orderfile 值`);
+      const val = staticValue(valWord);
+      if (val === null) {
+        return ask(`git ${sub}：-O 的 orderfile 值為動態，無法判定範圍`);
+      }
+      if (ctx.resolvePathValue(val) !== "in-project") return ask(outOfScope);
+      k += 2;
+      continue;
+    }
+    // 黏寫形式：-O<file>
+    if (t.startsWith("-O") && t.length > 2) {
+      if (ctx.resolvePathValue(t.slice(2)) !== "in-project") return ask(outOfScope);
+      k += 1;
+      continue;
     }
     k += 1;
   }
@@ -229,7 +250,7 @@ export const gitRule: CommandRule = {
       return ask("git grep：-O / --open-files-in-pager 會執行任意 pager 程式");
     }
 
-    // 子指令引數掃描（動態 token）。
+    // 子指令引數掃描（動態 token / -O orderfile 範圍）。
     // 刻意置於 grep -O 檢查之後，使 `git grep -O` 維持既有的「執行任意 pager」理由；
     // 也刻意置於 switch 之前，故 branch / tag / config / stash / remote 同受此掃描。
     const scanned = scanRestArgs(sub, restWords, ctx);
