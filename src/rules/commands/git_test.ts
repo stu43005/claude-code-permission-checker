@@ -186,3 +186,22 @@ Deno.test("git -C /tmp status asks (out-of-project path, via full pipeline)", ()
   const cwd = { kind: "known" as const, path: "/proj" };
   assertEquals(evaluate("git -C /tmp status", "/proj", cwd).verdict, "ask");
 });
+
+// ── 本次新增：子指令後動態 token 收緊 ──────────────────────────────────────
+
+Deno.test("dynamic token after subcommand asks", () => {
+  assertEquals(v("git log $ref"), "ask");
+  assertEquals(v("git diff $BRANCH HEAD"), "ask");
+  assertEquals(v("git diff $(git merge-base HEAD main)"), "ask");
+  assertEquals(v("git log *.md"), "ask"); // 未引號 glob 亦屬動態
+});
+
+Deno.test("dynamic token after -- still allows (pathspec cannot become a flag)", () => {
+  assertEquals(v("git diff HEAD -- $FILE"), "allow");
+});
+
+Deno.test("static tokens that look exotic are still static", () => {
+  // @{upstream} 不含逗號 / .. ，未被解析為 BraceExpansion → 靜態
+  assertEquals(v("git rev-parse --abbrev-ref @{upstream}"), "allow");
+  assertEquals(v("git log HEAD~1"), "allow");
+});

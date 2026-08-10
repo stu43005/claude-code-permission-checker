@@ -1,3 +1,4 @@
+import type { Word } from "../../deps.ts";
 import type { CommandRule, RuleContext, RuleVerdict } from "../types.ts";
 import { allow, ask } from "../types.ts";
 import { staticValue } from "../../engine/word.ts";
@@ -68,13 +69,19 @@ function isSafeConfigKey(key: string): boolean {
 /** 取得子指令與其後的引數（跳過全域選項及其值）。 */
 function parseSub(
   argv: RuleContext["argv"],
-): { sub: string | null; rest: string[]; dynamic: boolean; dangerous: string | null } {
+): {
+  sub: string | null;
+  rest: string[];
+  restWords: Word[];
+  dynamic: boolean;
+  dangerous: string | null;
+} {
   let i = 0;
   let dangerous: string | null = null;
 
   while (i < argv.length) {
     const t = staticValue(argv[i]);
-    if (t === null) return { sub: null, rest: [], dynamic: true, dangerous };
+    if (t === null) return { sub: null, rest: [], restWords: [], dynamic: true, dangerous };
     if (!t.startsWith("-")) break; // 非旗標 token → 子指令開始
 
     // 1. -c key=val（空格形式）
@@ -150,25 +157,52 @@ function parseSub(
     continue;
   }
 
-  if (i >= argv.length) return { sub: null, rest: [], dynamic: false, dangerous };
+  if (i >= argv.length) return { sub: null, rest: [], restWords: [], dynamic: false, dangerous };
   const subTok = staticValue(argv[i]);
-  if (subTok === null) return { sub: null, rest: [], dynamic: true, dangerous };
+  if (subTok === null) return { sub: null, rest: [], restWords: [], dynamic: true, dangerous };
   const rest: string[] = [];
+  const restWords: Word[] = [];
   for (let j = i + 1; j < argv.length; j++) {
     const r = staticValue(argv[j]);
-    rest.push(r ?? " "); // 動態值以哨符代表
+    rest.push(r ?? " "); // 動態值以哨符代表（既有 has() / includes() 檢查沿用）
+    restWords.push(argv[j]); // 原始 Word，供 scanRestArgs 精確判定動態
   }
-  return { sub: subTok, rest, dynamic: false, dangerous };
+  return { sub: subTok, rest, restWords, dynamic: false, dangerous };
 }
 
 function has(rest: string[], ...flags: string[]): boolean {
   return rest.some((r) => flags.includes(r));
 }
 
+/**
+ * 走訪子指令之後的引數。
+ *
+ * - 遇 `--` 停止：其後是 pathspec，不再有旗標語義。
+ * - 動態 token → ask：靜態分析無法排除其展開為旗標，放行等於讓旗標檢查可被單一變數繞過。
+ *
+ * 回傳 null 代表本掃描無異議（由呼叫端續行既有判定）。
+ */
+function scanRestArgs(
+  sub: string,
+  restWords: Word[],
+  _ctx: RuleContext,
+): RuleVerdict | null {
+  let k = 0;
+  while (k < restWords.length) {
+    const t = staticValue(restWords[k]);
+    if (t === "--") return null; // pathspec 區，停止掃描
+    if (t === null) {
+      return ask(`git ${sub}：子指令引數含動態 token，無法排除其展開為旗標`);
+    }
+    k += 1;
+  }
+  return null;
+}
+
 export const gitRule: CommandRule = {
   names: ["git"],
   evaluate(ctx: RuleContext): RuleVerdict {
-    const { sub, rest, dynamic, dangerous } = parseSub(ctx.argv);
+    const { sub, rest, restWords, dynamic, dangerous } = parseSub(ctx.argv);
     if (dynamic) return ask("git：子指令含動態值，無法靜態判定");
     if (sub === null) return ask("git：未指定子指令");
 
@@ -194,6 +228,12 @@ export const gitRule: CommandRule = {
     ) {
       return ask("git grep：-O / --open-files-in-pager 會執行任意 pager 程式");
     }
+
+    // 子指令引數掃描（動態 token）。
+    // 刻意置於 grep -O 檢查之後，使 `git grep -O` 維持既有的「執行任意 pager」理由；
+    // 也刻意置於 switch 之前，故 branch / tag / config / stash / remote 同受此掃描。
+    const scanned = scanRestArgs(sub, restWords, ctx);
+    if (scanned) return scanned;
 
     if (READ_SUBCOMMANDS.has(sub)) return allow();
 
