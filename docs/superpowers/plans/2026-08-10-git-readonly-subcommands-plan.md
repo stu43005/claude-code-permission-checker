@@ -499,14 +499,14 @@ Deno.test("excluded subcommands still ask", () => {
 });
 
 Deno.test("both guards also cover the newly added subcommands", () => {
-  // -O 範圍檢查（Task 2）
+  // -O orderfile 範圍檢查
   assertEquals(v("git diff-index -Osrc/order.txt HEAD"), "allow");
   assertEquals(v("git diff-tree -O/etc/passwd HEAD"), "ask");
   assertEquals(v("git range-diff -O /tmp/x a..b c..d"), "ask");
-  // --help 封堵（Task 3）
+  // --help man viewer 封堵
   assertEquals(v("git --help merge-base"), "ask");
   assertEquals(v("git merge-base --help"), "ask");
-  assertEquals(v("git merge-base -h"), "allow"); // -h 不受影響
+  assertEquals(v("git merge-base -h"), "allow"); // -h 只印用法，不受影響
 });
 ```
 
