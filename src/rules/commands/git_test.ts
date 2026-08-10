@@ -1,4 +1,4 @@
-import { assertEquals } from "@std/assert";
+import { assertEquals, assertStringIncludes } from "@std/assert";
 import { parse } from "../../deps.ts";
 import type { Command } from "../../deps.ts";
 import { gitRule } from "./git.ts";
@@ -347,4 +347,31 @@ Deno.test("ordinary blame flags are not mistaken for path-valued ones", () => {
   assertEquals(v("git blame --line-porcelain README.md"), "allow");
   assertEquals(v("git blame -L 1,10 README.md"), "allow");
   assertEquals(v("git blame --color-lines README.md"), "allow");
+});
+
+// ── 本次新增：交叉與回歸 ──────────────────────────────────────────────────
+
+Deno.test("git grep -O keeps its pager reason (new scan must not preempt)", () => {
+  const r = gitRule.evaluate(ctxOf("git grep -O pager foo"));
+  assertEquals(r.kind, "ask");
+  assertStringIncludes(r.kind === "ask" ? r.reason : "", "pager");
+});
+
+Deno.test("switch-gated subcommands are also covered by the new scan", () => {
+  assertEquals(v("git branch $NAME"), "ask"); // 動態 token，掃描先於 switch
+  assertEquals(v("git stash list"), "allow"); // 既有 allow 形式不被誤殺
+  assertEquals(v("git remote -v"), "allow");
+  assertEquals(v("git branch"), "allow");
+});
+
+Deno.test("global gates still apply to newly added subcommands", () => {
+  assertEquals(v("git -c core.pager=cat merge-base HEAD main"), "ask");
+  assertEquals(v("git --exec-path=/tmp rev-list HEAD"), "ask");
+  assertEquals(v("git --unknown-global merge-base HEAD main"), "ask");
+  assertEquals(v("git --config-env=core.pager=EVIL diff-tree HEAD"), "ask");
+});
+
+Deno.test("newly added diff-family subcommands still honor existing rest gates", () => {
+  assertEquals(v("git diff-tree --ext-diff HEAD"), "ask");
+  assertEquals(v("git range-diff --output=x a..b c..d"), "ask");
 });
