@@ -46,6 +46,7 @@ git rev-parse --abbrev-ref @{upstream}
    - `@{upstream}` → **靜態**（`parts: null`、`staticValue` 回 `"@{upstream}"`）。`@{…}` 不含逗號或 `..`，未被解析為 BraceExpansion，故 §1 的目標指令**不**受動態收緊影響。
    - `HEAD~1`、`--`、`src/x.ts` → 靜態。
    - `$BRANCH` → 動態（`SimpleExpansion`）；`*.md`（未引號 glob）→ 動態（`word.ts` 詞法偵測）。
+   - **`staticValue()` 對動態 Word 的回傳值實測為 `null`**（非 `undefined`、非空字串），故 §4.2 演算法以 `t === null` 判定動態是正確的。
 9. **`--help` 與 `-h` 行為不同（設計審查 round 2 觸發的實測）**：
    - `git --help <sub>` 與 `git <sub> --help` **都會 spawn man viewer**（實測 `GIT_MAN_VIEWER=nonexistent-viewer-xyz git --help log` 回「未知的 man 檢視器」警告，證明該環境變數指定的程式確實被當作 viewer 執行）。兩者等價於 `git help <sub>`。
    - `git <sub> -h`（如 `git log -h`）**只印用法到 stdout**，不 spawn man。
@@ -177,13 +178,13 @@ man viewer 可經 `GIT_MAN_VIEWER` 指定任意程式（§2 取證 9），故這
 4. **`-O` 空格形式**：`git diff -O src/order.txt HEAD` → `allow`；`git diff -O /etc/passwd HEAD` → `ask`；`git range-diff -O /tmp/x a..b c..d` → `ask`。
 5. **`-O` 邊界**：`git diff HEAD -O` （末尾缺值）→ `ask`；`git diff -O "$F" HEAD`（值動態）→ `ask`。
 6. **`--` 終止符**：`git diff HEAD -- -O/etc/passwd` → `allow`（`-O` 為 pathspec，不讀檔）。
-6b. **動態 token（§4.3 收緊）**：`git log $ref` → `ask`；`git diff $BRANCH HEAD` → `ask`；`git diff $(git merge-base HEAD main)` → `ask`；`git log *.md`（未引號 glob）→ `ask`。
-6c. **`--` 之後的動態 token 不 ask**：`git diff HEAD -- $FILE` → `allow`（掃描已於 `--` 停止，pathspec 不可能被解讀為旗標）。
-6d. **`--help` 封堵（§4.5）**：`git --help log` → `ask`；`git log --help` → `ask`；`git help log` → `ask`（既有）；`git --help` → `ask`。對照組 `git log -h` → `allow`（`-h` 不 spawn man，且不得被新檢查誤殺）。
-7. **grep 語意不被覆蓋**：`git grep -O foo` → `ask`，且理由字串仍為既有的 pager 理由（斷言 `reason` 內含 `pager`），確認新檢查未搶先命中。
-7b. **`switch` gated 子指令也受 §4.2 掃描**（§4.2 刻意在 `switch` 之前執行）：`git branch $NAME` → `ask`（動態 token）；`git stash list` → `allow`（不受新掃描影響）；`git remote -v` → `allow`。確認新掃描不誤殺 gated 子指令的既有 allow 形式。
-8. **全域閘門對新子指令仍生效**：`git -c core.pager=cat merge-base HEAD main` → `ask`；`git --exec-path=/tmp rev-list HEAD` → `ask`；`git --unknown-global merge-base HEAD main` → `ask`。
-9. **回歸**：既有測試全數維持通過（特別是 `git diff HEAD~1`、`git -C sub status` 等靜態形式仍為 `allow`）。**例外**：若既有測試中存在「子指令後帶動態 token 且斷言 `allow`」的案例，依 §4.3 該斷言必須改為 `ask`——這是本次刻意的行為收緊，不是測試被改壞。實作時須逐一檢視 `git_test.ts` 既有斷言並在計畫中列出所有需改動者。
+7. **動態 token（§4.3 收緊）**：`git log $ref` → `ask`；`git diff $BRANCH HEAD` → `ask`；`git diff $(git merge-base HEAD main)` → `ask`；`git log *.md`（未引號 glob）→ `ask`。
+8. **`--` 之後的動態 token 不 ask**：`git diff HEAD -- $FILE` → `allow`（掃描已於 `--` 停止，pathspec 不可能被解讀為旗標）。
+9. **`--help` 封堵（§4.5）**：`git --help log` → `ask`；`git log --help` → `ask`；`git help log` → `ask`（既有）；`git --help` → `ask`。對照組 `git log -h` → `allow`（`-h` 不 spawn man，且不得被新檢查誤殺）。
+10. **grep 語意不被覆蓋**：`git grep -O foo` → `ask`，且理由字串仍為既有的 pager 理由（斷言 `reason` 內含 `pager`），確認新檢查未搶先命中。
+11. **`switch` gated 子指令也受 §4.2 掃描**（§4.2 刻意在 `switch` 之前執行）：`git branch $NAME` → `ask`（動態 token）；`git stash list` → `allow`（不受新掃描影響）；`git remote -v` → `allow`。確認新掃描不誤殺 gated 子指令的既有 allow 形式。
+12. **全域閘門對新子指令仍生效**：`git -c core.pager=cat merge-base HEAD main` → `ask`；`git --exec-path=/tmp rev-list HEAD` → `ask`；`git --unknown-global merge-base HEAD main` → `ask`。
+13. **回歸**：既有測試全數維持通過（特別是 `git diff HEAD~1`、`git -C sub status` 等靜態形式仍為 `allow`）。**例外**：若既有測試中存在「子指令後帶動態 token 且斷言 `allow`」的案例，依 §4.3 該斷言必須改為 `ask`——這是本次刻意的行為收緊，不是測試被改壞。實作時須逐一檢視 `git_test.ts` 既有斷言並在計畫中列出所有需改動者。
 
 ## 7. 驗證步驟
 
