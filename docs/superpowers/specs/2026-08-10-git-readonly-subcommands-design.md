@@ -50,7 +50,12 @@ git rev-parse --abbrev-ref @{upstream}
    - `git --help <sub>` 與 `git <sub> --help` **都會 spawn man viewer**（實測 `GIT_MAN_VIEWER=nonexistent-viewer-xyz git --help log` 回「未知的 man 檢視器」警告，證明該環境變數指定的程式確實被當作 viewer 執行）。兩者等價於 `git help <sub>`。
    - `git <sub> -h`（如 `git log -h`）**只印用法到 stdout**，不 spawn man。
    - `git --help`（無子指令）只印 git 總用法，不 spawn man。
-10. **候選子指令的旗標面**：對 `merge-base`、`rev-list`、`name-rev`、`whatchanged`、`range-diff`、`cherry`、`diff-tree`、`diff-files`、`diff-index`、`check-ignore`、`check-attr`、`check-ref-format`、`count-objects`、`var`、`annotate` 逐一檢視 `-h` 輸出，除上述 `-O` 外未見寫入型（`--output`／`--write`／`-i`）或執行外部程式型旗標。
+10. **textconv 的觸發條件與適用子指令（設計審查 round 3 觸發的實測，git 2.49.0）**：於臨時 repo 設 `.gitattributes` 指定 `diff=evil`、config 定義 `diff.evil.textconv` 後逐一觀察：
+    - **driver 只能定義在 config**：僅有 checked-in `.gitattributes`、config 未定義該 driver 時，textconv **完全不執行**（diff 輸出為原始內容）。`git config --show-origin --get diff.evil.textconv` 顯示來源為 `.git/config`。checked-in 檔案無法單獨注入要執行的指令。
+    - **執行 textconv**：`git diff`、`git log -p`、`git show`（三者皆為**既有**已 allow 項）、`git whatchanged -p`（本次新增，實為 `log --raw` 的別名）。
+    - **不執行 textconv**：`git diff-tree -p`、`git diff-index -p`、`git diff-files -p`（本次新增的 plumbing 家族；plumbing 預設不套用 user-facing 轉換）。
+    - `--no-textconv` 可關閉該行為。
+11. **候選子指令的旗標面**：對 `merge-base`、`rev-list`、`name-rev`、`whatchanged`、`range-diff`、`cherry`、`diff-tree`、`diff-files`、`diff-index`、`check-ignore`、`check-attr`、`check-ref-format`、`count-objects`、`var`、`annotate` 逐一檢視 `-h` 輸出，除上述 `-O` 外未見寫入型（`--output`／`--write`／`-i`）或執行外部程式型旗標。
 
 ## 3. 已核可的決策
 
@@ -154,7 +159,12 @@ man viewer 可經 `GIT_MAN_VIEWER` 指定任意程式（§2 取證 9），故這
    - **Decision**：不實作硬邊界。
    - **Rationale**（使用者裁決）：① 與既有架構衝突——`factory.ts` 的 `pathValueFlags`（`grep -f <外部檔>`、`diff --from-file=<外部檔>`）全部都是可升級 ask，單獨把 `-O` 升格會造成規則體系不一致；② 危害極低——orderfile 內容只影響 diff 的檔案排序、**不會被輸出**，資訊洩漏強度遠弱於 `grep -f`；③ 使用者自行寫下 `Bash(git diff *)` 即為明確授權，正是升級層的設計意圖。
    - **範圍**：本裁決基於「`-O` 與既有 `pathValueFlags` 同類、且內容不外洩」這個前提。若日後 `-O` 的語義改變、或既有 `pathValueFlags` 改為不可升級，此接受限制不再自動適用，須重新評估。
-2. **`.gitattributes` 的 textconv filter 不在本次範圍**。`git diff` / `show` / `log` 可經 `textconv` 設定執行外部程式，此風險在現行設計中已隨這三個子指令被 allow 而存在（`--ext-diff` 有擋、textconv 沒擋）。新增的 diff-\* plumbing 家族繼承同一面，不提高既有風險等級。收緊 textconv 需獨立評估。
+2. **不為 textconv 增設閘門，diff 家族照常納入 allowlist**。
+   - **Concern**（design-soundness 審查 round 3 提出）：新增 `whatchanged` / `range-diff` / `diff-tree` / `diff-files` / `diff-index` 會增加「被分類為唯讀卻可能執行外部 textconv filter」的自動放行入口，與排除 `help` / `verify-*` 所用的原則矛盾。建議先要求 `--no-textconv` 或改為個案 gate。
+   - **Decision**：不實作 textconv 閘門，維持本 spec 的 allowlist 擴充。
+   - **Rationale**（使用者裁決，依 §2 取證 10 的實測）：① textconv driver **只能定義在 config**，checked-in `.gitattributes` 單獨無法注入指令，故「純粹 clone 一個不受信任的 repo」不足以觸發；② 本次新增的 plumbing 家族（`diff-tree` / `diff-files` / `diff-index`）**實測不執行 textconv**，比既有 allowlist 項更安全，reviewer 所述「擴大入口」對這三項不成立；③ 唯一會執行 textconv 的新增項 `whatchanged` 是 `log --raw` 的別名，而 `git log -p` / `diff` / `show` **早已在既有 allowlist**——攻擊者只需一個入口且該入口早已存在，多一個別名不改變攻擊面。
+   - **範圍**：本裁決基於「既有 `diff` / `log` / `show` 維持 allow」這個前提。若日後把這三者收緊或改為 gate，`whatchanged` 應同步處理，此接受限制不再自動適用。
+   - 收緊 textconv（含既有三項）需獨立評估，不在本次範圍。
 3. **有寫入形式的近親子指令不做個案 gate**。`symbolic-ref`、`worktree`、`submodule`、`notes`、`bisect`、`merge-tree` 需比照 `branch` / `stash` 的個案寫法，設計與測試成本高於本次收益，維持 `ask`。
 
 ## 6. 測試計畫（`src/rules/commands/git_test.ts`）
@@ -171,6 +181,7 @@ man viewer 可經 `GIT_MAN_VIEWER` 指定任意程式（§2 取證 9），故這
 6c. **`--` 之後的動態 token 不 ask**：`git diff HEAD -- $FILE` → `allow`（掃描已於 `--` 停止，pathspec 不可能被解讀為旗標）。
 6d. **`--help` 封堵（§4.5）**：`git --help log` → `ask`；`git log --help` → `ask`；`git help log` → `ask`（既有）；`git --help` → `ask`。對照組 `git log -h` → `allow`（`-h` 不 spawn man，且不得被新檢查誤殺）。
 7. **grep 語意不被覆蓋**：`git grep -O foo` → `ask`，且理由字串仍為既有的 pager 理由（斷言 `reason` 內含 `pager`），確認新檢查未搶先命中。
+7b. **`switch` gated 子指令也受 §4.2 掃描**（§4.2 刻意在 `switch` 之前執行）：`git branch $NAME` → `ask`（動態 token）；`git stash list` → `allow`（不受新掃描影響）；`git remote -v` → `allow`。確認新掃描不誤殺 gated 子指令的既有 allow 形式。
 8. **全域閘門對新子指令仍生效**：`git -c core.pager=cat merge-base HEAD main` → `ask`；`git --exec-path=/tmp rev-list HEAD` → `ask`；`git --unknown-global merge-base HEAD main` → `ask`。
 9. **回歸**：既有測試全數維持通過（特別是 `git diff HEAD~1`、`git -C sub status` 等靜態形式仍為 `allow`）。**例外**：若既有測試中存在「子指令後帶動態 token 且斷言 `allow`」的案例，依 §4.3 該斷言必須改為 `ask`——這是本次刻意的行為收緊，不是測試被改壞。實作時須逐一檢視 `git_test.ts` 既有斷言並在計畫中列出所有需改動者。
 
