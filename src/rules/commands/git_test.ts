@@ -292,3 +292,27 @@ Deno.test("both guards also cover the newly added subcommands", () => {
   assertEquals(v("git merge-base --help"), "ask");
   assertEquals(v("git merge-base -h"), "allow"); // -h 只印用法，不受影響
 });
+
+// ── 修補：blame / annotate 吃路徑值旗標範圍檢查 ─────────────────────────────
+
+Deno.test("blame / annotate path-valued flags are scope-checked", () => {
+  // --contents reads AND prints the file's contents
+  assertEquals(v("git annotate --contents /etc/passwd -- README.md"), "ask");
+  assertEquals(v("git blame --contents /etc/passwd -- README.md"), "ask");
+  assertEquals(v("git blame --contents=/etc/passwd -- README.md"), "ask");
+  assertEquals(v("git blame --contents src/x.ts -- README.md"), "allow");
+  // -S <revs-file>, both forms
+  assertEquals(v("git blame -S /etc/passwd README.md"), "ask");
+  assertEquals(v("git blame -S/etc/passwd README.md"), "ask");
+  // --ignore-revs-file, both forms
+  assertEquals(v("git blame --ignore-revs-file /etc/passwd README.md"), "ask");
+  assertEquals(v("git blame --ignore-revs-file=/etc/passwd README.md"), "ask");
+  // plain in-project blame unaffected
+  assertEquals(v("git blame README.md"), "allow");
+  assertEquals(v("git annotate README.md"), "allow");
+});
+
+Deno.test("log -S is a pickaxe string, not a path (must not be scope-checked)", () => {
+  assertEquals(v("git log -SREAD_SUBCOMMANDS"), "allow");
+  assertEquals(v("git log -S pattern"), "allow");
+});

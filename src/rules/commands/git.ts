@@ -65,6 +65,15 @@ const READ_SUBCOMMANDS = new Set<string>([
 ]);
 
 /**
+ * `blame` / `annotate` 專屬的吃路徑值旗標——其值會被 git 開啟讀取
+ * （`--contents` 更會把內容直接印進輸出）。
+ *
+ * `-S` 只在 blame / annotate 是 revs-file；在 `git log` 中 `-S<string>` 是 pickaxe
+ * 搜尋字串（非路徑），故本清單**不可**套用到其他子指令。
+ */
+const BLAME_PATH_VALUE_FLAGS = ["--contents", "--ignore-revs-file", "-S"];
+
+/**
  * 判斷 -c 傳入的 config key 是否安全（不會執行外部程式）。
  * 只放行純外觀 / 路徑類的已知安全 key；其餘一律視為不安全。
  */
@@ -229,6 +238,35 @@ function scanRestArgs(
       if (ctx.resolvePathValue(t.slice(2)) !== "in-project") return ask(outOfScope);
       k += 1;
       continue;
+    }
+    // blame / annotate 的吃路徑值旗標（僅這兩個子指令適用，見常數註解）
+    if (sub === "blame" || sub === "annotate") {
+      // 空格形式：--contents <file> / --ignore-revs-file <file> / -S <file>
+      if (BLAME_PATH_VALUE_FLAGS.includes(t)) {
+        const valWord = restWords[k + 1];
+        if (valWord === undefined) return ask(`git ${sub}：${t} 缺少路徑值`);
+        const val = staticValue(valWord);
+        if (val === null) {
+          return ask(`git ${sub}：${t} 的路徑值為動態，無法判定範圍`);
+        }
+        if (ctx.resolvePathValue(val) !== "in-project") {
+          return ask(`git ${sub}：${t} 的路徑值超出專案範圍`);
+        }
+        k += 2;
+        continue;
+      }
+      // 黏寫形式：--contents=<file> / --ignore-revs-file=<file> / -S<file>
+      const attached = BLAME_PATH_VALUE_FLAGS.find((f) =>
+        f.startsWith("--") ? t.startsWith(`${f}=`) : t.startsWith(f) && t.length > f.length
+      );
+      if (attached !== undefined) {
+        const val = t.slice(attached.startsWith("--") ? attached.length + 1 : attached.length);
+        if (ctx.resolvePathValue(val) !== "in-project") {
+          return ask(`git ${sub}：${attached} 的路徑值超出專案範圍`);
+        }
+        k += 1;
+        continue;
+      }
     }
     k += 1;
   }
