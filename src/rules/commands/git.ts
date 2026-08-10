@@ -44,10 +44,24 @@ const SAFE_VALUELESS_GLOBAL = new Set<string>([
   // （可經 GIT_MAN_VIEWER 指定任意程式）。移除後它落入「未知全域旗標」分支 → ask。
 ]);
 
-/** 純讀取子指令（其餘子指令一律 ask）。 */
+/**
+ * 純讀取子指令（其餘子指令一律 ask）。
+ *
+ * 刻意排除（皆維持 ask）：
+ * - `ls-remote`：不改本地狀態，但會發網路請求、可接任意 URL（不受 curl domain allowlist 管轄）。
+ * - `help`、`verify-commit`、`verify-tag`：不改儲存庫狀態，但會 spawn 外部程式（man / browser / gpg）。
+ * - `symbolic-ref`、`worktree`、`submodule`、`notes`、`bisect`、`merge-tree`：有寫入形式，需個案 gate。
+ */
 const READ_SUBCOMMANDS = new Set<string>([
-  "status", "log", "diff", "show", "blame", "rev-parse", "describe",
-  "cat-file", "ls-files", "ls-tree", "for-each-ref", "reflog", "shortlog", "grep",
+  // porcelain
+  "status", "log", "diff", "show", "blame", "annotate", "describe", "shortlog",
+  "grep", "reflog", "whatchanged", "range-diff", "cherry", "count-objects",
+  "version",
+  // plumbing
+  "rev-parse", "rev-list", "merge-base", "name-rev", "var",
+  "cat-file", "ls-files", "ls-tree", "for-each-ref",
+  "diff-tree", "diff-files", "diff-index",
+  "check-ignore", "check-attr", "check-ref-format",
 ]);
 
 /**

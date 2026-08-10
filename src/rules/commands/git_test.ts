@@ -247,3 +247,48 @@ Deno.test("--help after -- is a pathspec, not a flag", () => {
   assertEquals(v("git diff HEAD -- --help"), "allow");
   assertEquals(v("git log -- --help"), "allow");
 });
+
+// ── 本次新增：純唯讀子指令擴充 ──────────────────────────────────────────────
+
+Deno.test("newly added read-only subcommands allow", () => {
+  assertEquals(v("git merge-base HEAD main"), "allow");
+  assertEquals(v("git rev-list --count HEAD"), "allow");
+  assertEquals(v("git name-rev HEAD"), "allow");
+  assertEquals(v("git whatchanged -1"), "allow");
+  assertEquals(v("git range-diff a..b c..d"), "allow");
+  assertEquals(v("git cherry origin/main"), "allow");
+  assertEquals(v("git diff-tree -r HEAD"), "allow");
+  assertEquals(v("git diff-files -p"), "allow");
+  assertEquals(v("git diff-index --cached HEAD"), "allow");
+  assertEquals(v("git check-ignore src/x.ts"), "allow");
+  assertEquals(v("git check-attr diff src/x.ts"), "allow");
+  assertEquals(v("git check-ref-format refs/heads/x"), "allow");
+  assertEquals(v("git count-objects -v"), "allow");
+  assertEquals(v("git var GIT_AUTHOR_IDENT"), "allow");
+  assertEquals(v("git annotate README.md"), "allow");
+  assertEquals(v("git version"), "allow");
+});
+
+Deno.test("excluded subcommands still ask", () => {
+  assertEquals(v("git ls-remote origin"), "ask"); // 網路存取
+  assertEquals(v("git help log"), "ask"); // spawn man / browser
+  assertEquals(v("git verify-commit HEAD"), "ask"); // spawn gpg
+  assertEquals(v("git verify-tag v1"), "ask"); // spawn gpg
+  assertEquals(v("git symbolic-ref HEAD"), "ask"); // 有寫入形式
+  assertEquals(v("git worktree list"), "ask");
+  assertEquals(v("git submodule status"), "ask");
+  assertEquals(v("git notes list"), "ask");
+  assertEquals(v("git bisect log"), "ask");
+  assertEquals(v("git merge-tree a b"), "ask");
+});
+
+Deno.test("both guards also cover the newly added subcommands", () => {
+  // -O orderfile 範圍檢查
+  assertEquals(v("git diff-index -Osrc/order.txt HEAD"), "allow");
+  assertEquals(v("git diff-tree -O/etc/passwd HEAD"), "ask");
+  assertEquals(v("git range-diff -O /tmp/x a..b c..d"), "ask");
+  // --help man viewer 封堵
+  assertEquals(v("git --help merge-base"), "ask");
+  assertEquals(v("git merge-base --help"), "ask");
+  assertEquals(v("git merge-base -h"), "allow"); // -h 只印用法，不受影響
+});
