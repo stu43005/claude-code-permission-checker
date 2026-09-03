@@ -206,14 +206,55 @@ export function nonPathStaticValue(word: Word): string | null;
   glob 元字元不再使其為動態。
 - **共同護欄**：最終值的**第一個字元**若是 `*` / `?` / `[` → 回 `null`。
 
-護欄的用意：glob pattern 的展開結果必定以其字面前綴開頭。只要第一個字元是字面字元，展開結果就
-**不可能**變成 `-X`、`--input`、`--method=POST` 之類的旗標 token，`gh.ts` 的 `ghApiMutates` 掃描面
-因此不會被繞過。若第一個字元就是 glob 元字元，展開結果無法預測，維持 `null`（ask）。
+#### 4.2.1 字面前綴不變量（安全論證的基礎）
 
-套用點僅兩處：
+bash pathname expansion 有兩條本規格所依賴的性質：
 
-- `gh.ts`：argv 取值由 `staticValue` 改為 `nonPathStaticValue`。
-- `curl.ts`：主迴圈取值由 `staticValue` 改為 `nonPathStaticValue`。
+1. **`*` 與 `?` 都不匹配 `/`**（POSIX pathname expansion；`[...]` 亦不含 `/`）。因此展開結果的
+   **路徑結構（`/` 的數量與位置）與 pattern 相同**。
+2. 展開結果**必定以 pattern 中「第一個未跳脫 glob 元字元之前的字面前綴」開頭**。
+
+由此得到本規格的安全條件：
+
+> **凡安全決策所依據的資訊，必須完全落在字面前綴之內。**
+
+`nonPathStaticValue` 的首字元護欄只是這個條件的最低要求（保證字面前綴非空、且展開結果不可能以
+`-` 開頭、不會憑空變成旗標）。**各呼叫端還必須各自檢查元字元的位置**（見 §4.2.2）。
+
+#### 4.2.2 呼叫端的元字元位置護欄
+
+`word.ts` 一併匯出
+
+```ts
+/** 回傳第一個未跳脫 glob 元字元（`*` `?` `[`）的索引；無則回 -1。 */
+export function firstGlobMetacharIndex(value: string): number;
+```
+
+各呼叫端據此強制「安全決策資訊落在字面前綴內」：
+
+- **`curl.ts`**：對每個 URL 候選值，元字元**必須出現在 authority（`scheme://host[:port]`）之後**——
+  亦即 `firstGlobMetacharIndex(u)` 必須大於 `scheme://` 之後第一個 `/` 的索引；否則 `ask`。
+  這保證 `resolveUrl` 檢查的 scheme 與 host **完全落在字面前綴內**，展開結果不可能換到別的主機。
+- **`gh.ts`**：對 `api` 的 endpoint 操作元，元字元**必須出現在第一個 `/` 之後**；否則 `ask`。
+  這保證 endpoint 的第一段（`repos` / `search` / `orgs` …）為字面。
+
+#### 4.2.3 多字展開（multi-word expansion）
+
+一個含 glob 的 word 展開後可能變成**多個 argv word**。本規格對此的處置：
+
+- 所有展開結果共用同一字面前綴，故**沒有任何一個**能以 `-` 開頭 → `ghApiMutates` 的旗標掃描面不會
+  被繞過，`curl` 的旗標 allowlist 亦不會被繞過。
+- `gh api` 收到多個位置操作元時是**用法錯誤**（gh 自行報錯），不會變成別的請求或寫入操作。
+- `curl` 收到多個 URL 時，依 §4.2.1 性質 1 與 §4.2.2 的 authority 護欄，這些 URL 的 scheme 與 host
+  **與已通過網域檢查者相同**，故仍在允許網域內。
+- 上述兩點皆須有對應測試（見 §7.1）。
+
+#### 4.2.4 套用點
+
+僅兩處：
+
+- `gh.ts`：argv 取值由 `staticValue` 改為 `nonPathStaticValue`，並對 endpoint 套用 §4.2.2 護欄。
+- `curl.ts`：主迴圈取值由 `staticValue` 改為 `nonPathStaticValue`，並對 URL 候選套用 §4.2.2 護欄。
 
 `curl` 對 `{}` `[]` 的既有攔截**不放寬**：那是 curl 自己的 URL 展開語法，由 `resolveUrl` 判為
 「形式不安全」而 ask；`nonPathStaticValue` 只是讓 `[` 通過詞法層，最終仍被 URL 層擋下，結果一致。
@@ -297,6 +338,34 @@ cwdDependentNames?: string[];
 計算式：`cwdIndependentWhenNoPaths === true` **且** 不在 `cwdDependentNames` 內 **且** 該次呼叫
 `isRecursive === false` **且** 無 `pathValueFlags` 命中 **且** 需做範圍檢查的位置參數為 0 個。
 
+**單一解析來源（single-parse）契約（強制）**：上述四項條件與 `evaluate` 用來決定 allow/ask 的
+argv 解析，**必須來自同一次解析**，不得各自重新掃描 argv。實作方式：`flagGatedReader` 內抽出
+
+```ts
+interface ArgvClassification {
+  pathOperands: Word[];      // 需做 resolvePath 的位置參數（已扣除 nonPathLeadingPositional）
+  pathValueFlagHit: boolean; // 是否命中任一 pathValueFlags
+  isRecursive: boolean;
+}
+function classifyArgv(ctx: RuleContext, opts: FlagGatedReaderOptions): ArgvClassification;
+```
+
+`evaluate` 與 `cwdIndependent` **都只讀這個結果**。同一契約套用於：
+
+- `positional-output.ts` 的 `positionalOutputRule`（`uniq` / `xxd`）；
+- 手寫述詞的 `sedRule`（沿用既有 `inputPaths`）、`awkRule`（沿用既有 `collectProgram` 回傳的 `pos`）、
+  新增的 `jqRule`（沿用其單次掃描結果）。
+
+**為何不改 `RuleVerdict` 契約**：把分類 metadata 塞進 `RuleVerdict` 會強迫 `git` / `deno` / `find` /
+`gh` / `curl` 等**不參與 cwd 豁免**的規則一律攜帶用不到的欄位，擴大契約面卻不增加安全性。
+在規則內部共用一次解析即可得到同樣的「單一權威解析」保證，且改動面侷限於參與豁免的規則。
+
+**漂移方向分析**：即使兩者仍發生不一致，護欄 1（`ruleVerdict === "allow"` 才可能豁免）使後果受限——
+若 `evaluate` 判 ask，無論 `cwdIndependent` 回什麼都不豁免（僅可能多問）。反向不一致
+（`evaluate` allow 但 `cwdIndependent` 誤判無路徑）要成立，該路徑操作元必須已被 `resolvePath` 判為
+`in-project`；而在專案外的 cwd 下，相對路徑必然解析到專案外 → `evaluate` 早已 ask。故能通過的只剩
+**絕對且落在專案內**的路徑——那本來就允許讀取。結論：漂移只會造成多問，不會造成誤放行。
+
 | 規則 | opt-in | 備註 |
 | --- | --- | --- |
 | `fileReaderRule` | ✅ | `cwdDependentNames: ["ls"]`——`ls` 無操作元時列出 cwd |
@@ -346,14 +415,26 @@ cwdDependentNames?: string[];
 
 - `word_test.ts`：`nonPathStaticValue` —— `a?b=1` / `a*b` 回字面值；`?abc`、`*abc`、`[abc`
   （首字元為 glob）回 `null`；`$X`、`$(x)`、`a\b` 回 `null`；引號內容比照 `staticValue`。
+  `firstGlobMetacharIndex` —— 無元字元回 `-1`；`\*` 不算；回第一個未跳脫元字元索引。
 - `gh_test.ts`：`gh api repos/o/r/tags?per_page=50` → allow；
-  `gh api repos/o/r/x?a=1 -X POST` → ask；`gh api ?x` → ask（首字元 glob）。
-- `curl_test.ts`：允許網域 + `https://host/p?q=1`（未加引號）→ allow；`{}`/`[]` 仍 ask。
+  `gh api repos/o/r/x?a=1 -X POST` → ask；`gh api ?x` → ask（首字元 glob）；
+  `gh api rep?s/o/r/x` → ask（元字元落在第一個 `/` 之前，違反 §4.2.2）。
+- `curl_test.ts`：允許網域 + `https://host/p?q=1`（未加引號）→ allow；`{}`/`[]` 仍 ask；
+  `https://ho?t.example.com/x` → ask（元字元落在 authority 內，違反 §4.2.2）；
+  `http?://host/x` → ask（同上）。
+- **多字展開的行為斷言**（§4.2.3）：以 `gh api repos/o/*/x`、`curl https://host/a*b` 等 pattern
+  驗證判定僅依字面前綴，且測試中明示「展開後每個 word 皆以字面前綴開頭、不可能以 `-` 開頭」
+  這項不變量所對應的護欄確實生效（首字元 glob → ask、authority 內 glob → ask）。
 - `grep_test.ts`：`grep -E 'Retry'`（無檔案）→ allow；`grep pat /etc/passwd` → ask（檔案超範圍）；
   `grep -e pat file.txt` → 第一個位置參數視為檔案；`-ie pat file.txt` 群集含 `e` → 同上。
 - `jq_test.ts`（新增）：filter 不做路徑檢查；`-f ../outside.jq` → ask；
   `--rawfile n /etc/passwd` → ask；`--arg a b` 不當路徑；`--args` 後位置參數不當路徑；未知旗標 → ask。
 - `classify_test.ts`：`cwdIndependent` 三道護欄各自的 allow / ask 兩面。
+- **每一條條件宣告規則的 stdin-only 驗收**（涵蓋 §4.3.4 表列全部規則，不只 `grep` / `jq`）：
+  對 `cat`、`head`、`wc`、`cut`、`tr`、`nl`、`fold`、`column`、`sort`、`uniq`、`xxd`、`tail`、
+  `yq`、`diff`、`sed`、`awk`、`grep`、`jq` 各寫一則 `cd /outside && <cmd> <僅旗標>` → **allow**，
+  以及同指令帶一個路徑操作元 → **ask** 的對照，證明 `evaluate` 與 `cwdIndependent` 的單一解析
+  在每條規則上都一致。`ls`、`find`、`tree`、`rg`、`git`、`deno`、`file`、`date` 則斷言仍 **ask**。
 
 ### 7.2 回歸測試（必須維持 ask / deny）
 
@@ -405,8 +486,20 @@ value-flag 吃掉的位置。本規格**不改**此掃描，因此 `rg '~' …` 
 ### 8.4 glob 展開結果不可預測
 
 `nonPathStaticValue` 讓 `gh api a?b` 以字面 `a?b` 送進規則判定，但 bash 實際傳給 `gh` 的可能是
-展開後的檔名。首字元護欄保證展開結果必以字面前綴開頭、不可能變成旗標；且 `gh api` 在通過規則
-判定時已確認為 GET、`curl` 已確認 URL 落在允許網域，故展開差異不會把唯讀操作變成寫入操作。
+展開後的檔名，且可能是**多個** argv word。殘餘風險由 §4.2 的三層處置界定：字面前綴不變量
+（§4.2.1）、呼叫端元字元位置護欄（§4.2.2）、多字展開行為分析（§4.2.3）。結論是展開只能改變
+**字面前綴之後**的部分，故 `curl` 的 scheme/host 與 `gh api` 的 endpoint 首段恆為已檢查的字面值，
+且沒有任何展開結果能以 `-` 開頭。展開差異因此不會把唯讀操作變成寫入操作或換到別的主機。
+
+### 8.5 未採納的審查建議（記錄理由）
+
+設計審查提出兩項建議，其**疑慮已於 §4.2 / §4.3.4 處理**，但**具體做法未照採**：
+
+1. 「把規則契約改成回傳結構化 metadata（`{ verdict, pathOperandCount, … }`）」——會強迫不參與 cwd
+   豁免的規則攜帶用不到的欄位。改以規則內 `classifyArgv` 單一解析達成同樣保證（§4.3.4）。
+2. 「cwd 落在專案外時一律拒絕含 glob 元字元的非路徑 token」——**與本規格目標直接衝突**：基準集
+   60 條指令的 cwd 正是專案外（`cd /d`），此規則會使功能完全失效。改以字面前綴不變量與元字元
+   位置護欄取得等效的安全結論（§4.2）。
 
 ## 9. Non-goals / Accepted limitations
 
