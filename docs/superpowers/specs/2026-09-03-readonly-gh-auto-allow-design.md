@@ -445,7 +445,7 @@ rule allow）完全不變。
 
 | 規則 | 宣告條件 | 理由 |
 | --- | --- | --- |
-| `ghRule` | **僅** `api` 與 `search`，且 `api` 的 endpoint **不含 `{owner}` / `{repo}` / `{branch}` 佔位符** | 目標由 endpoint / query 明確給定，不看 cwd |
+| `ghRule` | **僅** `api` 與 `search`；`api` 的 endpoint **不含 `{owner}` / `{repo}` / `{branch}` 佔位符**；且所有旗標命中 gh 的已知旗標表（護欄 5） | 目標由 endpoint / query 明確給定，不看 cwd |
 | `curlRule` | 全部 allow 形式 | 只走網路；`-H @file` 由 `resolvePathValue` 以真實 cwd 檢查 |
 | `pureUtilRule` | `echo` / `pwd` / `whoami`（**排除 `which`**） | 不接受路徑操作元、不查檔案系統 |
 
@@ -541,24 +541,35 @@ function classifyArgv(ctx: RuleContext, opts: FlagGatedReaderOptions): ArgvClass
 | `cdRule` | `cd` 葉指令本身帶的是變更**前**的 cwd，不需豁免 |
 | `fileCmdRule`（`file`）/ `dateRule`（`date`） | 其 `valueFlags` 含吃路徑的旗標（`-m`/`-f`、`-r`/`-f`）但未列入 `pathValueFlags`，值目前不做範圍檢查；豁免會擴大該既有缺口（見 §8.3） |
 
-### 4.4 `gh api --cache`：本機寫入副作用 → ask
+### 4.4 `gh` 的本機副作用旗標 → ask
 
-`gh api --help`（`gh` 2.93.0，本機實測）列有：
+`ghApiMutates` 只涵蓋**遠端寫入**（HTTP 方法與 body 旗標），完全未涵蓋**本機副作用**。
+對 `ghRule` 目前 allow 的**全部**子指令（`api`、`search code`/`repos`/`issues`/`prs`、
+`repo view`/`list`、`issue view`/`list`/`status`、`pr view`/`list`/`status`/`diff`/`checks`、
+`release view`/`list`）逐一執行 `gh <sub> --help`（`gh` 2.93.0，本機實測）稽核後，
+**本機副作用旗標只有兩個**：
 
-```
-      --cache duration        Cache the response, e.g. "3600s", "60m", "1h"
-```
+| 旗標 | 出現於 | 副作用 |
+| --- | --- | --- |
+| `-w` / `--web` | `search *`、`repo view`、`issue view`/`list`、`pr view`/`list`/`diff`/`checks`、`release view` | `Open … in the web browser`（啟動本機瀏覽器） |
+| `--cache duration` | `api` | `Cache the response`（寫入本機 gh 快取目錄） |
 
-`--cache` 會把回應**寫入本機 gh 快取目錄**。本工具的判定基準是「純唯讀」，而 `ghApiMutates`
-只涵蓋「遠端寫入」（HTTP 方法與 body 旗標），未涵蓋本機副作用。
+其餘旗標皆為輸出格式化（`--json` / `-q`/`--jq` / `-t`/`--template` / `-i`/`--include` /
+`--verbose`）或查詢過濾（`--state`、`--limit`、`--language`、`--filename`、`--extension`、
+`--color`、`--name-only`、`-e`/`--exclude` 等），無本機副作用。會讀檔的
+`--input` / `-F @file` / `-f` 已由 `ghApiMutates` 判 ask。
 
-改動：`gh.ts` 新增 `ghApiHasLocalSideEffect(after)`，命中 `--cache` / `--cache=…` 即 `ask`
-（與 `ghApiMutates` 並列，任一命中即 ask）。
+改動：`gh.ts` 新增 `ghHasLocalSideEffect(toks)`，命中 `-w` / `--web` / `--cache` / `--cache=…`
+即 `ask`（與 `ghApiMutates` 並列，任一命中即 ask）。`-w` 與 `--cache` 對**所有** gh 子指令
+一律套用，不分子指令，避免遺漏。
 
-成本評估：corpus 20431 行指令中 `--cache` 出現 3 次，改為 ask 的代價可忽略；而它是本工具
-「唯讀」宣稱的實質例外，依「誤 ask 可接受、誤 allow 不可接受」的根本取捨應收緊。
+成本評估：corpus 20431 行指令中 `--web` 出現 0 次、`--cache` 出現 3 次，代價可忽略；
+而兩者都是本工具「純唯讀」宣稱的實質例外，依「誤 ask 可接受、誤 allow 不可接受」應收緊。
 
-（`--cache` 的值是 duration 不是路徑，故無路徑檢查問題；此處收緊的是**寫入**面向。）
+**已知既有缺口（本規格範圍外）**：`ghRule` 目前對**未知旗標**不做 ask（不符 `CLAUDE.md`
+「未知全域選項一律 ask」的既有規範）。本規格不補這一項——上表已窮舉當前 allowlisted 子指令的
+本機副作用面，且護欄 5 使**未知 gh 旗標無法取得 cwd 豁免**（fail-closed）。要把 gh 全面改為
+旗標 allowlist 屬獨立議題，應另走 spec 流程。
 
 ## 5. 核心不變量檢核
 
@@ -643,6 +654,10 @@ function classifyArgv(ctx: RuleContext, opts: FlagGatedReaderOptions): ArgvClass
 | `cd /outside && gh search code 'x'` | allow | `search` 目標由 query 決定 |
 | `cd /outside && gh api 'repos/{owner}/{repo}/issues'` | ask | endpoint 佔位符由 cwd 的 git repo 填入 |
 | `gh api --cache 1h repos/o/r/tags`（cwd 在專案內） | ask | §4.4：`--cache` 寫入本機快取 |
+| `gh search code x --web`（cwd 在專案內） | ask | §4.4：`--web` 開啟本機瀏覽器 |
+| `cd /outside && gh search code x --web` | ask | 同上（且護欄 1：規則已判 ask → 不豁免） |
+| `gh repo view -w` / `gh pr diff --web` | ask | §4.4：`-w` 對所有 gh 子指令一律 ask |
+| `cd /outside && gh api x --some-unknown-flag` | ask | 護欄 5：未知 gh 旗標 → 不豁免 |
 | `cd /outside && wc --files0-from=list` | ask | 護欄 5：`--files0-from` 為路徑值旗標 |
 | `cd /outside && sort --files0-from=list` | ask | 同上 |
 | `cd /outside && grep --exclude-from=f pat` | ask | 同上 |
