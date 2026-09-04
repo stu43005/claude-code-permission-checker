@@ -419,7 +419,7 @@ rule allow）完全不變。
 
 | 規則 | 宣告條件 | 理由 |
 | --- | --- | --- |
-| `ghRule` | **僅** `api` 與 `search` 兩個子指令 | 目標由 endpoint / query 明確給定，不看 cwd |
+| `ghRule` | **僅** `api` 與 `search`，且 `api` 的 endpoint **不含 `{owner}` / `{repo}` / `{branch}` 佔位符** | 目標由 endpoint / query 明確給定，不看 cwd |
 | `curlRule` | 全部 allow 形式 | 只走網路；`-H @file` 由 `resolvePathValue` 以真實 cwd 檢查 |
 | `pureUtilRule` | `echo` / `pwd` / `whoami`（**排除 `which`**） | 不接受路徑操作元、不查檔案系統 |
 
@@ -432,6 +432,17 @@ endpoint / query 決定，不受 cwd 影響，故只有這兩者可豁免。
 
 （本規格**不**額外實作「帶 `--repo` 時也豁免」的例外：基準集與 corpus 中的 research 用法全部是
 `gh api` / `gh search`，加上該例外只會擴大判斷面而無實際收益——YAGNI。未宣告者維持現行 ask。）
+
+**`gh api` 的 endpoint 佔位符也是 cwd 依賴**（`gh --version` 2.93.0，`gh api --help` 實測取得）：
+
+> Placeholder values `{owner}`, `{repo}`, and `{branch}` in the endpoint argument will get replaced
+> with values from the repository of the current directory or the repository specified in the
+> `GH_REPO` environment variable.
+
+因此 `gh api repos/{owner}/{repo}/issues` 的實際目標由 **cwd 所在的 git repository** 決定。
+`{` `}` 不在本工具的 `GLOB_CHARS`（`*` `?` `[`）之內，故不會自動被判為動態，**必須明文排除**：
+endpoint 含 `{owner}` / `{repo}` / `{branch}` 任一者時，`ghRule` 不得宣告 cwd 無關。
+（`-F/--field` 的佔位符值同屬 cwd 依賴，但帶 `-F` 本身即 `ghApiMutates` 命中 → ask，無需另外處理。）
 
 `pureUtilRule` 的宣告必須寫成排除 `which` 的述詞（`ctx.name !== "which"`），**不可**整條規則
 無條件宣告。原因：`which` 依 `PATH` 逐段搜尋可執行檔，而 `PATH` 合法地可能包含 `.` 或空字串段，
@@ -451,7 +462,7 @@ cwdDependentNames?: string[];
 計算式：`cwdIndependentWhenNoPaths === true` **且** 不在 `cwdDependentNames` 內 **且** 該次呼叫
 `isRecursive === false` **且** 無 `pathValueFlags` 命中 **且** 需做範圍檢查的位置參數為 0 個。
 
-**單一解析來源（single-parse）契約（強制）**：上述四項條件與 `evaluate` 用來決定 allow/ask 的
+**單一解析來源（single-parse）契約（強制）**：上述五項條件與 `evaluate` 用來決定 allow/ask 的
 argv 解析，**必須來自同一次解析**，不得各自重新掃描 argv。實作方式：`flagGatedReader` 內抽出
 
 ```ts
@@ -508,7 +519,7 @@ function classifyArgv(ctx: RuleContext, opts: FlagGatedReaderOptions): ArgvClass
 | default-deny | 是 | 三元件皆為 allowlist 加法；未宣告 / 未列入者行為完全不變 |
 | deny 四類 | 是 | 閘 1/2/3 仍在 `classify` 之前；遞迴根 deny 仍於 `classify` 內短路 |
 | 中央前置規則二/三/四不可升級 | 是 | 不動 |
-| 中央前置規則一 | 注意 本次唯一放寬處 | 由 §4.3.3 三道護欄限縮 |
+| 中央前置規則一 | 注意 本次唯一放寬處 | 由 §4.3.3 四道護欄限縮 |
 | `permissions.allow` 不能解除 deny | 是 | 不動 |
 | 永遠 `exit 0`、例外 → ask | 是 | 不動 |
 | `rule.evaluate` / `rule.cwdIndependent` 為純函式 | 是 | 新述詞明訂純函式契約；`classify` 先評估 rule 再做中央前置的既有順序依賴不變 |
@@ -517,7 +528,7 @@ function classifyArgv(ctx: RuleContext, opts: FlagGatedReaderOptions): ArgvClass
 
 實作完成後同步更新 `CLAUDE.md`：
 
-- 「四條中央前置規則」段落加註規則一的 cwd 豁免條件與三道護欄。
+- 「四條中央前置規則」段落加註規則一的 cwd 豁免條件與四道護欄。
 - 「架構（評估管線）」的 `classify.ts` 說明加入 `cwdIndependent` 述詞。
 - `scope.ts` / `word.ts` 說明加入 `nonPathStaticValue` 及其「非路徑操作元」適用邊界。
 - `rules/` 說明加入新檔 `commands/jq.ts`，並註記 `jq` 已自 `fileReaderRule` 移出。
@@ -553,7 +564,7 @@ function classifyArgv(ctx: RuleContext, opts: FlagGatedReaderOptions): ArgvClass
   `grep -e pat file.txt` → 第一個位置參數視為檔案；`-ie pat file.txt` 群集含 `e` → 同上。
 - `jq_test.ts`（新增）：filter 不做路徑檢查；`-f ../outside.jq` → ask；
   `--rawfile n /etc/passwd` → ask；`--arg a b` 不當路徑；`--args` 後位置參數不當路徑；未知旗標 → ask。
-- `classify_test.ts`：`cwdIndependent` 三道護欄各自的 allow / ask 兩面。
+- `classify_test.ts`：`cwdIndependent` 四道護欄各自的 allow / ask 兩面。
 - **每一條條件宣告規則的 stdin-only 驗收**（涵蓋 §4.3.4 表列全部規則，不只 `grep` / `jq`）：
   對 `cat`、`head`、`wc`、`cut`、`tr`、`nl`、`fold`、`column`、`sort`、`uniq`、`xxd`、`tail`、
   `yq`、`diff`、`sed`、`awk`、`grep`、`jq` 各寫一則 `cd /outside && <cmd> <僅旗標>` → **allow**，
@@ -600,7 +611,7 @@ function classifyArgv(ctx: RuleContext, opts: FlagGatedReaderOptions): ArgvClass
 
 ### 8.1 中央前置規則一被放寬
 
-這是本規格唯一放寬「不可升級中央前置」的地方。三道護欄使放寬範圍限縮為：
+這是本規格唯一放寬「不可升級中央前置」的地方。四道護欄使放寬範圍限縮為：
 「鏈內 `cd` 造成的 cwd」×「指令規則自身判 allow」×「該規則明確宣告 cwd 無關且本次無路徑操作元」。
 三者缺一即回到現行行為。任何新增規則若未宣告 `cwdIndependent`，自動維持現行行為。
 
@@ -639,6 +650,21 @@ value-flag 吃掉的位置。本規格**不改**此掃描，因此 `rg '~' …` 
 2. 「cwd 落在專案外時一律拒絕含 glob 元字元的非路徑 token」——**與本規格目標直接衝突**：基準集
    60 條指令的 cwd 正是專案外（`cd /d`），此規則會使功能完全失效。改採同一審查者提出的中間
    方案：收緊為「單一 `?` 查詢串」形態（§4.2），保住全部功能的同時把展開自由度降到一個字元。
+3. 「verdict 不變量只證明分類器穩定，未證明操作仍為唯讀；應改為明列唯讀 endpoint allowlist」
+   ——**其前提與 `gh` 實際行為不符**。`gh api --help`（`gh` 2.93.0，本機實測）明載：
+
+   > The default HTTP request method is `GET` normally and `POST` if any parameters were added.
+   > Override the method with `--method`.
+
+   即 HTTP 方法**完全由旗標決定**（`-X`/`--method`、`-f`/`--raw-field`、`-F`/`--field`、`--input`），
+   **endpoint 路徑不參與方法決定**；`ghApiMutates` 已完整涵蓋這組旗標。因此 endpoint 被展開改寫
+   只會換到另一個「被 GET 的資源」，不可能把唯讀請求變成寫入請求——「endpoint-driven mutation」
+   對 `gh api` 不存在。至於「明列唯讀 endpoint allowlist」：GitHub REST API 面極大且持續增長，
+   維護該清單成本高且會直接阻斷 research 用途（任意 endpoint 查詢正是本功能的目的），
+   與本規格「誤 ask 可接受、誤 allow 不可接受」的取捨無關——它擋掉的是誤 allow 以外的東西。
+
+   **本輪同時採納了該審查所暴露的真實問題**：`gh api` 的 `{owner}`/`{repo}`/`{branch}` 佔位符
+   確實由 cwd 的 git repository 決定，已於 §4.3.4 明文排除。
 
 ## 9. Non-goals / Accepted limitations
 
