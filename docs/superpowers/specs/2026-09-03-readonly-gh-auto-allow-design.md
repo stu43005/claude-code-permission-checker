@@ -389,7 +389,13 @@ rule allow）完全不變。
 | --- | --- |
 | `ghRule` | 唯讀子指令與 GET `api` 不讀本地檔；會讀檔的形式（`--input`、`-F @file`）本身即 ask |
 | `curlRule` | allow 形式只走網路；`-H @file` 由 `resolvePathValue` 以真實 cwd 檢查 |
-| `pureUtilRule`（`echo`/`pwd`/`whoami`/`which`） | 不接受路徑操作元 |
+| `pureUtilRule` 的 `echo` / `pwd` / `whoami`（**排除 `which`**） | 不接受路徑操作元、不查檔案系統 |
+
+`pureUtilRule` 的宣告必須寫成排除 `which` 的述詞（`ctx.name !== "which"`），**不可**整條規則
+無條件宣告。原因：`which` 依 `PATH` 逐段搜尋可執行檔，而 `PATH` 合法地可能包含 `.` 或空字串段，
+兩者都相對於 cwd 解析。若給 `which` cwd 豁免，`cd /outside && which some-name` 就能探測
+`/outside/some-name` 是否存在——那是以 cwd 為操作對象的檔案系統查詢，違反 §4.3.1 條件 (b)。
+本工具無法靜態得知執行期 `PATH`，故一律不豁免。
 
 **條件宣告（該次呼叫無任何被視為路徑的操作元）**：`flagGatedReader` 新增選項
 
@@ -525,6 +531,8 @@ function classifyArgv(ctx: RuleContext, opts: FlagGatedReaderOptions): ArgvClass
 | session cwd 本身在專案外 + `gh api x` | ask | 護欄 2 |
 | `Bash(gh:*)` 已設定 + `cd /outside && gh api x --input f` | ask | 護欄 1 |
 | `cd /outside && grep -r pat .` | deny 或 ask | 遞迴條件排除 |
+| `cd /outside && which some-name` | ask | `which` 排除於 `pureUtilRule` 宣告之外（PATH 可含 `.` / 空段） |
+| `cd /outside && echo hi` / `pwd` / `whoami` | allow | `pureUtilRule` 其餘三者確實與 cwd 無關 |
 
 ### 7.3 Operational verification
 
