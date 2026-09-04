@@ -357,20 +357,38 @@ cwdIndependent?(ctx: RuleContext): boolean;
 共用），並在中央前置之前算出豁免旗標：
 
 ```ts
+/**
+ * 護欄 4：argv 必須全為靜態 token。唯一例外是 §4.2 容忍的 endpoint / URL 操作元——
+ * 由規則自身在 cwdIndependent 中認定（gh：api 的 endpoint；curl：URL 候選）。
+ * 中央側只做「全靜態」的保守判斷，例外由規則側放行。
+ */
+const allArgvStatic = inv.argv.every((w) => staticValue(w) !== null);
+
 const cwdExempt =
   ruleVerdict?.kind === "allow" &&                 // 護欄 1
   inv.cwd.kind === "known" &&
   inv.cwd.origin === "chain-cd" &&                 // 護欄 2
+  (allArgvStatic || (rule?.toleratesNonStaticOperand?.(ctx) ?? false)) && // 護欄 4
   (rule?.cwdIndependent?.(ctx) ?? false);
 
 const central = centralPreflightAsk(inv, scope, cwdExempt);
+```
+
+`CommandRule` 因此再加一個可選述詞（未宣告 = 否，default-deny）：
+
+```ts
+/**
+ * 此次呼叫是否僅含「§4.2 明文容忍且已證明 verdict 不變的 endpoint / URL 操作元」
+ * 這一種非靜態 token（其餘 token 皆靜態）。只有 gh / curl 宣告；必須為純函式。
+ */
+toleratesNonStaticOperand?(ctx: RuleContext): boolean;
 ```
 
 `centralPreflightAsk` 新增第三參數 `skipCwdCheck: boolean`，**僅**用於跳過規則一；規則二/三/四
 不受影響。決策順序其餘部分（步驟 1 動態指令名、步驟 2 rule deny 短路、步驟 4 升級層、步驟 5
 rule allow）完全不變。
 
-#### 4.3.3 三道安全護欄
+#### 4.3.3 四道安全護欄
 
 1. **只有指令規則自身回 `allow` 才可能豁免。** 靠 `permissions.allow` 升級的 ask 永不豁免。
    若無此護欄，使用者設了 `Bash(gh:*)` 之後
@@ -380,16 +398,40 @@ rule allow）完全不變。
    繼承」情境即使成立也被封住（前提是 harness 如實回報 cwd）。
 3. **相對路徑仍以真實 cwd 解析。** 不做「改用專案根解析」這種替換——那會讓
    `cd /other && cat x.txt` 誤判成專案內。有路徑操作元的指令照樣 ask。
+4. **該葉指令的 argv 不得含任何非靜態 token。** 具體：豁免要求每個 argv token 的
+   `staticValue` 皆非 `null`（即無展開類構造、無未加引號 glob 元字元）；**唯一例外**是
+   §4.2 明文容忍、且已通過 verdict 不變量論證的 endpoint / URL 操作元。
+
+   此護欄封住「shell 先展開、指令才拿到結果」這條穿透路徑。若無此護欄：
+
+   - `cd /outside && echo *` —— `echo` 本身不碰檔案系統，但 bash 會先把 `*` 展開成
+     `/outside` 的檔名清單，等於**列舉專案外目錄**。
+   - `cd /outside && grep *` —— 展開後第一個檔名成為 pattern、其餘成為輸入檔，等於
+     **讀取專案外檔案內容**。（`grep pat *` 因 `*` 是第二個位置參數、會做路徑檢查而已被擋，
+     但只有一個位置參數時它被當 pattern 跳過，故必須靠本護欄。）
+
+   護欄 4 與 §4.2 的關係：§4.2 容忍的 token **不是路徑操作元**，且已證明 verdict 對其所有展開
+   結果不變（§4.2.5）；其餘任何非靜態 token 一律不得享有 cwd 豁免。
 
 #### 4.3.4 宣告清單
 
-**無條件 `cwdIndependent: () => true`**：
+**宣告為 cwd 無關（全部仍受 §4.3.3 護欄 4 約束）**：
 
-| 規則 | 理由 |
-| --- | --- |
-| `ghRule` | 唯讀子指令與 GET `api` 不讀本地檔；會讀檔的形式（`--input`、`-F @file`）本身即 ask |
-| `curlRule` | allow 形式只走網路；`-H @file` 由 `resolvePathValue` 以真實 cwd 檢查 |
-| `pureUtilRule` 的 `echo` / `pwd` / `whoami`（**排除 `which`**） | 不接受路徑操作元、不查檔案系統 |
+| 規則 | 宣告條件 | 理由 |
+| --- | --- | --- |
+| `ghRule` | **僅** `api` 與 `search` 兩個子指令 | 目標由 endpoint / query 明確給定，不看 cwd |
+| `curlRule` | 全部 allow 形式 | 只走網路；`-H @file` 由 `resolvePathValue` 以真實 cwd 檢查 |
+| `pureUtilRule` | `echo` / `pwd` / `whoami`（**排除 `which`**） | 不接受路徑操作元、不查檔案系統 |
+
+**`ghRule` 必須逐子指令宣告，不可整條規則宣告**：`READ_SUBS` 內的 `repo view`、`issue list` /
+`status`、`pr view` / `list` / `status` / `diff` / `checks`、`release view` / `list` 在**未給
+`--repo` / `-R`** 時，會以 **cwd 所在的 git repository（及其 remote、當前分支）** 推斷目標倉庫。
+因此 `cd /outside && gh pr diff` 查詢的是 `/outside` 那個 repo，而非受保護的專案——這是對 cwd 的
+信任邊界依賴，只是依賴的不是本地檔案讀取而是 repo context。`api` 與 `search` 的目標完全由
+endpoint / query 決定，不受 cwd 影響，故只有這兩者可豁免。
+
+（本規格**不**額外實作「帶 `--repo` 時也豁免」的例外：基準集與 corpus 中的 research 用法全部是
+`gh api` / `gh search`，加上該例外只會擴大判斷面而無實際收益——YAGNI。未宣告者維持現行 ask。）
 
 `pureUtilRule` 的宣告必須寫成排除 `which` 的述詞（`ctx.name !== "which"`），**不可**整條規則
 無條件宣告。原因：`which` 依 `PATH` 逐段搜尋可執行檔，而 `PATH` 合法地可能包含 `.` 或空字串段，
@@ -533,6 +575,13 @@ function classifyArgv(ctx: RuleContext, opts: FlagGatedReaderOptions): ArgvClass
 | `cd /outside && grep -r pat .` | deny 或 ask | 遞迴條件排除 |
 | `cd /outside && which some-name` | ask | `which` 排除於 `pureUtilRule` 宣告之外（PATH 可含 `.` / 空段） |
 | `cd /outside && echo hi` / `pwd` / `whoami` | allow | `pureUtilRule` 其餘三者確實與 cwd 無關 |
+| `cd /outside && echo *` | ask | 護欄 4：argv 含非靜態 token（避免列舉專案外目錄） |
+| `cd /outside && grep *` | ask | 護欄 4：同上（避免展開成專案外檔案清單） |
+| `cd /outside && head -100 *.log` | ask | 護欄 4 ＋ 位置參數路徑檢查 |
+| `cd /outside && gh pr diff` | ask | `ghRule` 只宣告 `api` / `search`（repo 由 cwd 推斷） |
+| `cd /outside && gh repo view` | ask | 同上 |
+| `cd /outside && gh issue list --repo o/r` | ask | 同上（本規格不實作 `--repo` 例外） |
+| `cd /outside && gh search code 'x'` | allow | `search` 目標由 query 決定 |
 
 ### 7.3 Operational verification
 
