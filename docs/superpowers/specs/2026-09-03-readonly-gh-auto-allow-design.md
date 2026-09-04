@@ -41,24 +41,24 @@ cd /d && gh search code 'repo:OWNER/REPO SomeSymbol' --language go --limit 10 2>
 
 ### 1.2 三個根因
 
-**根因 ①（cwd）**：`cd /d` 是 cmd.exe 的 `cd /d <path>` 習慣被誤搬到 bash——在 Git-Bash 中它等於
+**根因 1（cwd）**：`cd /d` 是 cmd.exe 的 `cd /d <path>` 習慣被誤搬到 bash——在 Git-Bash 中它等於
 `cd D:/`，把 cwd 換到磁碟根。中央前置規則一（`cwd.kind === "known"` 但落在專案根外 → **不可升級**
 ask）因此對整條鏈生效。**這條規則本身是對的**，問題在於它對「根本不碰檔案系統的指令」也一律套用。
 
-**根因 ②（glob）**：`word.ts` 以詞法方式偵測未加引號的 glob 元字元（`GLOB_CHARS = /[*?[]/`），命中即
+**根因 2（glob）**：`word.ts` 以詞法方式偵測未加引號的 glob 元字元（`GLOB_CHARS = /[*?[]/`），命中即
 視為動態、`staticValue` 回 `null`。`gh api repos/o/r/tags?per_page=50` 的 `?` 因此讓整個 token 變動態，
 `gh.ts` 直接回「含動態 token」。此偵測對**路徑**是必要的，但 endpoint 不是檔案系統路徑。
 
-**根因 ③（非路徑位置參數）**：`grep` 的 pattern 與 `jq` 的 filter 目前都被當成路徑做 `resolvePath`。
+**根因 3（非路徑位置參數）**：`grep` 的 pattern 與 `jq` 的 filter 目前都被當成路徑做 `resolvePath`。
 `grep.ts` 的註解明說這是刻意的保守設計（「pattern 通常為相對字串 → 落在專案內 → allow」）；`jq` 則是
 被收在 `fileReaderRule` 的 names 裡，filter 落入位置參數。cwd 在專案內時這兩者恰好都解析成專案內而
-放行，**一旦 cwd 在專案外就會解析到專案外 → ask**。故根因 ③ 是根因 ① 能否真正生效的前提。
+放行，**一旦 cwd 在專案外就會解析到專案外 → ask**。故根因 3 是根因 1 能否真正生效的前提。
 
 ### 1.3 為什麼不能只靠 `permissions.allow`
 
 四條中央前置安全 ask（cwd 超範圍／寫入重導向／賦值前綴／範圍外 `<`）**不可由 `permissions.allow`
 升級**（見 `CLAUDE.md`「hook 決策 vs settings.json 權限的優先序」）。因此在 settings.json 加
-`Bash(gh api:*)` 對根因 ① 完全無效——必須在引擎內處理。
+`Bash(gh api:*)` 對根因 1 完全無效——必須在引擎內處理。
 
 ### 1.4 cwd 是否跨 Bash 呼叫繼承（安全前提查證）
 
@@ -81,7 +81,8 @@ ask）因此對整條鏈生效。**這條規則本身是對的**，問題在於�
 ### 2.1 目標
 
 1. 「鏈內 `cd` 到專案外 + 純網路唯讀指令 + 純 stdin 過濾器」不再因 cwd 而 ask。
-2. `gh` / `curl` 的 endpoint / URL 內含 glob 元字元時不再被判為動態。
+2. `gh` / `curl` 的 endpoint / URL 為「單一 `?` 查詢串」形態（`…/x?k=v`）時不再被判為動態；
+   含 `*` / `[` / 多重元字元 / `?` 後含 `/` 者維持 ask（見 §4.2）。
 3. `grep` 的 pattern 與 `jq` 的 filter 不再被當作路徑做範圍檢查。
 4. 基準集 67 條達成 63 allow / 4 ask（以 build 後 binary 實測驗證）。
 
@@ -98,21 +99,21 @@ ask）因此對整條鏈生效。**這條規則本身是對的**，問題在於�
 管線位置（`*` 為本規格改動點）：
 
 ```
-parse.ts → walk.ts → 閘① sleep → 閘② 名稱重定義 → no-op → 閘③ printDisguiseDeny → classify.ts → combine.ts
-            ↑ *①-a                                                                    ↑ *①-b
+parse.ts → walk.ts → 閘 1 sleep → 閘 2 名稱重定義 → no-op → 閘 3 printDisguiseDeny → classify.ts → combine.ts
+            ↑ *1-a                                                                    ↑ *1-b
        cwd origin 標記                                                        cwd 豁免判定 + 中央前置
 
-rules/commands/gh.ts   ← *② nonPathStaticValue
-rules/commands/curl.ts ← *② nonPathStaticValue
-rules/commands/grep.ts ← *③ pattern 不做路徑檢查
-rules/commands/jq.ts   ← *③ 新檔：filter 不做路徑檢查
+rules/commands/gh.ts   ← *2 nonPathStaticValue
+rules/commands/curl.ts ← *2 nonPathStaticValue
+rules/commands/grep.ts ← *3 pattern 不做路徑檢查
+rules/commands/jq.ts   ← *3 新檔：filter 不做路徑檢查
 ```
 
 三個元件互相獨立可實作，但**只有三者齊備**基準集才會從 67 ask 變成 63 allow。
 
 ## 4. 詳細設計
 
-### 4.1 元件 ③：非路徑位置參數（`grep` / `jq`）
+### 4.1 元件 3：非路徑位置參數（`grep` / `jq`）
 
 #### 4.1.1 已查證事實（本機 binary 實際執行取得，非推測）
 
@@ -181,16 +182,15 @@ nonPathLeadingPositional?: (argv: Word[]) => boolean;
 
 長短旗標皆需支援 `--opt=value` 與 `--opt value` 兩種寫法。
 
-### 4.2 元件 ②：非路徑操作元的靜態取值（`gh` / `curl`）
+### 4.2 元件 2：非路徑操作元的靜態取值（`gh` / `curl`）
 
 `src/engine/word.ts` 新增：
 
 ```ts
 /**
- * 非路徑操作元的靜態取值：容忍未加引號的 glob 元字元（`*` `?` `[`），
- * 因為該值不會被當成檔案系統路徑使用（如 gh 的 API endpoint、curl 的 URL）。
+ * 非路徑操作元的靜態取值：僅容忍「單一 `?` 查詢串」形態的未加引號 token
+ * （如 gh 的 API endpoint、curl 的 URL）。`*` 與 `[` 一律不容忍。
  * 展開類 part 與含反斜線的未引號 Literal 仍回 null（維持保守）。
- * 護欄：值的第一個字元為 glob 元字元時回 null。
  */
 export function nonPathStaticValue(word: Word): string | null;
 ```
@@ -200,11 +200,19 @@ export function nonPathStaticValue(word: Word): string | null;
 - **有 `parts`**：任一 top-level part 為 `DYNAMIC_PART_TYPES`（`SimpleExpansion` /
   `ParameterExpansion` / `CommandExpansion` / `ArithmeticExpansion` / `ProcessSubstitution` /
   `BraceExpansion` / `ExtendedGlob`）→ `null`；`DoubleQuoted` / `LocaleString` 依既有
-  `nestedPartIsDynamic` 檢查內層；`Literal` 只在**含反斜線**時算動態（glob 元字元容忍）。
-  通過則回 `word.value`。
-- **無 `parts`**（未加引號字面值）：仍套用既有的 bash quote removal（`removeBackslashEscapes`）。
-  glob 元字元不再使其為動態。
-- **共同護欄**：最終值的**第一個字元**若是 `*` / `?` / `[` → 回 `null`。
+  `nestedPartIsDynamic` 檢查內層；`Literal` 只在**含反斜線**時算動態。通過後仍須通過下述
+  「單一 `?` 查詢串」檢查（引號內的 glob 字元本就不展開，故必然通過，檢查成本為零）。
+- **無 `parts`**（未加引號字面值）：仍套用既有的 bash quote removal（`removeBackslashEscapes`），
+  再套用「單一 `?` 查詢串」檢查。
+
+**「單一 `?` 查詢串」容忍條件（三項全部成立才容忍，否則回 `null`）**：
+
+1. 值中**未跳脫的 glob 元字元恰好一個**，且該字元是 `?`；`*` 與 `[` 出現即回 `null`。
+2. 該 `?` **不在索引 0**（字面前綴非空）。
+3. 該 `?` **之後的子字串不含 `/`**（亦不含其他元字元，已由條件 1 保證）。
+
+此形態即 URL / endpoint 的查詢串寫法：`…/tags?per_page=50`、`…/x.go?ref=v1.18.0`、
+`https://host/p?q=1`。基準集 60 條與 corpus 中 186 條帶 `?` 的 `gh api` 全部符合。
 
 #### 4.2.1 字面前綴不變量（安全論證的基礎）
 
@@ -218,8 +226,16 @@ bash pathname expansion 有兩條本規格所依賴的性質：
 
 > **凡安全決策所依據的資訊，必須完全落在字面前綴之內。**
 
-`nonPathStaticValue` 的首字元護欄只是這個條件的最低要求（保證字面前綴非空、且展開結果不可能以
-`-` 開頭、不會憑空變成旗標）。**各呼叫端還必須各自檢查元字元的位置**（見 §4.2.2）。
+「單一 `?` 查詢串」形態把展開的自由度壓到最小：pattern 形如 `<字面前綴>?<字面後綴>`，其中後綴不含
+`/`。因此
+
+- 展開結果必為 `<字面前綴>` + **恰好一個字元** + `<字面後綴>`，長度與結構皆固定；
+- 條件 3（`?` 之後不含 `/`）等價於「`?` 位於最後一個 `/` 之後」，故 URL 的 `scheme://host` 與
+  endpoint 的所有前段目錄**必然落在字面前綴內**；
+- 條件 2 保證前綴非空，故展開結果**不可能以 `-` 開頭**、不會憑空變成旗標。
+
+**各呼叫端仍須各自檢查元字元位置**（見 §4.2.2）作為 defence in depth——條件 3 已涵蓋絕大多數情形，
+但無路徑段的 URL（如 `https://ho?t`）不受條件 3 約束，需由 curl 的 authority 護欄擋下。
 
 #### 4.2.2 呼叫端的元字元位置護欄
 
@@ -244,10 +260,13 @@ export function firstGlobMetacharIndex(value: string): number;
 
 - 所有展開結果共用同一字面前綴，故**沒有任何一個**能以 `-` 開頭 → `ghApiMutates` 的旗標掃描面不會
   被繞過，`curl` 的旗標 allowlist 亦不會被繞過。
+- 在「單一 `?` 查詢串」形態下，展開需要 cwd 底下**恰好存在**檔名為 `<字面前綴><任一字元><字面後綴>`
+  的檔案；每個展開結果與原 pattern **只差一個字元**，且該字元不可能是 `/`。
 - `gh api` 收到多個位置操作元時是**用法錯誤**（gh 自行報錯），不會變成別的請求或寫入操作。
-- `curl` 收到多個 URL 時，依 §4.2.1 性質 1 與 §4.2.2 的 authority 護欄，這些 URL 的 scheme 與 host
-  **與已通過網域檢查者相同**，故仍在允許網域內。
-- 上述兩點皆須有對應測試（見 §7.1）。
+- `curl` 收到多個 URL 時，依 §4.2.1 性質 1、條件 3 與 §4.2.2 的 authority 護欄，這些 URL 的 scheme
+  與 host **與已通過網域檢查者相同**，故仍在允許網域內。
+- 上述皆須有對應測試（見 §7.1），且測試須包含「在 cwd 實際建立可匹配檔案」的 fixture，證明判定
+  只依字面 token、不因檔案系統狀態而改變。
 
 #### 4.2.4 套用點
 
@@ -261,7 +280,7 @@ export function firstGlobMetacharIndex(value: string): number;
 
 其餘所有取值點（路徑相關）**一律沿用 `staticValue`**，不得替換。
 
-### 4.3 元件 ①：cwd 無關宣告（放寬中央前置規則一）
+### 4.3 元件 1：cwd 無關宣告（放寬中央前置規則一）
 
 #### 4.3.1 型別與宣告
 
@@ -280,7 +299,14 @@ export function firstGlobMetacharIndex(value: string): number;
 
 ```ts
 /**
- * 此次呼叫是否與 cwd 無關：不讀 cwd 相對路徑、不隱含以 cwd 為操作對象、不展開 glob。
+ * 此次呼叫的安全判定是否與 cwd 無關，需同時滿足：
+ *  (a) 不以 cwd 相對路徑讀取檔案；
+ *  (b) 不隱含以 cwd 為操作對象（如 `ls` / `find` 無操作元時作用於 cwd）；
+ *  (c) 安全判定所依據的資訊不取決於 shell 對 cwd 的 glob 展開結果
+ *      —— 即該資訊完全落在 §4.2.1 定義的「字面前綴」之內。
+ * 注意 (c) 是「判定不依賴展開結果」，不是「該指令不含 glob 元字元」：
+ * §4.2 容忍的「單一 `?` 查詢串」形態，其 scheme/host/路徑段皆在字面前綴內，
+ * 故仍滿足 (c)。
  * 未宣告 = 否（default-deny）。必須為純函式、不得有副作用。
  */
 cwdIndependent?(ctx: RuleContext): boolean;
@@ -393,7 +419,7 @@ function classifyArgv(ctx: RuleContext, opts: FlagGatedReaderOptions): ArgvClass
 | 不變量 | 是否維持 | 說明 |
 | --- | --- | --- |
 | default-deny | ✅ | 三元件皆為 allowlist 加法；未宣告 / 未列入者行為完全不變 |
-| deny 四類 | ✅ | 閘①②③ 仍在 `classify` 之前；遞迴根 deny 仍於 `classify` 內短路 |
+| deny 四類 | ✅ | 閘 1/2/3 仍在 `classify` 之前；遞迴根 deny 仍於 `classify` 內短路 |
 | 中央前置規則二/三/四不可升級 | ✅ | 不動 |
 | 中央前置規則一 | ⚠️ 本次唯一放寬處 | 由 §4.3.3 三道護欄限縮 |
 | `permissions.allow` 不能解除 deny | ✅ | 不動 |
@@ -413,18 +439,21 @@ function classifyArgv(ctx: RuleContext, opts: FlagGatedReaderOptions): ArgvClass
 
 ### 7.1 單元測試（allow / ask 兩面 + 邊界）
 
-- `word_test.ts`：`nonPathStaticValue` —— `a?b=1` / `a*b` 回字面值；`?abc`、`*abc`、`[abc`
-  （首字元為 glob）回 `null`；`$X`、`$(x)`、`a\b` 回 `null`；引號內容比照 `staticValue`。
+- `word_test.ts`：`nonPathStaticValue` —— `a?b=1` 回字面值；
+  `a*b`、`a[b]c`（含 `*` / `[`）回 `null`；`a?b?c`（兩個 `?`）回 `null`；
+  `?abc`（`?` 在索引 0）回 `null`；`a?b/c`（`?` 之後含 `/`）回 `null`；
+  `$X`、`$(x)`、`a\b` 回 `null`；引號內容比照 `staticValue`。
   `firstGlobMetacharIndex` —— 無元字元回 `-1`；`\*` 不算；回第一個未跳脫元字元索引。
 - `gh_test.ts`：`gh api repos/o/r/tags?per_page=50` → allow；
-  `gh api repos/o/r/x?a=1 -X POST` → ask；`gh api ?x` → ask（首字元 glob）；
-  `gh api rep?s/o/r/x` → ask（元字元落在第一個 `/` 之前，違反 §4.2.2）。
+  `gh api repos/o/r/x?a=1 -X POST` → ask；`gh api ?x` → ask；
+  `gh api repos/o/*/x` → ask（含 `*`）；`gh api rep?s/o/r/x` → ask（`?` 之後含 `/`）。
 - `curl_test.ts`：允許網域 + `https://host/p?q=1`（未加引號）→ allow；`{}`/`[]` 仍 ask；
-  `https://ho?t.example.com/x` → ask（元字元落在 authority 內，違反 §4.2.2）；
-  `http?://host/x` → ask（同上）。
-- **多字展開的行為斷言**（§4.2.3）：以 `gh api repos/o/*/x`、`curl https://host/a*b` 等 pattern
-  驗證判定僅依字面前綴，且測試中明示「展開後每個 word 皆以字面前綴開頭、不可能以 `-` 開頭」
-  這項不變量所對應的護欄確實生效（首字元 glob → ask、authority 內 glob → ask）。
+  `https://host/a*b` → ask（含 `*`）；`https://ho?t` → ask（authority 護欄）；
+  `http?://host/x` → ask（`?` 之後含 `/`）。
+- **檔案系統狀態獨立性 fixture 測試**（§4.2.3）：在受測 cwd 底下實際建立可匹配
+  `<字面前綴><任一字元><字面後綴>` 的檔案（例如針對 `repos/o/r/tags?per_page=50` 建立
+  `repos/o/r/tagsXper_page=50`），斷言判定結果與「該檔案不存在」時**完全相同**，
+  證明本工具的決策只依字面 token、不受專案外檔案系統內容影響。
 - `grep_test.ts`：`grep -E 'Retry'`（無檔案）→ allow；`grep pat /etc/passwd` → ask（檔案超範圍）；
   `grep -e pat file.txt` → 第一個位置參數視為檔案；`-ie pat file.txt` 群集含 `e` → 同上。
 - `jq_test.ts`（新增）：filter 不做路徑檢查；`-f ../outside.jq` → ask；
@@ -483,26 +512,43 @@ value-flag 吃掉的位置。本規格**不改**此掃描，因此 `rg '~' …` 
 不做範圍檢查。這是**既有**缺口，本規格不修，但因此**不**替這兩條規則宣告 `cwdIndependent`，
 避免在缺口上再疊加 cwd 豁免。
 
-### 8.4 glob 展開結果不可預測
+### 8.4 glob 展開的殘餘影響面
 
-`nonPathStaticValue` 讓 `gh api a?b` 以字面 `a?b` 送進規則判定，但 bash 實際傳給 `gh` 的可能是
-展開後的檔名，且可能是**多個** argv word。殘餘風險由 §4.2 的三層處置界定：字面前綴不變量
-（§4.2.1）、呼叫端元字元位置護欄（§4.2.2）、多字展開行為分析（§4.2.3）。結論是展開只能改變
-**字面前綴之後**的部分，故 `curl` 的 scheme/host 與 `gh api` 的 endpoint 首段恆為已檢查的字面值，
-且沒有任何展開結果能以 `-` 開頭。展開差異因此不會把唯讀操作變成寫入操作或換到別的主機。
+`nonPathStaticValue` 讓 `gh api a?b=1` 以字面送進規則判定，但 bash 實際傳給 `gh` 的可能是展開後的
+檔名，且可能是多個 argv word。經使用者裁決收緊為「單一 `?` 查詢串」形態後，殘餘影響面為：
+
+- 展開需要 cwd 底下**恰好存在**檔名為 `<字面前綴><任一字元><字面後綴>` 的檔案；
+- 每個展開結果與原 token **只差一個字元**，且該字元不可能是 `/`；
+- 因此 scheme、host、所有前段路徑皆維持已檢查的字面值，展開**不能**換主機、不能注入旗標、
+  不能把 GET 變成寫入。
+
+換言之，最壞情況是「對同一個已允許主機發出一個字元不同的 GET」。此殘餘面已由使用者在審查中
+明確接受（見 §9）。
 
 ### 8.5 未採納的審查建議（記錄理由）
 
-設計審查提出兩項建議，其**疑慮已於 §4.2 / §4.3.4 處理**，但**具體做法未照採**：
+設計審查提出兩項具體做法未照採（其**疑慮本身已處理**）：
 
 1. 「把規則契約改成回傳結構化 metadata（`{ verdict, pathOperandCount, … }`）」——會強迫不參與 cwd
    豁免的規則攜帶用不到的欄位。改以規則內 `classifyArgv` 單一解析達成同樣保證（§4.3.4）。
 2. 「cwd 落在專案外時一律拒絕含 glob 元字元的非路徑 token」——**與本規格目標直接衝突**：基準集
-   60 條指令的 cwd 正是專案外（`cd /d`），此規則會使功能完全失效。改以字面前綴不變量與元字元
-   位置護欄取得等效的安全結論（§4.2）。
+   60 條指令的 cwd 正是專案外（`cd /d`），此規則會使功能完全失效。改採同一審查者提出的中間
+   方案：收緊為「單一 `?` 查詢串」形態（§4.2），保住全部功能的同時把展開自由度降到一個字元。
 
 ## 9. Non-goals / Accepted limitations
 
-（本節於審查迴圈中如有經使用者裁決不實作的項目，逐條記錄 Concern / Decision / Rationale。）
+### 9.1 「單一 `?` 查詢串」展開仍受 cwd 檔案系統影響（一個字元）
 
-目前無已裁決項目。
+- **Concern**：容忍未加引號的 glob 元字元時，bash 會以（可能在專案外的）cwd 進行 pathname
+  expansion，使 `gh` / `curl` 實際收到的 argv 與本工具判定時所見的字面 token 不同；審查者建議
+  「cwd 在專案外時一律拒絕 glob 元字元」或完全要求加引號。
+- **Decision**：不採用「一律拒絕」。改為收緊成「單一 `?` 查詢串」形態（§4.2），並**接受**其殘餘
+  影響面——展開結果與原 token 只差一個字元。
+- **Rationale**（使用者裁決）：「一律拒絕」會使基準集 60/67 條回到 ask、元件 2 等於取消，與本規格
+  目標直接衝突；而收緊後的殘餘面已降到「對同一個已允許主機發出一個字元不同的 GET」，不能換主機、
+  不能注入旗標、不能寫入。收緊方案零功能代價（基準集 60 條與 corpus 186 條帶 `?` 的 `gh api`
+  全部符合該形態），故取收緊而非取消。
+
+**範圍限定（stale-waiver guard）**：本項接受是建立在「僅容忍單一 `?`、且其後不含 `/`」這個前提上。
+若日後放寬容忍範圍（例如再開放 `*`、多重元字元、或允許 `?` 後含 `/`），本項不再自動適用，須以新
+議題重新走審查流程。
