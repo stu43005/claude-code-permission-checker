@@ -388,7 +388,7 @@ toleratesNonStaticOperand?(ctx: RuleContext): boolean;
 不受影響。決策順序其餘部分（步驟 1 動態指令名、步驟 2 rule deny 短路、步驟 4 升級層、步驟 5
 rule allow）完全不變。
 
-#### 4.3.3 四道安全護欄
+#### 4.3.3 五道安全護欄
 
 1. **只有指令規則自身回 `allow` 才可能豁免。** 靠 `permissions.allow` 升級的 ask 永不豁免。
    若無此護欄，使用者設了 `Bash(gh:*)` 之後
@@ -412,6 +412,32 @@ rule allow）完全不變。
 
    護欄 4 與 §4.2 的關係：§4.2 容忍的 token **不是路徑操作元**，且已證明 verdict 對其所有展開
    結果不變（§4.2.5）；其餘任何非靜態 token 一律不得享有 cwd 豁免。
+
+5. **該葉指令的每個旗標都必須命中該規則明列的「已知旗標表」。** 未列入者 → 不豁免。
+
+   這是本設計對「路徑值旗標」的**結構性**答案。原本的豁免條件是「無路徑操作元且未命中
+   `pathValueFlags`」，但那等於假設 `pathValueFlags` 已窮舉——實際上並沒有。實測（各指令
+   `--help`）就找到多個既有規則未建模的路徑值旗標：
+
+   | 指令 | 未建模的路徑值旗標（實測 `--help`） |
+   | --- | --- |
+   | `wc` | `--files0-from=F`（GNU coreutils：從 F 讀 NUL 分隔的檔名清單） |
+   | `sort` | `--files0-from=F`（同上） |
+   | `grep` | `--exclude-from=FILE` |
+   | `diff` | `-X` / `--exclude-from=FILE`、`-S` / `--starting-file=FILE` |
+   | `realpath` | `--relative-to=DIR`、`--relative-base=DIR` |
+
+   若只靠「補齊 `pathValueFlags`」，任何**日後新增或本次仍漏掉**的路徑值旗標都會直接變成
+   誤放行。改成旗標表 allowlist 後，未知旗標的後果只是「不豁免 → 維持現行 ask」——
+   與本專案「一律 allowlist 優先於 denylist」的根本取捨一致。
+
+   旗標表分三類：(i) 無值旗標；(ii) 吃**非路徑**值的旗標；(iii) 吃**路徑**值的旗標。
+   類 (iii) 出現即**不豁免**（其值必須以真實 cwd 檢查，而豁免正是要跳過 cwd 判斷）。
+   類 (i)/(ii) 沿用各規則既有的 `askFlags` / `valueFlags` 定義再明文補齊。
+
+   **同時補齊 `pathValueFlags`**：上表五項一併加入對應規則的 `pathValueFlags`。這獨立於 cwd
+   豁免，修掉的是既有的**未檢查路徑值**缺口（例如今天 `wc --files0-from=../../x` 就不會被檢查），
+   屬安全方向的收緊。
 
 #### 4.3.4 宣告清單
 
@@ -453,16 +479,19 @@ endpoint 含 `{owner}` / `{repo}` / `{branch}` 任一者時，`ghRule` 不得宣
 **條件宣告（該次呼叫無任何被視為路徑的操作元）**：`flagGatedReader` 新增選項
 
 ```ts
-/** opt-in：無路徑操作元、非遞迴、未命中 pathValueFlags 時視為 cwd 無關。 */
+/** opt-in：無路徑操作元、非遞迴、未命中 pathValueFlags、且所有旗標命中已知旗標表時視為 cwd 無關。 */
 cwdIndependentWhenNoPaths?: boolean;
 /** 上述 opt-in 的例外名單（隱含以 cwd 為操作對象者，如 ls）。 */
 cwdDependentNames?: string[];
+/** 護欄 5 的已知旗標表：per-name 列出 (i) 無值旗標與 (ii) 吃非路徑值的旗標。 */
+knownFlags?: Record<string, { noValue: string[]; nonPathValue: string[] }>;
 ```
 
 計算式：`cwdIndependentWhenNoPaths === true` **且** 不在 `cwdDependentNames` 內 **且** 該次呼叫
-`isRecursive === false` **且** 無 `pathValueFlags` 命中 **且** 需做範圍檢查的位置參數為 0 個。
+`isRecursive === false` **且** 無 `pathValueFlags` 命中 **且** 需做範圍檢查的位置參數為 0 個
+**且** 每個以 `-` 開頭的 argv token 皆命中該指令 `knownFlags` 的 (i)/(ii) 兩類（護欄 5）。
 
-**單一解析來源（single-parse）契約（強制）**：上述五項條件與 `evaluate` 用來決定 allow/ask 的
+**單一解析來源（single-parse）契約（強制）**：上述六項條件與 `evaluate` 用來決定 allow/ask 的
 argv 解析，**必須來自同一次解析**，不得各自重新掃描 argv。實作方式：`flagGatedReader` 內抽出
 
 ```ts
@@ -512,6 +541,25 @@ function classifyArgv(ctx: RuleContext, opts: FlagGatedReaderOptions): ArgvClass
 | `cdRule` | `cd` 葉指令本身帶的是變更**前**的 cwd，不需豁免 |
 | `fileCmdRule`（`file`）/ `dateRule`（`date`） | 其 `valueFlags` 含吃路徑的旗標（`-m`/`-f`、`-r`/`-f`）但未列入 `pathValueFlags`，值目前不做範圍檢查；豁免會擴大該既有缺口（見 §8.3） |
 
+### 4.4 `gh api --cache`：本機寫入副作用 → ask
+
+`gh api --help`（`gh` 2.93.0，本機實測）列有：
+
+```
+      --cache duration        Cache the response, e.g. "3600s", "60m", "1h"
+```
+
+`--cache` 會把回應**寫入本機 gh 快取目錄**。本工具的判定基準是「純唯讀」，而 `ghApiMutates`
+只涵蓋「遠端寫入」（HTTP 方法與 body 旗標），未涵蓋本機副作用。
+
+改動：`gh.ts` 新增 `ghApiHasLocalSideEffect(after)`，命中 `--cache` / `--cache=…` 即 `ask`
+（與 `ghApiMutates` 並列，任一命中即 ask）。
+
+成本評估：corpus 20431 行指令中 `--cache` 出現 3 次，改為 ask 的代價可忽略；而它是本工具
+「唯讀」宣稱的實質例外，依「誤 ask 可接受、誤 allow 不可接受」的根本取捨應收緊。
+
+（`--cache` 的值是 duration 不是路徑，故無路徑檢查問題；此處收緊的是**寫入**面向。）
+
 ## 5. 核心不變量檢核
 
 | 不變量 | 是否維持 | 說明 |
@@ -519,7 +567,7 @@ function classifyArgv(ctx: RuleContext, opts: FlagGatedReaderOptions): ArgvClass
 | default-deny | 是 | 三元件皆為 allowlist 加法；未宣告 / 未列入者行為完全不變 |
 | deny 四類 | 是 | 閘 1/2/3 仍在 `classify` 之前；遞迴根 deny 仍於 `classify` 內短路 |
 | 中央前置規則二/三/四不可升級 | 是 | 不動 |
-| 中央前置規則一 | 注意 本次唯一放寬處 | 由 §4.3.3 四道護欄限縮 |
+| 中央前置規則一 | 注意 本次唯一放寬處 | 由 §4.3.3 五道護欄限縮 |
 | `permissions.allow` 不能解除 deny | 是 | 不動 |
 | 永遠 `exit 0`、例外 → ask | 是 | 不動 |
 | `rule.evaluate` / `rule.cwdIndependent` 為純函式 | 是 | 新述詞明訂純函式契約；`classify` 先評估 rule 再做中央前置的既有順序依賴不變 |
@@ -528,7 +576,7 @@ function classifyArgv(ctx: RuleContext, opts: FlagGatedReaderOptions): ArgvClass
 
 實作完成後同步更新 `CLAUDE.md`：
 
-- 「四條中央前置規則」段落加註規則一的 cwd 豁免條件與四道護欄。
+- 「四條中央前置規則」段落加註規則一的 cwd 豁免條件與五道護欄。
 - 「架構（評估管線）」的 `classify.ts` 說明加入 `cwdIndependent` 述詞。
 - `scope.ts` / `word.ts` 說明加入 `nonPathStaticValue` 及其「非路徑操作元」適用邊界。
 - `rules/` 說明加入新檔 `commands/jq.ts`，並註記 `jq` 已自 `fileReaderRule` 移出。
@@ -564,7 +612,7 @@ function classifyArgv(ctx: RuleContext, opts: FlagGatedReaderOptions): ArgvClass
   `grep -e pat file.txt` → 第一個位置參數視為檔案；`-ie pat file.txt` 群集含 `e` → 同上。
 - `jq_test.ts`（新增）：filter 不做路徑檢查；`-f ../outside.jq` → ask；
   `--rawfile n /etc/passwd` → ask；`--arg a b` 不當路徑；`--args` 後位置參數不當路徑；未知旗標 → ask。
-- `classify_test.ts`：`cwdIndependent` 四道護欄各自的 allow / ask 兩面。
+- `classify_test.ts`：`cwdIndependent` 五道護欄各自的 allow / ask 兩面。
 - **每一條條件宣告規則的 stdin-only 驗收**（涵蓋 §4.3.4 表列全部規則，不只 `grep` / `jq`）：
   對 `cat`、`head`、`wc`、`cut`、`tr`、`nl`、`fold`、`column`、`sort`、`uniq`、`xxd`、`tail`、
   `yq`、`diff`、`sed`、`awk`、`grep`、`jq` 各寫一則 `cd /outside && <cmd> <僅旗標>` → **allow**，
@@ -593,6 +641,13 @@ function classifyArgv(ctx: RuleContext, opts: FlagGatedReaderOptions): ArgvClass
 | `cd /outside && gh repo view` | ask | 同上 |
 | `cd /outside && gh issue list --repo o/r` | ask | 同上（本規格不實作 `--repo` 例外） |
 | `cd /outside && gh search code 'x'` | allow | `search` 目標由 query 決定 |
+| `cd /outside && gh api 'repos/{owner}/{repo}/issues'` | ask | endpoint 佔位符由 cwd 的 git repo 填入 |
+| `gh api --cache 1h repos/o/r/tags`（cwd 在專案內） | ask | §4.4：`--cache` 寫入本機快取 |
+| `cd /outside && wc --files0-from=list` | ask | 護欄 5：`--files0-from` 為路徑值旗標 |
+| `cd /outside && sort --files0-from=list` | ask | 同上 |
+| `cd /outside && grep --exclude-from=f pat` | ask | 同上 |
+| `cd /outside && wc --some-unknown-flag` | ask | 護欄 5：未知旗標 → 不豁免（fail-closed） |
+| `wc --files0-from=../../outside/list`（cwd 在專案內） | ask | 補齊 `pathValueFlags` 後的既有缺口修正 |
 
 ### 7.3 Operational verification
 
@@ -611,7 +666,7 @@ function classifyArgv(ctx: RuleContext, opts: FlagGatedReaderOptions): ArgvClass
 
 ### 8.1 中央前置規則一被放寬
 
-這是本規格唯一放寬「不可升級中央前置」的地方。四道護欄使放寬範圍限縮為：
+這是本規格唯一放寬「不可升級中央前置」的地方。五道護欄使放寬範圍限縮為：
 「鏈內 `cd` 造成的 cwd」×「指令規則自身判 allow」×「該規則明確宣告 cwd 無關且本次無路徑操作元」。
 三者缺一即回到現行行為。任何新增規則若未宣告 `cwdIndependent`，自動維持現行行為。
 
