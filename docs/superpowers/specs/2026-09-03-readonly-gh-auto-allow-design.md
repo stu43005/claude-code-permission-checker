@@ -100,13 +100,13 @@ ask）因此對整條鏈生效。**這條規則本身是對的**，問題在於�
 
 ```
 parse.ts → walk.ts → 閘 1 sleep → 閘 2 名稱重定義 → no-op → 閘 3 printDisguiseDeny → classify.ts → combine.ts
-            ↑ *1-a                                                                    ↑ *1-b
+            ^ *1-a                                                                    ^ *1-b
        cwd origin 標記                                                        cwd 豁免判定 + 中央前置
 
-rules/commands/gh.ts   ← *2 nonPathStaticValue
-rules/commands/curl.ts ← *2 nonPathStaticValue
-rules/commands/grep.ts ← *3 pattern 不做路徑檢查
-rules/commands/jq.ts   ← *3 新檔：filter 不做路徑檢查
+rules/commands/gh.ts   <- *2 nonPathStaticValue
+rules/commands/curl.ts <- *2 nonPathStaticValue
+rules/commands/grep.ts <- *3 pattern 不做路徑檢查
+rules/commands/jq.ts   <- *3 新檔：filter 不做路徑檢查
 ```
 
 三個元件互相獨立可實作，但**只有三者齊備**基準集才會從 67 ask 變成 63 allow。
@@ -182,7 +182,16 @@ nonPathLeadingPositional?: (argv: Word[]) => boolean;
 
 長短旗標皆需支援 `--opt=value` 與 `--opt value` 兩種寫法。
 
-### 4.2 元件 2：非路徑操作元的靜態取值（`gh` / `curl`）
+### 4.2 元件 2：endpoint / URL **操作元**的靜態取值（`gh` / `curl`）
+
+本元件的適用面**限縮到單一操作元**：`gh api` 的 endpoint、`curl` 的 URL。同一條指令中的其他
+token（子指令、旗標、旗標值、`-H` header 值等）**一律沿用 `staticValue`**——含未加引號 `?` 者
+維持動態 → ask。
+
+由此得到本元件的**強制不變量**（§4.2.5 為其論證，§7.1 為其測試）：
+
+> **被容忍的 `?` 必須嚴格位於「本工具 verdict 所依據的每一個 byte」之後。
+> 因此本工具對該指令的判定，對該 token 的任何可能展開結果都相同。**
 
 `src/engine/word.ts` 新增：
 
@@ -268,17 +277,47 @@ export function firstGlobMetacharIndex(value: string): number;
 - 上述皆須有對應測試（見 §7.1），且測試須包含「在 cwd 實際建立可匹配檔案」的 fixture，證明判定
   只依字面 token、不因檔案系統狀態而改變。
 
-#### 4.2.4 套用點
+#### 4.2.4 套用點（只針對操作元，不是整條 argv）
 
-僅兩處：
+兩條規則的取值流程都改為「**先全部 `staticValue`，只對操作元位置做一次補救**」：
 
-- `gh.ts`：argv 取值由 `staticValue` 改為 `nonPathStaticValue`，並對 endpoint 套用 §4.2.2 護欄。
-- `curl.ts`：主迴圈取值由 `staticValue` 改為 `nonPathStaticValue`，並對 URL 候選套用 §4.2.2 護欄。
+`gh.ts`：
+
+1. 對每個 argv token 取 `staticValue`，記下哪些回 `null`。
+2. 若**回 `null` 的 token 超過一個** → `ask`（不做補救）。
+3. 若子指令（第一個非旗標 token）無法靜態取得 → `ask`。
+4. 僅當子指令為 `api`、且唯一的 `null` token 用 `nonPathStaticValue` 可取得值、且該值
+   **不以 `-` 開頭**、且它就是 `api` 之後的**第一個位置操作元**（endpoint）時，才採用該值；
+   位置不符（例如它其實是某旗標的值）→ `ask`。
+5. 對該 endpoint 值套用 §4.2.2 的 `gh` 護欄。
+
+`curl.ts`：
+
+1. 主迴圈維持 `staticValue`；**任何被當作旗標或旗標值消費的 token 為 `null` → 直接 `ask`**
+   （旗標與旗標值永不套用寬鬆取值）。
+2. 僅當某個 `null` token 落在**位置參數（URL 候選）**位置、且全 argv 只有這一個 `null`、
+   且 `nonPathStaticValue` 取得的值不以 `-` 開頭時，才採用該值。
+3. 對該 URL 值套用 §4.2.2 的 authority 護欄，再照常送進 `resolveUrl`。
 
 `curl` 對 `{}` `[]` 的既有攔截**不放寬**：那是 curl 自己的 URL 展開語法，由 `resolveUrl` 判為
-「形式不安全」而 ask；`nonPathStaticValue` 只是讓 `[` 通過詞法層，最終仍被 URL 層擋下，結果一致。
+「形式不安全」而 ask。
 
-其餘所有取值點（路徑相關）**一律沿用 `staticValue`**，不得替換。
+其餘所有取值點（路徑相關、旗標、旗標值）**一律沿用 `staticValue`**，不得替換。
+
+#### 4.2.5 verdict 不變量的論證
+
+`gh api`：本工具的判定**完全不讀 endpoint 路徑**——`ghApiMutates` 只掃描旗標
+（`-X`/`--method`/`-f`/`-F`/`--field`/`--raw-field`/`--input` 及其黏寫形式）。endpoint token 的
+任何展開結果都以非 `-` 的字面前綴開頭（§4.2.1 性質 2 ＋ 容忍條件 2），故**不可能**變成旗標、
+不可能改變 `ghApiMutates` 的結果。判定依據的 byte 集合與 endpoint 不相交 → verdict 恆定。
+
+`curl`：本工具的判定依據是旗標 allowlist ＋ `resolveUrl` 的 scheme 與 host。旗標與旗標值不套用
+寬鬆取值（§4.2.4），scheme/host 由容忍條件 3（`?` 之後不含 `/`）與 §4.2.2 的 authority 護欄保證
+落在字面前綴內。多字展開產生的額外 URL 共用同一 scheme+host，通過同一次網域檢查 → verdict 恆定。
+
+**結論**：argv 確實可能因展開而不同，但**本工具的 allow/ask 判定對所有可能的展開結果完全相同**。
+殘餘差異退化為「對同一個已允許主機取得不同的資料」——屬研究結果正確性問題，不是權限判定問題
+（記錄於 §9.1）。
 
 ### 4.3 元件 1：cwd 無關宣告（放寬中央前置規則一）
 
@@ -394,10 +433,10 @@ function classifyArgv(ctx: RuleContext, opts: FlagGatedReaderOptions): ArgvClass
 
 | 規則 | opt-in | 備註 |
 | --- | --- | --- |
-| `fileReaderRule` | ✅ | `cwdDependentNames: ["ls"]`——`ls` 無操作元時列出 cwd |
-| `grepRule` | ✅ | `rg` 恆為遞迴，計算式自然排除 |
-| `sortRule` / `uniqRule` / `xxdRule` / `yqRule` / `tailRule` / `diffRule` | ✅ | 無操作元時皆讀 stdin |
-| `sedRule` / `awkRule` / `jqRule` | ✅（手寫述詞） | 程式碼已與輸入路徑分離；條件為輸入路徑數為 0 |
+| `fileReaderRule` | 是 | `cwdDependentNames: ["ls"]`——`ls` 無操作元時列出 cwd |
+| `grepRule` | 是 | `rg` 恆為遞迴，計算式自然排除 |
+| `sortRule` / `uniqRule` / `xxdRule` / `yqRule` / `tailRule` / `diffRule` | 是 | 無操作元時皆讀 stdin |
+| `sedRule` / `awkRule` / `jqRule` | 是（手寫述詞） | 程式碼已與輸入路徑分離；條件為輸入路徑數為 0 |
 
 `uniqRule` / `xxdRule` 出自 `positional-output.ts` 的 `positionalOutputRule`，需在該 factory 內
 比照加上同一 opt-in 機制。
@@ -418,13 +457,13 @@ function classifyArgv(ctx: RuleContext, opts: FlagGatedReaderOptions): ArgvClass
 
 | 不變量 | 是否維持 | 說明 |
 | --- | --- | --- |
-| default-deny | ✅ | 三元件皆為 allowlist 加法；未宣告 / 未列入者行為完全不變 |
-| deny 四類 | ✅ | 閘 1/2/3 仍在 `classify` 之前；遞迴根 deny 仍於 `classify` 內短路 |
-| 中央前置規則二/三/四不可升級 | ✅ | 不動 |
-| 中央前置規則一 | ⚠️ 本次唯一放寬處 | 由 §4.3.3 三道護欄限縮 |
-| `permissions.allow` 不能解除 deny | ✅ | 不動 |
-| 永遠 `exit 0`、例外 → ask | ✅ | 不動 |
-| `rule.evaluate` / `rule.cwdIndependent` 為純函式 | ✅ | 新述詞明訂純函式契約；`classify` 先評估 rule 再做中央前置的既有順序依賴不變 |
+| default-deny | 是 | 三元件皆為 allowlist 加法；未宣告 / 未列入者行為完全不變 |
+| deny 四類 | 是 | 閘 1/2/3 仍在 `classify` 之前；遞迴根 deny 仍於 `classify` 內短路 |
+| 中央前置規則二/三/四不可升級 | 是 | 不動 |
+| 中央前置規則一 | 注意 本次唯一放寬處 | 由 §4.3.3 三道護欄限縮 |
+| `permissions.allow` 不能解除 deny | 是 | 不動 |
+| 永遠 `exit 0`、例外 → ask | 是 | 不動 |
+| `rule.evaluate` / `rule.cwdIndependent` 為純函式 | 是 | 新述詞明訂純函式契約；`classify` 先評估 rule 再做中央前置的既有順序依賴不變 |
 
 ## 6. 文件同步
 
@@ -446,10 +485,18 @@ function classifyArgv(ctx: RuleContext, opts: FlagGatedReaderOptions): ArgvClass
   `firstGlobMetacharIndex` —— 無元字元回 `-1`；`\*` 不算；回第一個未跳脫元字元索引。
 - `gh_test.ts`：`gh api repos/o/r/tags?per_page=50` → allow；
   `gh api repos/o/r/x?a=1 -X POST` → ask；`gh api ?x` → ask；
-  `gh api repos/o/*/x` → ask（含 `*`）；`gh api rep?s/o/r/x` → ask（`?` 之後含 `/`）。
+  `gh api repos/o/*/x` → ask（含 `*`）；`gh api rep?s/o/r/x` → ask（`?` 之後含 `/`）；
+  **操作元限縮**：`gh api x -H Accept:a?b` → ask（旗標值不套用寬鬆取值）；
+  `gh issue list --repo o/r?x` → ask（子指令非 `api`）；
+  `gh api a?b c?d` → ask（`null` token 超過一個）。
 - `curl_test.ts`：允許網域 + `https://host/p?q=1`（未加引號）→ allow；`{}`/`[]` 仍 ask；
   `https://host/a*b` → ask（含 `*`）；`https://ho?t` → ask（authority 護欄）；
-  `http?://host/x` → ask（`?` 之後含 `/`）。
+  `http?://host/x` → ask（`?` 之後含 `/`）；
+  **操作元限縮**：`curl -H Accept:a?b https://host/p` → ask（旗標值不套用寬鬆取值）；
+  `curl --max-time 1?0 https://host/p` → ask（同上）。
+- **verdict 不變量測試**（§4.2.5）：對同一 endpoint 逐一列出其所有「把 `?` 換成單一字元」的
+  可能展開結果，斷言每一個都得到與原 token **相同的 verdict**；`curl` 同理，並額外斷言多個
+  展開結果作為多 URL 傳入時 verdict 不變。
 - **檔案系統狀態獨立性 fixture 測試**（§4.2.3）：在受測 cwd 底下實際建立可匹配
   `<字面前綴><任一字元><字面後綴>` 的檔案（例如針對 `repos/o/r/tags?per_page=50` 建立
   `repos/o/r/tagsXper_page=50`），斷言判定結果與「該檔案不存在」時**完全相同**，
@@ -520,10 +567,11 @@ value-flag 吃掉的位置。本規格**不改**此掃描，因此 `rg '~' …` 
 - 展開需要 cwd 底下**恰好存在**檔名為 `<字面前綴><任一字元><字面後綴>` 的檔案；
 - 每個展開結果與原 token **只差一個字元**，且該字元不可能是 `/`；
 - 因此 scheme、host、所有前段路徑皆維持已檢查的字面值，展開**不能**換主機、不能注入旗標、
-  不能把 GET 變成寫入。
+  不能把 GET 變成寫入；
+- 更進一步，依 §4.2.5 的 verdict 不變量，本工具對所有可能展開結果的 allow/ask 判定**完全相同**。
 
-換言之，最壞情況是「對同一個已允許主機發出一個字元不同的 GET」。此殘餘面已由使用者在審查中
-明確接受（見 §9）。
+換言之，最壞情況是「對同一個已允許主機取得一個字元不同的 URL 的資料」——是**研究結果正確性**
+的問題，不是權限判定的問題。此殘餘面已由使用者在審查中明確接受（見 §9.1）。
 
 ### 8.5 未採納的審查建議（記錄理由）
 
@@ -542,13 +590,17 @@ value-flag 吃掉的位置。本規格**不改**此掃描，因此 `rg '~' …` 
 - **Concern**：容忍未加引號的 glob 元字元時，bash 會以（可能在專案外的）cwd 進行 pathname
   expansion，使 `gh` / `curl` 實際收到的 argv 與本工具判定時所見的字面 token 不同；審查者建議
   「cwd 在專案外時一律拒絕 glob 元字元」或完全要求加引號。
-- **Decision**：不採用「一律拒絕」。改為收緊成「單一 `?` 查詢串」形態（§4.2），並**接受**其殘餘
-  影響面——展開結果與原 token 只差一個字元。
-- **Rationale**（使用者裁決）：「一律拒絕」會使基準集 60/67 條回到 ask、元件 2 等於取消，與本規格
-  目標直接衝突；而收緊後的殘餘面已降到「對同一個已允許主機發出一個字元不同的 GET」，不能換主機、
-  不能注入旗標、不能寫入。收緊方案零功能代價（基準集 60 條與 corpus 186 條帶 `?` 的 `gh api`
-  全部符合該形態），故取收緊而非取消。
+- **Decision**：不採用「一律拒絕」，亦不採用「操作元含 glob 即停用 cwd 豁免」。改為
+  (a) 收緊成「單一 `?` 查詢串」形態，(b) 適用面限縮到 endpoint / URL **單一操作元**，
+  (c) 建立並測試 **verdict 不變量**（§4.2.5）。**接受**其殘餘影響面——執行時取得的 URL 可能
+  與指令字面差一個字元。
+- **Rationale**（使用者裁決）：「一律拒絕」會使基準集 60/67 條回到 ask、元件 2 等於取消；
+  「含 glob 即停用 cwd 豁免」對本基準集效果相同（`cd /d` 與 `?` 同時出現）。而經過 (a)(b)(c)
+  之後，殘餘差異已**不影響本工具的權限判定**（verdict 對所有展開結果相同），只可能影響
+  research 取得的資料內容；且觸發條件是 cwd 底下恰好存在與 endpoint 僅差一個字元的檔案，
+  實務上不會偶發。故取精確化而非取消。
 
-**範圍限定（stale-waiver guard）**：本項接受是建立在「僅容忍單一 `?`、且其後不含 `/`」這個前提上。
-若日後放寬容忍範圍（例如再開放 `*`、多重元字元、或允許 `?` 後含 `/`），本項不再自動適用，須以新
-議題重新走審查流程。
+**範圍限定（stale-waiver guard）**：本項接受同時建立在三個前提上——(a) 僅容忍單一 `?` 且其後
+不含 `/`；(b) 寬鬆取值只套用於 endpoint / URL 操作元，旗標與旗標值一律不套用；(c) §4.2.5 的
+verdict 不變量成立且有測試守護。任一前提日後被放寬（例如開放 `*`、允許 `?` 後含 `/`、對旗標值
+套用寬鬆取值、或 verdict 開始依賴 endpoint 路徑），本項不再自動適用，須以新議題重新走審查流程。
