@@ -257,8 +257,14 @@ export function firstGlobMetacharIndex(value: string): number;
 
 各呼叫端據此強制「安全決策資訊落在字面前綴內」：
 
-- **`curl.ts`**：對每個 URL 候選值，元字元**必須出現在 authority（`scheme://host[:port]`）之後**——
-  亦即 `firstGlobMetacharIndex(u)` 必須大於 `scheme://` 之後第一個 `/` 的索引；否則 `ask`。
+- **`curl.ts`**：對每個 URL 候選值，元字元**必須出現在 authority（`scheme://host[:port]`）之後**。
+  authority 的結束位置定義為：`scheme://` 之後**第一個 `/`、`?` 或 `#` 的索引**（三者取最小；
+  皆不存在則視為字串結尾）。`firstGlobMetacharIndex(u)` 必須**大於等於**該索引；否則 `ask`。
+
+  **無路徑的查詢串 URL**（`https://host?q=1`）因此正確通過：authority 在 `?` 處結束，
+  元字元索引等於該索引 → allow。若只用「第一個 `/`」定義，這種 URL 會找不到 `/` 而誤判。
+  `https://ho?t`（元字元落在 host 內）仍 `ask`。
+
   這保證 `resolveUrl` 檢查的 scheme 與 host **完全落在字面前綴內**，展開結果不可能換到別的主機。
 - **`gh.ts`**：對 `api` 的 endpoint 操作元，元字元**必須出現在第一個 `/` 之後**；否則 `ask`。
   這保證 endpoint 的第一段（`repos` / `search` / `orgs` …）為字面。
@@ -366,8 +372,9 @@ const allArgvStatic = inv.argv.every((w) => staticValue(w) !== null);
 
 const cwdExempt =
   ruleVerdict?.kind === "allow" &&                 // 護欄 1
+  sessionCwdInScope &&                             // 護欄 2（起點可信）
   inv.cwd.kind === "known" &&
-  inv.cwd.origin === "chain-cd" &&                 // 護欄 2
+  inv.cwd.origin === "chain-cd" &&                 // 護欄 2（鏈內 cd）
   (allArgvStatic || (rule?.toleratesNonStaticOperand?.(ctx) ?? false)) && // 護欄 4
   (rule?.cwdIndependent?.(ctx) ?? false);
 
@@ -393,9 +400,22 @@ rule allow）完全不變。
 1. **只有指令規則自身回 `allow` 才可能豁免。** 靠 `permissions.allow` 升級的 ask 永不豁免。
    若無此護欄，使用者設了 `Bash(gh:*)` 之後
    `cd /outside && gh api x --input secret.txt` 會被升級成 allow 且跳過 cwd 檢查——這是實質漏洞。
-2. **只豁免鏈內 `cd` 造成的 cwd**（`origin === "chain-cd"`）。若 hook 傳入的 session cwd 本身就在
-   專案外，代表外部狀態已偏離，一律不豁免、規則一照常 ask。此護欄使 §1.4 的「cwd 若真的跨呼叫
-   繼承」情境即使成立也被封住（前提是 harness 如實回報 cwd）。
+2. **豁免同時要求「起點可信」與「鏈內 `cd`」兩件事**：
+
+   - `sessionCwdInScope === true`：hook 傳入的 **session cwd 本身**必須落在允許讀取範圍內；
+   - `inv.cwd.origin === "chain-cd"`：當前 cwd 由本次指令鏈內的 `cd` 產生。
+
+   **兩者缺一不可。** 只看 `origin` 會被 no-op cd 繞過：若 session cwd 已在專案外，
+   `cd . && gh api …`（或任何相對 no-op `cd`）會把那個**未經信任的外部 cwd** 重新標記為
+   `chain-cd`，形同自我授權。加上 `sessionCwdInScope` 後，起點不可信就永遠無法透過鏈內 `cd`
+   取得豁免。
+
+   此護欄使 §1.4 的「cwd 若真的跨呼叫繼承」情境即使成立也被封住：髒 cwd 會以 session cwd 的
+   身分傳入 → `sessionCwdInScope === false` → 不豁免（前提是 harness 如實回報 cwd）。
+
+   `sessionCwdInScope` 由 `evaluate` 對 `initialCwd` 計算一次
+   （`initialCwd.kind === "known" && isReadScoped(normalizeAbsolute(initialCwd.path), scope)`），
+   以獨立參數傳入 `classify`；**不**由 `CwdState` 攜帶，避免與 `origin` 混為一談。
 3. **相對路徑仍以真實 cwd 解析。** 不做「改用專案根解析」這種替換——那會讓
    `cd /other && cat x.txt` 誤判成專案內。有路徑操作元的指令照樣 ask。
 4. **該葉指令的 argv 不得含任何非靜態 token。** 具體：豁免要求每個 argv token 的
@@ -510,7 +530,7 @@ function classifyArgv(ctx: RuleContext, opts: FlagGatedReaderOptions): ArgvClass
   新增的 `jqRule`（沿用其單次掃描結果）。
 
 **為何不改 `RuleVerdict` 契約**：把分類 metadata 塞進 `RuleVerdict` 會強迫 `git` / `deno` / `find` /
-`gh` / `curl` 等**不參與 cwd 豁免**的規則一律攜帶用不到的欄位，擴大契約面卻不增加安全性。
+`git` / `deno` / `find` 等**不參與 cwd 豁免**的規則一律攜帶用不到的欄位，擴大契約面卻不增加安全性。
 在規則內部共用一次解析即可得到同樣的「單一權威解析」保證，且改動面侷限於參與豁免的規則。
 
 **漂移方向分析**：即使兩者仍發生不一致，護欄 1（`ruleVerdict === "allow"` 才可能豁免）使後果受限——
@@ -566,10 +586,36 @@ function classifyArgv(ctx: RuleContext, opts: FlagGatedReaderOptions): ArgvClass
 成本評估：corpus 20431 行指令中 `--web` 出現 0 次、`--cache` 出現 3 次，代價可忽略；
 而兩者都是本工具「純唯讀」宣稱的實質例外，依「誤 ask 可接受、誤 allow 不可接受」應收緊。
 
-**已知既有缺口（本規格範圍外）**：`ghRule` 目前對**未知旗標**不做 ask（不符 `CLAUDE.md`
-「未知全域選項一律 ask」的既有規範）。本規格不補這一項——上表已窮舉當前 allowlisted 子指令的
-本機副作用面，且護欄 5 使**未知 gh 旗標無法取得 cwd 豁免**（fail-closed）。要把 gh 全面改為
-旗標 allowlist 屬獨立議題，應另走 spec 流程。
+### 4.5 `gh` 改為旗標 allowlist（未知旗標 → ask）
+
+只把 `-w` / `--cache` 列為 ask 是 **denylist**，其正確性依賴「對 gh 2.93.0 的一次性稽核」——
+未來 gh 版本新增帶本機副作用的旗標就會被誤放行。依 `CLAUDE.md`「一律 allowlist 優先於
+denylist」「未知全域選項一律 ask」，`ghRule` 改為**旗標 allowlist**：
+
+**未列入者一律 `ask`。** 這同時解決版本漂移：任何新 gh 版本新增的旗標都是未知旗標 → ask，
+不需要偵測或釘選 gh 版本。
+
+安全旗標集（本機 `gh <sub> --help` 實測取得，`gh` 2.93.0）：
+
+| 範圍 | 無值旗標 | 吃一個非路徑值的旗標 |
+| --- | --- | --- |
+| 全部子指令共用 | `-h` / `--help` | `--json`、`-q` / `--jq`、`-t` / `--template` |
+| `api` | `--paginate`、`--silent`、`--slurp`、`-i` / `--include`、`--verbose` | `-H` / `--header`、`--hostname`、`-p` / `--preview`、`-X` / `--method`（**值必須是 `GET`**，否則既有 `ghApiMutates` 判 ask） |
+| `search *` | `--archived` | `-L` / `--limit`、`-R` / `--repo`、`--owner`、`--language`、`--match`、`--sort`、`--order`、`--state`、`--filename`、`--extension`、`--size`、`--label`、`--author`、`--assignee`、`--created`、`--updated`、`--visibility`、`--include-forks` |
+| `repo` / `issue` / `pr` / `release` 的唯讀子指令 | `--patch`、`--name-only` | `-R` / `--repo`、`-L` / `--limit`、`-s` / `--state`、`--label`、`--author`、`--assignee`、`--search`、`--color`、`-e` / `--exclude` |
+
+明確 ask（本機副作用，見 §4.4 表）：`-w` / `--web`、`--cache`。
+明確 ask（遠端寫入，既有 `ghApiMutates`）：`-X` / `--method` 非 GET、`-f` / `--raw-field`、
+`-F` / `--field`、`--input`。
+
+**刻意不窮舉 `gh search` 的全部過濾旗標**（`--good-first-issues`、`--reactions`、`--milestone`
+等數十個）：依「誤 ask 可接受、誤 allow 不可接受」，罕用過濾旗標落到 ask 只是多問一次；
+把它們全部列入反而擴大維護面與出錯機會。corpus 中實際出現的 gh 旗標
+（`-H`、`--jq`、`--limit`、`--language`、`--sort`、`-R`、`--state`、`--repo`、`--template`）
+皆已涵蓋。
+
+長短旗標皆須支援 `--opt=value` 與 `--opt value`；短旗標群集（如 `-qi`）逐字母比對，
+任一字母未列入即 ask。
 
 ## 5. 核心不變量檢核
 
@@ -657,7 +703,12 @@ function classifyArgv(ctx: RuleContext, opts: FlagGatedReaderOptions): ArgvClass
 | `gh search code x --web`（cwd 在專案內） | ask | §4.4：`--web` 開啟本機瀏覽器 |
 | `cd /outside && gh search code x --web` | ask | 同上（且護欄 1：規則已判 ask → 不豁免） |
 | `gh repo view -w` / `gh pr diff --web` | ask | §4.4：`-w` 對所有 gh 子指令一律 ask |
-| `cd /outside && gh api x --some-unknown-flag` | ask | 護欄 5：未知 gh 旗標 → 不豁免 |
+| `gh api x --some-unknown-flag`（cwd 在專案內） | ask | §4.5：gh 未知旗標一律 ask |
+| `gh search code x --good-first-issues`（cwd 在專案內） | ask | §4.5：未列入安全集的過濾旗標 → ask（可接受的誤 ask） |
+| session cwd 在專案外 + `cd . && gh api x` | ask | 護欄 2：`sessionCwdInScope === false`，no-op cd 不能自我授權 |
+| session cwd 在專案外 + `cd /outside && gh api x?a=1` | ask | 同上 |
+| session cwd 在專案內 + `cd /outside && gh api x?a=1` | allow | 護欄 2 兩項條件皆成立 |
+| `curl -s 'https://allowed-host?q=1'`（無路徑） | allow | §4.2.2：authority 在 `?` 處結束 |
 | `cd /outside && wc --files0-from=list` | ask | 護欄 5：`--files0-from` 為路徑值旗標 |
 | `cd /outside && sort --files0-from=list` | ask | 同上 |
 | `cd /outside && grep --exclude-from=f pat` | ask | 同上 |
