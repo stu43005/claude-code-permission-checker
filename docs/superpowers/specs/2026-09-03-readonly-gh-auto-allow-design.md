@@ -257,13 +257,17 @@ export function firstGlobMetacharIndex(value: string): number;
 
 各呼叫端據此強制「安全決策資訊落在字面前綴內」：
 
-- **`curl.ts`**：對每個 URL 候選值，元字元**必須出現在 authority（`scheme://host[:port]`）之後**。
-  authority 的結束位置定義為：`scheme://` 之後**第一個 `/`、`?` 或 `#` 的索引**（三者取最小；
-  皆不存在則視為字串結尾）。`firstGlobMetacharIndex(u)` 必須**大於等於**該索引；否則 `ask`。
+- **`curl.ts`**：對每個 URL 候選值，元字元**必須出現在「終結 authority 的那個 `/`」之後**。
+  具體：令 `slash` = `scheme://` 之後第一個 `/` 的索引。**若不存在該 `/` → `ask`**；
+  否則 `firstGlobMetacharIndex(u)` 必須**嚴格大於** `slash`，不然 `ask`。
 
-  **無路徑的查詢串 URL**（`https://host?q=1`）因此正確通過：authority 在 `?` 處結束，
-  元字元索引等於該索引 → allow。若只用「第一個 `/`」定義，這種 URL 會找不到 `/` 而誤判。
-  `https://ho?t`（元字元落在 host 內）仍 `ask`。
+  **無路徑段的 URL 一律 ask**，即使 `?` 看起來只在查詢串：`https://host?q=1` 展開時，
+  bash 會把 `?` 當成 host 尾端的一個字元，得到 `https://hostXq=1`——**主機被改掉**，
+  scheme/host 不再落在字面前綴內，違反 §4.2.5 的 verdict 不變量。因此**不能**把 `?` / `#`
+  當作 authority 的終結符；只有真正的 `/` 才是。
+
+  `https://ho?t`、`http?://host/x`、`https://host?q=1` 三者皆 `ask`；
+  `https://host/p?q=1` 才 allow。
 
   這保證 `resolveUrl` 檢查的 scheme 與 host **完全落在字面前綴內**，展開結果不可能換到別的主機。
 - **`gh.ts`**：對 `api` 的 endpoint 操作元，元字元**必須出現在第一個 `/` 之後**；否則 `ask`。
@@ -656,11 +660,15 @@ denylist」「未知全域選項一律 ask」，`ghRule` 改為**旗標 allowlis
 - `curl_test.ts`：允許網域 + `https://host/p?q=1`（未加引號）→ allow；`{}`/`[]` 仍 ask；
   `https://host/a*b` → ask（含 `*`）；`https://ho?t` → ask（authority 護欄）；
   `http?://host/x` → ask（`?` 之後含 `/`）；
+  **`https://host?q=1` → ask**（無路徑段：展開會改變 host，見 §4.2.2）；
   **操作元限縮**：`curl -H Accept:a?b https://host/p` → ask（旗標值不套用寬鬆取值）；
   `curl --max-time 1?0 https://host/p` → ask（同上）。
 - **verdict 不變量測試**（§4.2.5）：對同一 endpoint 逐一列出其所有「把 `?` 換成單一字元」的
   可能展開結果，斷言每一個都得到與原 token **相同的 verdict**；`curl` 同理，並額外斷言多個
   展開結果作為多 URL 傳入時 verdict 不變。
+- **curl verdict 不變量測試**（§4.2.5）：對 `https://host/p?q=1` 列出把 `?` 換成單一字元的
+  展開結果，斷言 verdict 相同；另斷言「多個展開結果同時作為多 URL 傳入」時 verdict 亦不變
+  （所有結果共用同一 scheme+host，故通過同一次網域檢查）。
 - **檔案系統狀態獨立性 fixture 測試**（§4.2.3）：在受測 cwd 底下實際建立可匹配
   `<字面前綴><任一字元><字面後綴>` 的檔案（例如針對 `repos/o/r/tags?per_page=50` 建立
   `repos/o/r/tagsXper_page=50`），斷言判定結果與「該檔案不存在」時**完全相同**，
