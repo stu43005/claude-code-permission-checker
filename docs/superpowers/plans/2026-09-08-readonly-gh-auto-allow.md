@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers-codex:subagent-driven-development to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Stop asking for read-only `gh` CLI research commands by fixing three interdependent false-ask root causes (out-of-project cwd, `?` in an endpoint treated as glob, `grep`/`jq` non-path leading positionals), while tightening several read-only gaps found during spec review.
+**Goal:** Stop asking for read-only `gh` CLI research commands by fixing three interdependent false-ask root causes (out-of-project cwd, `?` in a `gh api` endpoint treated as glob, `grep`/`jq` non-path leading positionals), while closing several read-only gaps found during review.
 
-**Architecture:** Every participating command gets **one** `CommandSpec` that declares each flag once (name, arity, whether the value is a path) plus how its positional operands are classified. A single parser reads that spec, and its result is **memoized per `RuleContext`** so `evaluate` and `cwdIndependent` provably consume the same parse. On top of that, `classify` gains a cwd exemption fenced by five guardrails, and `word.ts` gains a narrowly-scoped relaxed static value used **only** for the `gh api` endpoint and `curl` URL operand.
+**Architecture:** `classify` gains a cwd exemption that skips **only** central preflight rule 1, fenced by five guardrails and opted into per rule. Exactly **seven** commands opt in — `gh`, `head`, `jq`, `grep`, `wc`, `tail`, `sed` — which is every filter the baseline set actually uses; plus `echo`/`pwd`/`whoami`, which take no operands. The four that go through `flagGatedReader` (`grep`, `head`, `wc`, `tail`) get a small `CommandSpec` declaring each flag once, parsed once and memoized per `RuleContext` so `evaluate` and the predicate provably read the same parse. `gh`, `jq`, and `sed` keep hand-written parsers with the same memoization. `gh api`'s endpoint operand gets a narrowly-scoped relaxed static value; `curl` does not.
 
 **Tech Stack:** Deno 2 + TypeScript, `npm:unbash@4.0.1` for Bash AST parsing, `@std/assert` for tests, `deno compile` to a single binary.
 
@@ -14,21 +14,32 @@
 
 ## Conventions for every task
 
-**No document references in source code.** Code comments must be self-contained: explain the
-behavior, never cite `spec §x.y`. Plan prose may cite the spec freely; shipped comments may not.
+**No document references in shipped code.** Code comments explain the behavior; they never cite
+`spec §x.y`. Plan prose may cite the spec freely.
 
-**Test helpers already exist — use them, do not invent new ones:**
+**Use the test helper each file already has — verified signatures:**
 
 | Test file | Existing helper |
 | --- | --- |
-| `src/rules/commands/grep_test.ts` | `ctxOf(name, src)`; assert via `grepRule.evaluate(ctxOf(...)).kind` |
-| `src/rules/commands/gh_test.ts` | `ctxOf(src)` + `v(src)` |
-| `src/rules/commands/curl_test.ts` | `ctxOf(src)`; the fixture's allowed domain is **`api.example.com`**, not `example.com` |
-| `src/rules/commands/coreutils_test.ts` | explicit `<rule>.evaluate(ctxOf(name, src))` calls — no `v` |
+| `src/rules/commands/grep_test.ts` | `ctxOf(name, src)`; assert `grepRule.evaluate(ctxOf(...)).kind` |
+| `src/rules/commands/coreutils_test.ts` | `ctxOf(src, cwd?)` — **one** command string, optional cwd |
 | `src/rules/commands/simple-flag_test.ts` | `v(rule, name, src)` |
-| `src/engine/classify_test.ts` | `only(src)`, `onlyWith(src, rules)`, `rulesOf({...})` |
+| `src/rules/commands/gh_test.ts` | `ctxOf(src)` + `v(src)` |
+| `src/rules/commands/curl_test.ts` | `ctxOf(src)`; the fixture's allowed domain is **`api.example.com`** |
+| `src/engine/classify_test.ts` | `only(src)`, `onlyWith(src, rules)`, `rulesOf({...})`; already imports `walk` |
 
-When a task below shows a test that needs a helper the file lacks, the task defines it explicitly.
+**Verified third-party behavior this plan depends on** (each confirmed by running the tool locally):
+
+| Fact | Evidence |
+| --- | --- |
+| `jq -f/--from-file` is a **boolean**; the program file is the **first positional**, regardless of flag position | `jq prog.jq -f data.json` → `1` (program `prog.jq` = `.a`, input `data.json` = `{"a":1}`). Had `-f` consumed `data.json`, the input would be the non-JSON `prog.jq` and jq would error. |
+| `jq -L` accepts an **attached** value | `jq -Ln '.' data.json` → `{"a":1}`. If `-Ln` were `-L -n` (null input) the output would be `null`. |
+| `grep --color` / `--colour` do **not** consume the next token (optional, attached-only) | `grep --color pat f.txt` prints the match; the pattern is not swallowed. |
+| `head -100` / `tail -200` numeric shorthand is valid | Both run and print. |
+| `gh api`'s HTTP method comes from flags only (`GET` default, `POST` when parameters are added, `--method` overrides) — never from the endpoint | `gh api --help`, gh 2.93.0 |
+| `gh api` fills `{owner}` / `{repo}` / `{branch}` from the repository of the current directory | `gh api --help`, gh 2.93.0 |
+| `dangerousRoot` denies only a filesystem root or the home root | built binary: `cd /tmp && find . -name x` → **ask**; `cd /d && find . -name x` and `cd /tmp && find / -name x` → **deny** |
+| `resolveUrl` compares **path prefixes** for 38 preapproved entries, not just the host | `permissions/domain_scope.ts`: `matchesPreapproved(host, pathname)` |
 
 ---
 
@@ -38,34 +49,82 @@ When a task below shows a test that needs a helper the file lacks, the task defi
 
 | File | Responsibility |
 | --- | --- |
-| `src/rules/command_spec.ts` | The single per-command flag/positional description and its one parser (`parseArgv`), memoized per `RuleContext` |
-| `src/rules/command_spec_test.ts` | Tests for the parser |
-| `src/rules/commands/jq.ts` | `jq` rule: filter is not a path; flag allowlist; path-valued flag values scope-checked |
+| `src/rules/command_spec.ts` | `CommandSpec` (each flag declared once) + `parseArgv`, memoized per `RuleContext`. Four commands use it: `grep`/`egrep`/`fgrep`, `head`, `wc`, `tail` |
+| `src/rules/command_spec_test.ts` | Parser tests |
+| `src/rules/commands/jq.ts` | `jq` rule: filter is not a path; `-f` is boolean; `-L` takes an attached value |
 | `src/rules/commands/jq_test.ts` | Tests for the above |
 
 **Modify:** `src/engine/word.ts`, `src/types.ts`, `src/engine/cwd.ts`, `src/engine/scope.ts`,
 `src/engine/classify.ts`, `src/engine/evaluate.ts`, `src/rules/types.ts`, `src/rules/factory.ts`,
-`src/rules/commands/{grep,coreutils,simple-flag,positional-output,tail,sed,awk,gh,curl}.ts`,
-`src/rules/allowlist.ts`, `src/engine/{cwd,walk,classify}_test.ts`, `CLAUDE.md`.
+`src/rules/commands/{grep,coreutils,simple-flag,tail,sed,gh}.ts`, `src/rules/allowlist.ts`,
+`src/engine/{cwd,walk,classify}_test.ts`, `CLAUDE.md`.
+
+**Deliberately untouched:** `src/rules/commands/{awk,positional-output,curl,find,deno,git}.ts`.
+`awk`, `uniq`, `xxd`, `yq`, `sort`'s exemption, `diff`, `tree`, `file`, `date`, `curl`'s value
+parsing — none of them opt in, so none of their flag grammars need modelling.
 
 ---
 
-### Task 1: `word.ts` — glob metachar index + relaxed operand value
+### Task 1: declare the two optional predicates on `CommandRule`
+
+**Files:**
+- Modify: `src/rules/types.ts`
+
+This lands **first** so every later task's focused `deno test` type-checks. It is a pure type
+addition — both properties are optional, so no existing rule changes.
+
+- [ ] **Step 1: Add the declarations**
+
+```ts
+export interface CommandRule {
+  /** 此規則涵蓋的指令名（含別名）。 */
+  names: string[];
+  evaluate(ctx: RuleContext): RuleVerdict;
+  /**
+   * 此次呼叫的安全判定是否與 cwd 無關，需同時滿足：
+   *  (a) 不以 cwd 相對路徑讀取檔案；
+   *  (b) 不隱含以 cwd 為操作對象（如 ls / find 無操作元時作用於 cwd）；
+   *  (c) 安全判定所依據的資訊不取決於 shell 對 cwd 的 glob 展開結果。
+   * (c) 是「判定不依賴展開結果」，不是「不含 glob 元字元」。
+   * 未宣告 = 否（default-deny）。必須為純函式、不得有副作用。
+   */
+  cwdIndependent?(ctx: RuleContext): boolean;
+  /**
+   * 此次呼叫是否僅含一種非靜態 token：本工具的判定完全不讀其內容的操作元
+   * （目前只有 gh api 的 endpoint）。其餘 token 必須皆為靜態。必須為純函式。
+   */
+  toleratesNonStaticOperand?(ctx: RuleContext): boolean;
+}
+```
+
+- [ ] **Step 2: Verify nothing broke**
+
+Run: `deno task check && deno task lint && deno task test`
+Expected: all green — optional properties on an interface break no existing implementation.
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add src/rules/types.ts
+git commit -m "feat(rules): declare optional cwdIndependent / toleratesNonStaticOperand predicates"
+```
+
+---
+
+### Task 2: `word.ts` — glob metachar index + relaxed operand value
 
 **Files:**
 - Modify: `src/engine/word.ts`
 - Test: `src/engine/word_test.ts`
 
-**Backslash decision (resolves the spec's two statements):** `staticValue` already performs bash
-quote removal on unquoted words, so unquoted `a\b` yields `"ab"` — it is *static*, and
-`nonPathStaticValue` returns it unchanged via the early return. The spec's §7.1 line listing
-`a\b → null` describes the *relaxed branch only* (a word that was not already static). Since a word
-containing a backslash is never rejected by `staticValue` in the first place, the relaxed branch is
-never reached for it. Both statements hold; the tests below assert the actual behavior.
+**Backslash behavior (resolves the spec's two statements):** `staticValue` already applies bash
+quote removal to unquoted words, so `a\b` is *static* and returns `"ab"` through
+`nonPathStaticValue`'s early return. The relaxed branch is therefore never reached for a
+backslash-bearing unquoted word; both spec statements hold. The tests assert the real behavior.
 
 - [ ] **Step 1: Write the failing tests**
 
-Append to `src/engine/word_test.ts` (the file already imports `assertEquals`, `parse`, and `Command`):
+Append to `src/engine/word_test.ts` (it already imports `assertEquals`, `parse`, `Command`):
 
 ```ts
 import { firstGlobMetacharIndex, nonPathStaticValue } from "./word.ts";
@@ -85,15 +144,16 @@ Deno.test("firstGlobMetacharIndex finds the first unescaped metachar", () => {
 });
 
 Deno.test("nonPathStaticValue tolerates a single-? query string", () => {
-  assertEquals(nonPathStaticValue(wordOf("repos/o/r/tags?per_page=50")), "repos/o/r/tags?per_page=50");
-  assertEquals(nonPathStaticValue(wordOf("https://h/p?q=1")), "https://h/p?q=1");
+  assertEquals(
+    nonPathStaticValue(wordOf("repos/o/r/tags?per_page=50")),
+    "repos/o/r/tags?per_page=50",
+  );
 });
 
 Deno.test("nonPathStaticValue passes already-static words straight through", () => {
   assertEquals(nonPathStaticValue(wordOf("plain/endpoint")), "plain/endpoint");
   assertEquals(nonPathStaticValue(wordOf("'a?b/c'")), "a?b/c");
   assertEquals(nonPathStaticValue(wordOf('"a*b"')), "a*b");
-  // 未加引號的反斜線由 staticValue 做 quote removal，屬「已靜態」路徑，不進寬鬆分支
   assertEquals(nonPathStaticValue(wordOf("a\\b")), "ab");
 });
 
@@ -105,22 +165,13 @@ Deno.test("nonPathStaticValue rejects everything outside the tolerated shape", (
   assertEquals(nonPathStaticValue(wordOf("a?b/c")), null);
   assertEquals(nonPathStaticValue(wordOf("$X")), null);
   assertEquals(nonPathStaticValue(wordOf("$(x)")), null);
-  assertEquals(nonPathStaticValue(wordOf("a\\?b?c")), null); // 跳脫的 ? 不算，但仍有第二個 ?…此為 -> 單一 ?：見下
-});
-
-Deno.test("nonPathStaticValue handles an escaped metachar plus a real query ?", () => {
-  // `a\?b?c`：`\?` 被 quote removal 變成字面 `?`，整個 word 因含反斜線而由 staticValue 處理
-  assertEquals(nonPathStaticValue(wordOf("a\\?b?c")), null);
 });
 ```
-
-Remove the last assertion of the fourth test (the one with the trailing comment) — the fifth test
-covers that case explicitly. The fourth test's remaining seven assertions stand.
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
 Run: `deno test --allow-env src/engine/word_test.ts`
-Expected: FAIL — `firstGlobMetacharIndex` / `nonPathStaticValue` are not exported.
+Expected: FAIL — neither function is exported.
 
 - [ ] **Step 3: Implement in `src/engine/word.ts`**
 
@@ -142,7 +193,7 @@ export function firstGlobMetacharIndex(value: string): number {
  *  1. 未跳脫的 glob 元字元恰好一個，且該字元是 `?`（`*` / `[` 一律不容忍）；
  *  2. 該 `?` 不在索引 0 —— 字面前綴非空，故展開結果不可能以 `-` 開頭、不會變成旗標；
  *  3. 該 `?` 之後的子字串不含 `/` —— 等價於「`?` 位於最後一個 `/` 之後」，
- *     故所有前段路徑（URL 的 scheme://host、endpoint 的前段）皆落在字面前綴內。
+ *     故所有前段路徑都落在字面前綴內。
  */
 function isSingleQueryGlob(value: string): boolean {
   const first = firstGlobMetacharIndex(value);
@@ -154,13 +205,13 @@ function isSingleQueryGlob(value: string): boolean {
 }
 
 /**
- * 非路徑操作元（gh api 的 endpoint、curl 的 URL）的靜態取值。
+ * 「本工具的判定完全不讀其內容」的操作元專用靜態取值。
  * 與 staticValue 的唯一差異：未加引號、且符合「單一 `?` 查詢串」形態的 token
  * 不再視為動態。`*` / `[` / 多重元字元 / `?` 後含 `/` 一律回 null。
  *
- * **只可用於「本工具的判定不讀其內容」的操作元**：gh api 的判定只看旗標，
- * curl 的判定只看 scheme 與 host（兩者皆由上述條件保證落在字面前綴內）。
- * 路徑、旗標、旗標值一律不得使用本函式。
+ * **目前唯一合法用途是 `gh api` 的 endpoint 操作元**——gh api 的判定只掃描旗標、
+ * 完全不讀 endpoint 路徑，故展開結果不影響判定。路徑、旗標、旗標值，以及 curl 的
+ * 任何 token（其判定會比對 preapproved 的 path 前綴）一律不得使用本函式。
  */
 export function nonPathStaticValue(word: Word): string | null {
   const strict = staticValue(word);
@@ -182,17 +233,12 @@ export function nonPathStaticValue(word: Word): string | null {
 }
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [ ] **Step 4: Run the tests, type check and lint**
 
-Run: `deno test --allow-env src/engine/word_test.ts`
-Expected: PASS.
+Run: `deno test --allow-env src/engine/word_test.ts && deno task check && deno task lint`
+Expected: PASS / no errors.
 
-- [ ] **Step 5: Type check and lint**
-
-Run: `deno task check && deno task lint`
-Expected: no errors.
-
-- [ ] **Step 6: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
 git add src/engine/word.ts src/engine/word_test.ts
@@ -201,14 +247,11 @@ git commit -m "feat(engine): add firstGlobMetacharIndex + nonPathStaticValue"
 
 ---
 
-### Task 2: `CwdState.origin` — mark chain-derived cwd (and fix the assertions it breaks)
+### Task 3: `CwdState.origin` — mark chain-derived cwd (and fix the eight assertions it breaks)
 
 **Files:**
 - Modify: `src/types.ts:6-8`, `src/engine/cwd.ts:13-18`
 - Test: `src/engine/cwd_test.ts`, `src/engine/walk_test.ts`
-
-Stamping `origin` changes seven existing whole-object `assertEquals` results. They are updated
-here, in the same task, so the suite stays green.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -224,7 +267,7 @@ Deno.test("in-chain cd stamps origin chain-cd; session cwd does not", () => {
 });
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [ ] **Step 2: Run it to verify it fails**
 
 Run: `deno test --allow-env src/engine/walk_test.ts`
 Expected: FAIL — `cat.cwd` has no `origin`.
@@ -258,29 +301,31 @@ function applyPath(cwd: CwdState, value: string): CwdState {
 }
 ```
 
-- [ ] **Step 5: Update the seven assertions this breaks**
+- [ ] **Step 5: Update the eight assertions this breaks**
 
-In `src/engine/cwd_test.ts`, add `origin: "chain-cd"` to these expected objects:
+`src/engine/cwd_test.ts` — add `origin: "chain-cd"` to the expected object on each line:
 
-| Line | Change |
+| Line | New expected object |
 | --- | --- |
-| 17 | `assertEquals(next, { kind: "known", path: "/proj/src", origin: "chain-cd" });` |
-| 22 | `assertEquals(next, { kind: "known", path: "/tmp", origin: "chain-cd" });` |
-| 35 | `assertEquals(c, { kind: "known", path: "/proj/sub", origin: "chain-cd" });` |
-| 43 | `assertEquals(c, { kind: "known", path: "/proj/sub/wt", origin: "chain-cd" });` |
-| 51 | `assertEquals(c, { kind: "known", path: "/outside", origin: "chain-cd" });` |
-| 57 | `{ kind: "known", path: "/outside/.git", origin: "chain-cd" },` |
+| 17 | `{ kind: "known", path: "/proj/src", origin: "chain-cd" }` |
+| 22 | `{ kind: "known", path: "/tmp", origin: "chain-cd" }` |
+| 35 | `{ kind: "known", path: "/proj/sub", origin: "chain-cd" }` |
+| 43 | `{ kind: "known", path: "/proj/sub/wt", origin: "chain-cd" }` |
+| 51 | `{ kind: "known", path: "/outside", origin: "chain-cd" }` |
+| 57 | `{ kind: "known", path: "/outside/.git", origin: "chain-cd" }` |
 
 Lines 26, 30, 63 (`{ kind: "unknown" }`) and line 71 (`git status` with no path option returns the
-cwd unchanged, so no `origin`) stay as they are.
+cwd object unchanged, so no `origin`) stay as they are.
 
-In `src/engine/walk_test.ts`, line 28:
+`src/engine/walk_test.ts`:
 
-```ts
-  assertEquals(cat.cwd, { kind: "known", path: "/proj/src", origin: "chain-cd" });
-```
+| Line | New expected object |
+| --- | --- |
+| 28 | `{ kind: "known", path: "/proj/src", origin: "chain-cd" }` |
+| 45 | `{ kind: "known", path: "/proj/sub", origin: "chain-cd" }` — inside `"git -C sets per-command cwd without leaking"`, this is the `git` leaf's cwd, which `gitEffectiveCwd` derives via `applyPath` |
 
-Line 34 (`{ kind: "known", path: "/proj" }` — cwd unchanged inside a subshell) stays as it is.
+Line 34, and the `cat.cwd` assertion that follows line 45, stay unchanged — those are cwd values
+that were never passed through `applyPath`.
 
 - [ ] **Step 6: Run the full suite, type check and lint**
 
@@ -296,48 +341,45 @@ git commit -m "feat(engine): mark chain-derived cwd with origin: chain-cd"
 
 ---
 
-### Task 3: `buildScopeConfig` — one ScopeConfig construction shared by evaluate and classify
+### Task 4: `buildScopeConfig` — one ScopeConfig construction shared by evaluate and classify
 
 **Files:**
-- Modify: `src/engine/scope.ts` (append after the `ScopeConfig` interface, ~line 160), `src/engine/classify.ts:56-70`
+- Modify: `src/engine/scope.ts` (append after the `ScopeConfig` interface), `src/engine/classify.ts`
 - Test: `src/engine/scope_test.ts`
 
 - [ ] **Step 1: Write the failing test**
 
-Append to `src/engine/scope_test.ts`:
+Append to `src/engine/scope_test.ts`. `ReadScope` is `{ roots: string[]; files: string[] }`
+(verified in `src/permissions/path_scope.ts:4-9`), so build three distinct scopes as literals —
+do **not** call `parsePathRule`, whose real signature is
+`parsePathRule(rule: string, home: string | null): PathScopeEntry | null`:
 
 ```ts
 import { buildScopeConfig } from "./scope.ts";
 import type { PermissionRules } from "../permissions/settings.ts";
-import { EMPTY_READ_SCOPE, parsePathRule, type ReadScope } from "../permissions/path_scope.ts";
 import { EMPTY_DOMAIN_SCOPE } from "../permissions/domain_scope.ts";
 
 Deno.test("buildScopeConfig maps allow/deny/ask to distinct fields", () => {
-  const scopeOf = (rule: string): ReadScope => {
-    const s = { ...EMPTY_READ_SCOPE };
-    parsePathRule(rule, s);
-    return s;
-  };
   const rules: PermissionRules = {
     bash: { allow: [], deny: [], ask: [] },
-    readScope: { allow: scopeOf("Read(//a/**)"), deny: scopeOf("Read(//d/**)"), ask: scopeOf("Read(//k/**)") },
+    readScope: {
+      allow: { roots: ["/allowed"], files: [] },
+      deny: { roots: ["/denied"], files: [] },
+      ask: { roots: ["/asked"], files: [] },
+    },
     webFetch: { allow: EMPTY_DOMAIN_SCOPE, deny: EMPTY_DOMAIN_SCOPE, ask: EMPTY_DOMAIN_SCOPE },
   };
   const scope = buildScopeConfig("/proj", rules, "/home/u", ["/trusted"]);
   assertEquals(scope.root, "/proj");
   assertEquals(scope.home, "/home/u");
   assertEquals(scope.trusted, ["/trusted"]);
-  assertEquals(scope.allow, rules.readScope.allow);
-  assertEquals(scope.deny, rules.readScope.deny);
-  assertEquals(scope.ask, rules.readScope.ask);
+  assertEquals(scope.allow.roots, ["/allowed"]);
+  assertEquals(scope.deny.roots, ["/denied"]);
+  assertEquals(scope.ask.roots, ["/asked"]);
 });
 ```
 
-If `parsePathRule`'s signature differs, adapt the three scopes to whatever the existing
-`path_scope_test.ts` uses — the point is that all three are **distinct and non-empty**, so a
-swapped mapping fails the test.
-
-- [ ] **Step 2: Run the test to verify it fails**
+- [ ] **Step 2: Run it to verify it fails**
 
 Run: `deno test --allow-env src/engine/scope_test.ts`
 Expected: FAIL — `buildScopeConfig` is not exported.
@@ -377,7 +419,12 @@ import type { PermissionRules } from "../permissions/settings.ts";
 
 - [ ] **Step 4: Use it in `src/engine/classify.ts`**
 
-Replace the inline `scope` construction with `const scope: ScopeConfig = buildScopeConfig(root, rules, home, trustedReadRoots);`
+Replace the inline `scope` construction inside `classify` with:
+
+```ts
+  const scope: ScopeConfig = buildScopeConfig(root, rules, home, trustedReadRoots);
+```
+
 and add `buildScopeConfig` to the existing `./scope.ts` import list.
 
 - [ ] **Step 5: Run tests, type check and lint**
@@ -394,15 +441,145 @@ git commit -m "refactor(engine): extract buildScopeConfig shared by evaluate and
 
 ---
 
-### Task 4: `command_spec.ts` — one flag table per command, one memoized parse
+### Task 5: close the existing unchecked path-value gaps
+
+**Files:**
+- Modify: `src/rules/commands/coreutils.ts` (`fileReaderRule`, `diffRule`), `src/rules/commands/simple-flag.ts` (`sortRule`)
+- Test: `src/rules/commands/coreutils_test.ts`, `src/rules/commands/simple-flag_test.ts`
+
+These flags read a file but their values were never scope-checked. This is a standalone security
+fix using the **existing** `flagGatedReader` options — independent of the exemption work.
+
+Verified from `--help`: `wc --files0-from=F`, `sort --files0-from=F`, `grep --exclude-from=FILE`,
+`diff -X/--exclude-from=FILE` and `-S/--starting-file=FILE`, `realpath --relative-to=DIR` and
+`--relative-base=DIR`.
+
+**Deliberately excluded:** `file -m/-f` and `date -r/-f`. Spec §2.2 and §8.3 explicitly keep those
+existing gaps out of scope for this change; adding them here would alter two rules the plan
+otherwise does not touch.
+
+- [ ] **Step 1: Write the failing tests**
+
+Append to `src/rules/commands/coreutils_test.ts` — its helper is `ctxOf(src, cwd?)`, taking **one**
+command string:
+
+```ts
+Deno.test("wc --files0-from is scope-checked in both forms", () => {
+  assertEquals(fileReaderRule.evaluate(ctxOf("wc --files0-from=list.txt")).kind, "allow");
+  assertEquals(fileReaderRule.evaluate(ctxOf("wc --files0-from=../out/list.txt")).kind, "ask");
+  assertEquals(fileReaderRule.evaluate(ctxOf("wc --files0-from ../out/list.txt")).kind, "ask");
+});
+
+Deno.test("realpath --relative-to / --relative-base are scope-checked", () => {
+  assertEquals(fileReaderRule.evaluate(ctxOf("realpath --relative-to=sub a.txt")).kind, "allow");
+  assertEquals(fileReaderRule.evaluate(ctxOf("realpath --relative-to=../out a.txt")).kind, "ask");
+  assertEquals(fileReaderRule.evaluate(ctxOf("realpath --relative-base=../out a.txt")).kind, "ask");
+});
+
+Deno.test("diff -X / -S are scope-checked in both forms", () => {
+  assertEquals(diffRule.evaluate(ctxOf("diff -X ex.txt a.txt b.txt")).kind, "allow");
+  assertEquals(diffRule.evaluate(ctxOf("diff -X ../out.txt a.txt b.txt")).kind, "ask");
+  assertEquals(diffRule.evaluate(ctxOf("diff -X../out.txt a.txt b.txt")).kind, "ask");
+  assertEquals(diffRule.evaluate(ctxOf("diff --starting-file=../out a.txt b.txt")).kind, "ask");
+});
+```
+
+Append to `src/rules/commands/simple-flag_test.ts` — its helper is `v(rule, name, src)`:
+
+```ts
+Deno.test("sort --files0-from is scope-checked", () => {
+  assertEquals(v(sortRule, "sort", "sort --files0-from=list.txt"), "allow");
+  assertEquals(v(sortRule, "sort", "sort --files0-from=../out/list.txt"), "ask");
+});
+```
+
+- [ ] **Step 2: Run them to verify they fail**
+
+Run: `deno test --allow-env src/rules/commands/coreutils_test.ts src/rules/commands/simple-flag_test.ts`
+Expected: FAIL — the out-of-project variants currently allow, because the values are skipped.
+
+- [ ] **Step 3: Add the flags to `fileReaderRule` in `src/rules/commands/coreutils.ts`**
+
+```ts
+export const fileReaderRule: CommandRule = flagGatedReader({
+  names: [
+    "cat", "head", "wc", "ls", "stat", "cut", "tr", "column",
+    "cmp", "comm", "md5sum", "sha256sum", "hexdump", "nl", "fold",
+    "basename", "dirname", "realpath", "readlink",
+  ],
+  // 這些旗標的值是會被讀取的路徑，過去被當一般 flag 跳過而未檢查：
+  //   wc       --files0-from=F      從 F 讀 NUL 分隔的檔名清單
+  //   realpath --relative-to=DIR / --relative-base=DIR
+  valueFlags: [exact("--files0-from", "--relative-to", "--relative-base")],
+  pathValueFlags: ["--files0-from", "--relative-to", "--relative-base"],
+  // 這些指令無「會寫檔」的 flag；故 askFlags 留空。
+  recursive: (n, a) => n === "ls" && hasAnyFlag(a, [exact("-R", "--recursive")]),
+});
+```
+
+> `jq` is still in this `names` list at this point; Task 8 removes it.
+
+- [ ] **Step 4: Add the flags to `diffRule`**
+
+```ts
+/** diff：位置參數做範圍檢查，且吃路徑值的旗標也需範圍檢查。 */
+export const diffRule: CommandRule = flagGatedReader({
+  names: ["diff"],
+  valueFlags: [exact("--from-file", "--to-file", "-X", "--exclude-from", "-S", "--starting-file")],
+  pathValueFlags: ["--from-file", "--to-file", "-X", "--exclude-from", "-S", "--starting-file"],
+});
+```
+
+- [ ] **Step 5: Add the flag to `sortRule` in `src/rules/commands/simple-flag.ts`**
+
+```ts
+export const sortRule: CommandRule = flagGatedReader({
+  names: ["sort"],
+  askFlags: [
+    exact("-o", "--output", "-T", "--temporary-directory", "--compress-program", "--random-source"),
+    prefix("-o", "--output=", "-T", "--temporary-directory=", "--compress-program=", "--random-source="),
+  ],
+  valueFlags: [exact(
+    "-o", "-T", "-S", "-k", "-t", "--output", "--temporary-directory", "--buffer-size",
+    "--key", "--field-separator", "--files0-from", "--compress-program", "--random-source",
+  )],
+  pathValueFlags: ["--files0-from"],
+  askReason: () =>
+    "sort：-o / -T 會寫檔或指定暫存目錄；--compress-program 會執行外部程式；--random-source 會讀檔",
+});
+```
+
+> `--compress-program` executes an external program and `--random-source` reads a file, so both
+> join `askFlags` rather than being modelled as safe value flags.
+
+- [ ] **Step 6: Run the tests, full suite, type check and lint**
+
+Run: `deno task check && deno task lint && deno task test`
+Expected: all green.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add src/rules/commands/coreutils.ts src/rules/commands/simple-flag.ts src/rules/commands/coreutils_test.ts src/rules/commands/simple-flag_test.ts
+git commit -m "fix(rules): scope-check --files0-from, --relative-to/-base, diff -X/-S; ask on sort's program/random-source flags"
+```
+
+---
+
+### Task 6: `command_spec.ts` — one flag table, one memoized parse
 
 **Files:**
 - Create: `src/rules/command_spec.ts`, `src/rules/command_spec_test.ts`
 
-This is the structural answer to the review's central finding: the old plan described each flag
-twice (once in `valueFlags` for operand classification, once in `knownFlags` for the exemption
-check), and the two descriptions disagreed — `fold -w 80` treated `80` as a path, `grep --color`
-consumed the pattern as a flag value. One table, one parser, one memoized result.
+Only four commands use this: `grep`/`egrep`/`fgrep`, `head`, `wc`, `tail`. The value of declaring
+each flag once is that operand classification and the known-flag check cannot disagree — the
+failure mode where `--color` swallowed grep's pattern.
+
+Two flag forms the four commands genuinely need:
+
+- `"required"` — consumes a value (`-n 10`, `-n10`, `--lines=10`).
+- `"attached-only"` — an **optional** value that is only accepted glued with `=`; a bare
+  `--color` consumes nothing. Verified: `grep --color pat f.txt` matches without swallowing `pat`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -432,90 +609,87 @@ function ctxOf(name: string, src: string): RuleContext {
   };
 }
 
-const FOLD: CommandSpec = {
+const DEMO: CommandSpec = {
   flags: [
-    { name: "-b", takesValue: false, valueIsPath: false },
-    { name: "-s", takesValue: false, valueIsPath: false },
-    { name: "-w", takesValue: true, valueIsPath: false },
-    { name: "--width", takesValue: true, valueIsPath: false },
+    { name: "-b", value: "none" },
+    { name: "-w", value: "required" },
+    { name: "--width", value: "required" },
+    { name: "--color", value: "attached-only" },
+    { name: "--from", value: "required", valueIsPath: true },
   ],
   positionals: "paths",
 };
 
-Deno.test("a non-path flag value is not a path operand", () => {
-  const r = parseArgv(ctxOf("fold", "fold -w 80"), FOLD);
-  assertEquals(r.unknownFlag, null);
-  assertEquals(r.pathOperands.length, 0);
-  assertEquals(r.pathValues.length, 0);
+Deno.test("a required value is consumed in all three forms", () => {
+  assertEquals(parseArgv(ctxOf("demo", "demo -w 80 a.txt"), DEMO).pathOperands.length, 1);
+  assertEquals(parseArgv(ctxOf("demo", "demo -w80 a.txt"), DEMO).pathOperands.length, 1);
+  assertEquals(parseArgv(ctxOf("demo", "demo --width=80 a.txt"), DEMO).pathOperands.length, 1);
+  assertEquals(parseArgv(ctxOf("demo", "demo --width 80 a.txt"), DEMO).pathOperands.length, 1);
 });
 
-Deno.test("attached and separated forms both consume the value", () => {
-  assertEquals(parseArgv(ctxOf("fold", "fold -w80 a.txt"), FOLD).pathOperands.length, 1);
-  assertEquals(parseArgv(ctxOf("fold", "fold --width=80 a.txt"), FOLD).pathOperands.length, 1);
-  assertEquals(parseArgv(ctxOf("fold", "fold --width 80 a.txt"), FOLD).pathOperands.length, 1);
+Deno.test("attached-only accepts =value and consumes nothing when bare", () => {
+  const bare = parseArgv(ctxOf("demo", "demo --color pat a.txt"), DEMO);
+  assertEquals(bare.unknownFlag, null);
+  assertEquals(bare.pathOperands.map((w) => w.value), ["pat", "a.txt"]);
+  const glued = parseArgv(ctxOf("demo", "demo --color=auto a.txt"), DEMO);
+  assertEquals(glued.unknownFlag, null);
+  assertEquals(glued.pathOperands.map((w) => w.value), ["a.txt"]);
 });
 
 Deno.test("an unknown flag is reported, never silently skipped", () => {
-  assertEquals(parseArgv(ctxOf("fold", "fold --nope"), FOLD).unknownFlag, "--nope");
-  assertEquals(parseArgv(ctxOf("fold", "fold -1unknown"), FOLD).unknownFlag, "-1");
-  assertEquals(parseArgv(ctxOf("fold", "fold -bZ"), FOLD).unknownFlag, "-Z"); // 群集內未知字母
+  assertEquals(parseArgv(ctxOf("demo", "demo --nope"), DEMO).unknownFlag, "--nope");
+  assertEquals(parseArgv(ctxOf("demo", "demo -bZ"), DEMO).unknownFlag, "-Z");
+  assertEquals(parseArgv(ctxOf("demo", "demo -b=1"), DEMO).unknownFlag, "-b");
 });
 
-Deno.test("numericShorthand is opt-in per command and must be the whole token", () => {
+Deno.test("numericShorthand is opt-in and must be the entire token", () => {
   const HEAD: CommandSpec = {
-    flags: [{ name: "-n", takesValue: true, valueIsPath: false }],
+    flags: [{ name: "-n", value: "required" }],
     positionals: "paths",
     numericShorthand: true,
   };
   assertEquals(parseArgv(ctxOf("head", "head -100"), HEAD).unknownFlag, null);
   assertEquals(parseArgv(ctxOf("head", "head -100x"), HEAD).unknownFlag, "-100x");
-  assertEquals(parseArgv(ctxOf("fold", "fold -100"), FOLD).unknownFlag, "-100");
-});
-
-Deno.test("positionals: none means no positional is a path", () => {
-  const TR: CommandSpec = { flags: [{ name: "-d", takesValue: false, valueIsPath: false }], positionals: "none" };
-  assertEquals(parseArgv(ctxOf("tr", "tr a b"), TR).pathOperands.length, 0);
+  assertEquals(parseArgv(ctxOf("demo", "demo -100"), DEMO).unknownFlag, "-100");
 });
 
 Deno.test("positionals: pattern-then-paths drops only the first", () => {
-  const GREP: CommandSpec = {
-    flags: [{ name: "-E", takesValue: false, valueIsPath: false }],
-    positionals: "pattern-then-paths",
-  };
+  const GREP: CommandSpec = { flags: [{ name: "-E", value: "none" }], positionals: "pattern-then-paths" };
   const r = parseArgv(ctxOf("grep", "grep -E pat a.txt b.txt"), GREP);
   assertEquals(r.pathOperands.map((w) => w.value), ["a.txt", "b.txt"]);
+  assertEquals(r.nonPathOperands.map((w) => w.value), ["pat"]);
 });
 
-Deno.test("a path-valued flag records its value", () => {
-  const WC: CommandSpec = {
-    flags: [{ name: "--files0-from", takesValue: true, valueIsPath: true }],
-    positionals: "paths",
-  };
-  assertEquals(parseArgv(ctxOf("wc", "wc --files0-from=list"), WC).pathValues, ["list"]);
-  assertEquals(parseArgv(ctxOf("wc", "wc --files0-from list"), WC).pathValues, ["list"]);
+Deno.test("a path-valued flag records its value in both forms", () => {
+  assertEquals(parseArgv(ctxOf("demo", "demo --from=list"), DEMO).pathValues, ["list"]);
+  assertEquals(parseArgv(ctxOf("demo", "demo --from list"), DEMO).pathValues, ["list"]);
 });
 
 Deno.test("any dynamic token makes the whole parse dynamic", () => {
-  assertEquals(parseArgv(ctxOf("fold", "fold -w $N"), FOLD).dynamic, true);
-  assertEquals(parseArgv(ctxOf("fold", "fold $F"), FOLD).dynamic, true);
+  assertEquals(parseArgv(ctxOf("demo", "demo -w $N"), DEMO).dynamic, true);
+  assertEquals(parseArgv(ctxOf("demo", "demo $F"), DEMO).dynamic, true);
 });
 
 Deno.test("-- terminates option parsing", () => {
-  const r = parseArgv(ctxOf("fold", "fold -- -w"), FOLD);
+  const r = parseArgv(ctxOf("demo", "demo -- -w"), DEMO);
   assertEquals(r.unknownFlag, null);
   assertEquals(r.pathOperands.map((w) => w.value), ["-w"]);
 });
 
+Deno.test("a missing required value is reported, not silently accepted", () => {
+  assertEquals(parseArgv(ctxOf("demo", "demo -w"), DEMO).unknownFlag, "-w");
+});
+
 Deno.test("parseArgv memoizes per RuleContext so both consumers share one result", () => {
-  const ctx = ctxOf("fold", "fold -w 80 a.txt");
-  assertEquals(parseArgv(ctx, FOLD) === parseArgv(ctx, FOLD), true);
+  const ctx = ctxOf("demo", "demo -w 80 a.txt");
+  assertEquals(parseArgv(ctx, DEMO) === parseArgv(ctx, DEMO), true);
 });
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [ ] **Step 2: Run them to verify they fail**
 
 Run: `deno test --allow-env src/rules/command_spec_test.ts`
-Expected: FAIL — module `./command_spec.ts` not found.
+Expected: FAIL — module not found.
 
 - [ ] **Step 3: Create `src/rules/command_spec.ts`**
 
@@ -524,44 +698,51 @@ import type { Word } from "../deps.ts";
 import type { RuleContext } from "./types.ts";
 import { staticValue } from "../engine/word.ts";
 
+/**
+ * 旗標吃值的方式：
+ *  - "none"：不吃值；帶 `=value` 視為未知形式（保守）。
+ *  - "required"：一定吃一個值。支援 `--opt value` / `--opt=value` / `-xvalue`。
+ *  - "attached-only"：值為選填，且**只接受黏在 `=` 後面**；裸寫時不吃下一個 token
+ *    （GNU grep 的 `--color` 即此形態：`grep --color pat f.txt` 不會吃掉 pat）。
+ */
+export type FlagValueKind = "none" | "required" | "attached-only";
+
 /** 單一旗標的完整描述：一個旗標只在此描述一次。 */
 export interface FlagSpec {
   /** 旗標 token（`-x` 或 `--long`）。短旗標與長旗標各自列一筆。 */
   name: string;
-  /** 是否吃一個值（`--opt value` / `--opt=value` / `-xvalue` 三種寫法皆處理）。 */
-  takesValue: boolean;
-  /** 該值是否為會被讀取的路徑（需做範圍檢查）。takesValue 為 false 時忽略。 */
-  valueIsPath: boolean;
+  value: FlagValueKind;
+  /** 該值是否為會被讀取的路徑（需做範圍檢查）。僅對 "required" 有意義。 */
+  valueIsPath?: boolean;
 }
 
 /**
- * 位置參數的語義：
- *  - "paths"：全部是會被讀取的檔案路徑（cat / head / wc …）。
- *  - "none"：都不是路徑（tr 的 SET1/SET2、echo 的字串）。
- *  - "pattern-then-paths"：第一個是 pattern（不是路徑），其餘是路徑（grep）。
+ * 位置參數語義：
+ *  - "paths"：全部是會被讀取的檔案路徑。
+ *  - "pattern-then-paths"：第一個是 pattern（不是路徑），其餘是路徑。
  */
-export type PositionalKind = "paths" | "none" | "pattern-then-paths";
+export type PositionalKind = "paths" | "pattern-then-paths";
 
 export interface CommandSpec {
   flags: FlagSpec[];
   positionals: PositionalKind;
   /**
    * 是否支援 legacy 數字短旗標（head -100 / tail -200）。
-   * 僅在明確開啟時才接受，且整個 token 必須是 `-` 加數字；`-100x` 一律視為未知旗標。
+   * 僅在明確開啟時接受，且**整個 token** 必須是 `-` 加數字；`-100x` 視為未知旗標。
    */
   numericShorthand?: boolean;
-  /** 此次呼叫是否遞迴遍歷（由規則提供；用於危險根偵測與 cwd 豁免排除）。 */
+  /** 此次呼叫是否遞迴遍歷（用於危險根偵測與 cwd 豁免排除）。 */
   recursive?: (name: string, argv: Word[]) => boolean;
 }
 
 export interface ArgvParse {
-  /** 需做 resolvePath 的位置參數（已依 positionals 語義扣除非路徑者）。 */
+  /** 需做 resolvePath 的位置參數。 */
   pathOperands: Word[];
-  /** 非路徑的位置參數（pattern、SET1/SET2 等），供規則自行運用。 */
+  /** 非路徑的位置參數（pattern 等）。 */
   nonPathOperands: Word[];
-  /** 吃路徑值的旗標所帶的值（字串），需做 resolvePathValue。 */
+  /** 吃路徑值的旗標所帶的值，需做 resolvePathValue。 */
   pathValues: string[];
-  /** 第一個未列入 spec 的旗標 token；全部已知時為 null。 */
+  /** 第一個未列入 spec、或形式不符的旗標 token；全部正常時為 null。 */
   unknownFlag: string | null;
   /** argv 中是否有任何非靜態 token。 */
   dynamic: boolean;
@@ -571,8 +752,7 @@ export interface ArgvParse {
 
 /**
  * 每個 RuleContext 只解析一次。classify 對單一葉指令只建構一個 RuleContext，
- * 並把同一個物件傳給 evaluate 與 cwdIndependent，故兩者拿到的是**同一份**解析結果，
- * 不是各自重跑一次的兩份結果。
+ * 並把同一個物件傳給 evaluate 與 cwdIndependent，故兩者拿到的是**同一份**解析結果。
  */
 const CACHE = new WeakMap<RuleContext, ArgvParse>();
 
@@ -584,11 +764,8 @@ export function parseArgv(ctx: RuleContext, spec: CommandSpec): ArgvParse {
   return result;
 }
 
-function findFlag(spec: CommandSpec, name: string): FlagSpec | undefined {
-  return spec.flags.find((f) => f.name === name);
-}
-
 function doParse(ctx: RuleContext, spec: CommandSpec): ArgvParse {
+  const find = (name: string) => spec.flags.find((f) => f.name === name);
   const argv = ctx.argv;
   const positional: Word[] = [];
   const pathValues: string[] = [];
@@ -600,19 +777,17 @@ function doParse(ctx: RuleContext, spec: CommandSpec): ArgvParse {
     const t = staticValue(argv[i]);
     if (t === null) { dynamic = true; continue; }
 
-    if (optionsDone || !t.startsWith("-") || t === "-") {
-      positional.push(argv[i]);
-      continue;
-    }
+    if (optionsDone || !t.startsWith("-") || t === "-") { positional.push(argv[i]); continue; }
     if (t === "--") { optionsDone = true; continue; }
 
     if (t.startsWith("--")) {
       const eq = t.indexOf("=");
       const name = eq === -1 ? t : t.slice(0, eq);
       const inline = eq === -1 ? null : t.slice(eq + 1);
-      const f = findFlag(spec, name);
+      const f = find(name);
       if (!f) { unknownFlag ??= name; continue; }
-      if (!f.takesValue) { if (inline !== null) unknownFlag ??= name; continue; }
+      if (f.value === "none") { if (inline !== null) unknownFlag ??= name; continue; }
+      if (f.value === "attached-only") { continue; } // 裸寫不吃值；=value 已含在同 token
       let value = inline;
       if (value === null) {
         i++;
@@ -624,16 +799,21 @@ function doParse(ctx: RuleContext, spec: CommandSpec): ArgvParse {
       continue;
     }
 
-    // legacy 數字短旗標：整個 token 必須是 `-` 加數字才接受
+    // legacy 數字短旗標：整個 token 必須是 `-` 加數字
     if (spec.numericShorthand && /^-[0-9]+$/.test(t)) continue;
 
-    // 短旗標群集：逐字母比對；吃值字母吃掉同 token 剩餘字元，剩餘為空則吃下一 token
+    // 短旗標群集：逐字母；吃值字母吃掉同 token 剩餘字元，剩餘為空則吃下一 token
     let ate = false;
     for (let k = 1; k < t.length; k++) {
       const short = `-${t[k]}`;
-      const f = findFlag(spec, short);
+      const f = find(short);
       if (!f) { unknownFlag ??= short; ate = true; break; }
-      if (!f.takesValue) continue;
+      if (f.value === "none") {
+        // `-b=1` 這種形式不合法，保守視為未知
+        if (t[k + 1] === "=") { unknownFlag ??= short; ate = true; break; }
+        continue;
+      }
+      if (f.value === "attached-only") continue; // 短旗標無此形態，容忍但不吃值
       const rest = t.slice(k + 1);
       let value: string | null = rest;
       if (rest === "") {
@@ -649,12 +829,9 @@ function doParse(ctx: RuleContext, spec: CommandSpec): ArgvParse {
     if (ate) continue;
   }
 
-  let pathOperands: Word[] = positional;
+  let pathOperands = positional;
   let nonPathOperands: Word[] = [];
-  if (spec.positionals === "none") {
-    nonPathOperands = positional;
-    pathOperands = [];
-  } else if (spec.positionals === "pattern-then-paths" && positional.length > 0) {
+  if (spec.positionals === "pattern-then-paths" && positional.length > 0) {
     nonPathOperands = positional.slice(0, 1);
     pathOperands = positional.slice(1);
   }
@@ -670,20 +847,12 @@ function doParse(ctx: RuleContext, spec: CommandSpec): ArgvParse {
 }
 ```
 
-Note the `-1unknown` case: `numericShorthand` requires the *entire* token to match `^-[0-9]+$`, so
-`-1unknown` falls through to the cluster scan, where `-1` is not in the table and is reported.
+- [ ] **Step 4: Run the tests, type check and lint**
 
-- [ ] **Step 4: Run the tests to verify they pass**
+Run: `deno test --allow-env src/rules/command_spec_test.ts && deno task check && deno task lint`
+Expected: PASS / no errors. Nothing consumes `CommandSpec` yet, so the full suite is unaffected.
 
-Run: `deno test --allow-env src/rules/command_spec_test.ts`
-Expected: PASS.
-
-- [ ] **Step 5: Type check and lint**
-
-Run: `deno task check && deno task lint`
-Expected: no errors.
-
-- [ ] **Step 6: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
 git add src/rules/command_spec.ts src/rules/command_spec_test.ts
@@ -692,203 +861,26 @@ git commit -m "feat(rules): add CommandSpec + memoized single-parse parseArgv"
 
 ---
 
-### Task 5: rewire `flagGatedReader` onto `CommandSpec`
+### Task 7: `grep` — PATTERN is not a path, on top of `CommandSpec`
 
 **Files:**
-- Modify: `src/rules/factory.ts`
-- Test: `src/rules/factory_test.ts` (create)
-
-`flagGatedReader` keeps its existing `askFlags` / `recursive` / `askReason` behavior, but its
-operand and flag-value classification now comes from `parseArgv`. A rule that supplies a `specs`
-table gets the exemption predicate for free; a rule that does not keeps today's behavior exactly.
-
-- [ ] **Step 1: Write the failing test**
-
-Create `src/rules/factory_test.ts`:
-
-```ts
-import { assertEquals } from "@std/assert";
-import { parse } from "../deps.ts";
-import type { Command } from "../deps.ts";
-import { flagGatedReader } from "./factory.ts";
-import type { CommandSpec } from "./command_spec.ts";
-import type { RuleContext } from "./types.ts";
-import { dangerousRoot, resolvePath, resolvePathValue, rootScope } from "../engine/scope.ts";
-
-function ctxOf(name: string, src: string): RuleContext {
-  const cmd = parse(src).commands[0].command as Command;
-  const cwd = { kind: "known", path: "/proj" } as const;
-  return {
-    name,
-    argv: cmd.suffix,
-    redirects: cmd.redirects,
-    assignments: cmd.prefix,
-    cwd,
-    resolvePath: (w) => resolvePath(w, cwd, rootScope("/proj")),
-    resolvePathValue: (v) => resolvePathValue(v, cwd, rootScope("/proj")),
-    resolveUrl: () => "not-allowed",
-    isDangerousRoot: (w) => dangerousRoot(w, cwd, null),
-  };
-}
-
-const SPEC: CommandSpec = {
-  flags: [
-    { name: "-w", takesValue: true, valueIsPath: false },
-    { name: "--from", takesValue: true, valueIsPath: true },
-  ],
-  positionals: "paths",
-};
-
-const rule = flagGatedReader({
-  names: ["demo"],
-  specs: { demo: SPEC },
-  cwdIndependentWhenNoPaths: true,
-});
-
-Deno.test("path operands and path-valued flags are scope-checked", () => {
-  assertEquals(rule.evaluate(ctxOf("demo", "demo a.txt")).kind, "allow");
-  assertEquals(rule.evaluate(ctxOf("demo", "demo ../out.txt")).kind, "ask");
-  assertEquals(rule.evaluate(ctxOf("demo", "demo --from ../out.txt")).kind, "ask");
-});
-
-Deno.test("a non-path flag value is not treated as a path", () => {
-  assertEquals(rule.evaluate(ctxOf("demo", "demo -w 80")).kind, "allow");
-  assertEquals(rule.cwdIndependent!(ctxOf("demo", "demo -w 80")), true);
-});
-
-Deno.test("unknown flags block the exemption and ask", () => {
-  assertEquals(rule.evaluate(ctxOf("demo", "demo --nope")).kind, "ask");
-  assertEquals(rule.cwdIndependent!(ctxOf("demo", "demo --nope")), false);
-});
-
-Deno.test("any path operand or path-valued flag blocks the exemption", () => {
-  assertEquals(rule.cwdIndependent!(ctxOf("demo", "demo a.txt")), false);
-  assertEquals(rule.cwdIndependent!(ctxOf("demo", "demo --from a.txt")), false);
-});
-```
-
-- [ ] **Step 2: Run the test to verify it fails**
-
-Run: `deno test --allow-env src/rules/factory_test.ts`
-Expected: FAIL — `flagGatedReader` has no `specs` / `cwdIndependentWhenNoPaths` option.
-
-- [ ] **Step 3: Rewrite `src/rules/factory.ts`**
-
-```ts
-import type { CommandRule, RuleContext, RuleVerdict } from "./types.ts";
-import { allow, ask, deny, recursiveRootDenyReason } from "./types.ts";
-import { type FlagMatcher, hasAnyFlag } from "./flags.ts";
-import { type CommandSpec, parseArgv } from "./command_spec.ts";
-
-export interface FlagGatedReaderOptions {
-  names: string[];
-  /** 每個指令名對應一份旗標 / 位置參數描述。缺該名的 spec → 該指令不參與 cwd 豁免。 */
-  specs: Record<string, CommandSpec>;
-  /** 命中任一即 ask（寫入 / 副作用 flag），先於 spec 解析。 */
-  askFlags?: FlagMatcher[];
-  /** ask 時的說明（含指令名）。 */
-  askReason?: (name: string) => string;
-  /** opt-in：無路徑操作元 / 路徑值、非遞迴、旗標全已知時視為 cwd 無關。 */
-  cwdIndependentWhenNoPaths?: boolean;
-  /** 上述 opt-in 的例外名單（隱含以 cwd 為操作對象者，如 ls）。 */
-  cwdDependentNames?: string[];
-}
-
-/**
- * 通用唯讀規則。所有 argv 分類（位置參數是不是路徑、旗標吃不吃值、值是不是路徑、
- * 有沒有未知旗標）都來自 parseArgv 的單一結果；evaluate 與 cwdIndependent 讀的是
- * 同一個快取結果，不會各自重掃而漂移。
- */
-export function flagGatedReader(opts: FlagGatedReaderOptions): CommandRule {
-  const askFlags = opts.askFlags ?? [];
-  return {
-    names: opts.names,
-    evaluate(ctx: RuleContext): RuleVerdict {
-      if (askFlags.length && hasAnyFlag(ctx.argv, askFlags)) {
-        return ask(opts.askReason?.(ctx.name) ?? `${ctx.name}：偵測到寫入 / 副作用參數`);
-      }
-      const spec = opts.specs[ctx.name];
-      if (!spec) return ask(`${ctx.name}：未提供旗標描述`);
-      const p = parseArgv(ctx, spec);
-
-      // 遞迴根 deny 必須先於任何路徑 ask，否則既有硬 deny 會被降級成 ask。
-      // 危險根可能藏在被 value-flag 吃掉的位置，故掃描全部 argv token。
-      if (p.isRecursive) {
-        for (const w of ctx.argv) {
-          if (ctx.isDangerousRoot(w)) {
-            return deny(recursiveRootDenyReason(ctx.name, w.value));
-          }
-        }
-      }
-      if (p.dynamic) return ask(`${ctx.name}：含動態 token，無法靜態判定`);
-      if (p.unknownFlag !== null) {
-        return ask(`${ctx.name}：未列入安全集合的旗標 ${p.unknownFlag}`);
-      }
-      for (const v of p.pathValues) {
-        if (ctx.resolvePathValue(v) !== "in-project") {
-          return ask(`${ctx.name}：旗標的路徑值超出專案範圍或無法解析（${v}）`);
-        }
-      }
-      for (const arg of p.pathOperands) {
-        if (ctx.resolvePath(arg) !== "in-project") {
-          return ask(`${ctx.name}：路徑超出專案範圍或無法靜態解析（${arg.value}）`);
-        }
-      }
-      return allow();
-    },
-    cwdIndependent: opts.cwdIndependentWhenNoPaths
-      ? (ctx: RuleContext) => {
-        if ((opts.cwdDependentNames ?? []).includes(ctx.name)) return false;
-        const spec = opts.specs[ctx.name];
-        if (!spec) return false;
-        const p = parseArgv(ctx, spec); // 與 evaluate 同一快取結果
-        return !p.isRecursive && !p.dynamic && p.unknownFlag === null &&
-          p.pathOperands.length === 0 && p.pathValues.length === 0;
-      }
-      : undefined,
-  };
-}
-```
-
-Note the deliberate ordering: the recursive-root `deny` now runs **before** any path `ask`, so
-adding path-value checks cannot downgrade an existing hard deny (e.g. `grep -r / --exclude-from=x`
-stays `deny`).
-
-- [ ] **Step 4: Run the test to verify it passes**
-
-Run: `deno test --allow-env src/rules/factory_test.ts`
-Expected: PASS.
-
-- [ ] **Step 5: Type check**
-
-Run: `deno task check`
-Expected: FAIL — every existing `flagGatedReader` caller still passes the old options. Tasks 6–8
-convert them; do not run `deno task test` yet.
-
-- [ ] **Step 6: Commit**
-
-```bash
-git add src/rules/factory.ts src/rules/factory_test.ts
-git commit -m "refactor(rules): drive flagGatedReader from CommandSpec's single parse"
-```
-
----
-
-### Task 6: convert `grep` — PATTERN is not a path
-
-**Files:**
-- Modify: `src/rules/commands/grep.ts`
+- Modify: `src/rules/factory.ts`, `src/rules/commands/grep.ts`
 - Test: `src/rules/commands/grep_test.ts`
 
-- [ ] **Step 1: Write the failing tests and fix the one that changes**
+`flagGatedReader` gains **optional** `spec` support: a rule that supplies `spec` gets
+`CommandSpec`-driven classification plus the exemption predicate; a rule that does not keeps
+today's `valueFlags` / `pathValueFlags` path exactly. Only `grep` uses it in this task.
 
-In `src/rules/commands/grep_test.ts`, the existing assertion at the "grep 非遞迴碰根 -> 非 deny"
-test asserts `grep / file` → `ask`. With PATTERN excluded from path checks, `/` is the pattern and
-`file` is in-project, so the correct new expectation is `allow`. Change that line:
+- [ ] **Step 1: Write the failing tests, and fix the one existing assertion that changes**
+
+In `src/rules/commands/grep_test.ts`, the test `"grep 非遞迴碰根 -> 非 deny"` asserts
+`grep / file` → `ask`. With PATTERN excluded from path checks, `/` is the pattern and `file` is
+in-project, so the correct expectation becomes `allow` (still not `deny`, which is what that test
+is about). Update that line and add a comment:
 
 ```ts
 Deno.test("grep 非遞迴碰根 -> 非 deny", () => {
-  // `/` 是 PATTERN 不是路徑，`file` 在專案內 → allow（且確實不是 deny）
+  // `/` 是 PATTERN 不是路徑；`file` 在專案內 → allow（重點是「不是 deny」）
   assertEquals(grepRule.evaluate(ctxOf("grep", "grep / file")).kind, "allow");
   assertEquals(grepRule.evaluate(ctxOf("grep", "grep x /")).kind, "ask");
   assertEquals(grepRule.evaluate(ctxOf("rg", "rg foo ./src")).kind, "allow");
@@ -913,10 +905,12 @@ Deno.test("with -e / -f every positional is a FILE again", () => {
   assertEquals(grepRule.evaluate(ctxOf("grep", "grep --regexp=pat ../outside.txt")).kind, "ask");
   assertEquals(grepRule.evaluate(ctxOf("grep", "grep -ie pat ../outside.txt")).kind, "ask");
   assertEquals(grepRule.evaluate(ctxOf("grep", "grep -f pats.txt ../outside.txt")).kind, "ask");
+  // 群集內的 -e 帶黏寫值（含標點 / 數字）也必須算「pattern 由旗標提供」
+  assertEquals(grepRule.evaluate(ctxOf("grep", "grep -rex.y ../outside.txt")).kind, "ask");
+  assertEquals(grepRule.evaluate(ctxOf("grep", "grep -ie1 ../outside.txt")).kind, "ask");
 });
 
 Deno.test("--color does not consume the pattern", () => {
-  // --color 是選填值旗標；分開寫時不吃下一 token，故 pat 仍是 PATTERN、secret.txt 仍受檢
   assertEquals(grepRule.evaluate(ctxOf("grep", "grep --color pat ../secret.txt")).kind, "ask");
   assertEquals(grepRule.evaluate(ctxOf("grep", "grep --color=auto pat a.txt")).kind, "allow");
 });
@@ -928,7 +922,10 @@ Deno.test("--exclude-from is scope-checked in both forms", () => {
 });
 
 Deno.test("a recursive root deny still wins over a path-value ask", () => {
-  assertEquals(grepRule.evaluate(ctxOf("grep", "grep -r x / --exclude-from=../out.txt")).kind, "deny");
+  assertEquals(
+    grepRule.evaluate(ctxOf("grep", "grep -r x / --exclude-from=../out.txt")).kind,
+    "deny",
+  );
 });
 
 Deno.test("unknown grep flags ask", () => {
@@ -936,12 +933,90 @@ Deno.test("unknown grep flags ask", () => {
 });
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [ ] **Step 2: Run them to verify they fail**
 
 Run: `deno test --allow-env src/rules/commands/grep_test.ts`
 Expected: FAIL.
 
-- [ ] **Step 3: Rewrite `src/rules/commands/grep.ts`**
+- [ ] **Step 3: Add optional `spec` support to `src/rules/factory.ts`**
+
+Add to `FlagGatedReaderOptions`:
+
+```ts
+  /**
+   * 選填：改由 CommandSpec 驅動 argv 分類（每個旗標只描述一次）。
+   * 提供 spec 時，valueFlags / pathValueFlags 不再使用，並可 opt-in cwd 豁免述詞。
+   * 未提供時，行為與既有完全相同。
+   */
+  spec?: (name: string, argv: Word[]) => CommandSpec | undefined;
+  /** opt-in：spec 解析後無路徑操作元 / 路徑值、非遞迴、旗標全已知時視為 cwd 無關。 */
+  cwdIndependentWhenNoPaths?: boolean;
+  /** 上述 opt-in 的例外名單（隱含以 cwd 為操作對象者，如 ls）。 */
+  cwdDependentNames?: string[];
+```
+
+Add the spec-driven evaluation path inside `flagGatedReader`, keeping the legacy path untouched:
+
+```ts
+/** spec 驅動的判定；與 cwdIndependent 共用 parseArgv 的同一份快取結果。 */
+function evaluateWithSpec(
+  ctx: RuleContext,
+  spec: CommandSpec,
+  opts: FlagGatedReaderOptions,
+): RuleVerdict {
+  const p = parseArgv(ctx, spec);
+  // 遞迴根 deny 必須先於任何路徑 ask，否則既有硬 deny 會被降級成 ask。
+  // 危險根可能藏在被 value-flag 吃掉的位置，故掃描全部 argv token。
+  if (p.isRecursive) {
+    for (const w of ctx.argv) {
+      if (ctx.isDangerousRoot(w)) return deny(recursiveRootDenyReason(ctx.name, w.value));
+    }
+  }
+  if (p.dynamic) return ask(`${ctx.name}：含動態 token，無法靜態判定`);
+  if (p.unknownFlag !== null) {
+    return ask(`${ctx.name}：未列入安全集合的旗標 ${p.unknownFlag}`);
+  }
+  for (const v of p.pathValues) {
+    if (ctx.resolvePathValue(v) !== "in-project") {
+      return ask(`${ctx.name}：旗標的路徑值超出專案範圍或無法解析（${v}）`);
+    }
+  }
+  for (const arg of p.pathOperands) {
+    if (ctx.resolvePath(arg) !== "in-project") {
+      return ask(`${ctx.name}：路徑超出專案範圍或無法靜態解析（${arg.value}）`);
+    }
+  }
+  return allow();
+}
+```
+
+and in the returned object:
+
+```ts
+    evaluate(ctx: RuleContext): RuleVerdict {
+      if (askFlags.length && hasAnyFlag(ctx.argv, askFlags)) {
+        return ask(opts.askReason?.(ctx.name) ?? `${ctx.name}：偵測到寫入 / 副作用參數`);
+      }
+      const spec = opts.spec?.(ctx.name, ctx.argv);
+      if (spec) return evaluateWithSpec(ctx, spec, opts);
+      // …既有的 legacy 路徑完全不動…
+    },
+    cwdIndependent: opts.cwdIndependentWhenNoPaths
+      ? (ctx: RuleContext) => {
+        if ((opts.cwdDependentNames ?? []).includes(ctx.name)) return false;
+        const spec = opts.spec?.(ctx.name, ctx.argv);
+        if (!spec) return false; // 無 spec → 不豁免（default-deny）
+        const p = parseArgv(ctx, spec); // 與 evaluate 同一份快取結果
+        return !p.isRecursive && !p.dynamic && p.unknownFlag === null &&
+          p.pathOperands.length === 0 && p.pathValues.length === 0;
+      }
+      : undefined,
+```
+
+Add the imports: `import { type CommandSpec, parseArgv } from "./command_spec.ts";` and
+`import type { Word } from "../deps.ts";` (if not already present).
+
+- [ ] **Step 4: Rewrite `src/rules/commands/grep.ts`**
 
 ```ts
 import type { CommandRule } from "../types.ts";
@@ -963,12 +1038,11 @@ const isRecursive = (n: string, a: Word[]) =>
   ]);
 
 /**
- * GNU grep 3.0：`grep [OPTION]... PATTERN [FILE]...`。
- * 給了 -e/--regexp 或 -f/--file 時 pattern 改由旗標提供，第一個位置參數變回 FILE。
- * `--color` / `--colour` 的值是選填的，分開寫時**不吃**下一個 token（GNU 語義），
- * 故列為 takesValue: false；`--color=auto` 的黏寫形式由 `=` 分支自然處理。
+ * GNU grep 3.0 的旗標。`--color` / `--colour` 的值是選填且只接受黏寫（`--color=auto`），
+ * 裸寫時不吃下一個 token —— 若誤設為吃值，`grep --color pat file` 會把 pat 當成它的值、
+ * 讓真正的輸入檔被當成 PATTERN 而跳過範圍檢查。
  */
-const NO_VALUE: string[] = [
+const NO_VALUE = [
   "-E", "--extended-regexp", "-F", "--fixed-strings", "-G", "--basic-regexp",
   "-P", "--perl-regexp", "-i", "--ignore-case", "-y", "-v", "--invert-match",
   "-w", "--word-regexp", "-x", "--line-regexp", "-c", "--count",
@@ -976,692 +1050,91 @@ const NO_VALUE: string[] = [
   "-q", "--quiet", "--silent", "-s", "--no-messages", "-n", "--line-number",
   "-b", "--byte-offset", "-H", "--with-filename", "-h", "--no-filename",
   "-a", "--text", "-I", "-z", "--null-data", "-Z", "--null", "-U", "--binary",
-  "--color", "--colour", "-r", "-R", "--recursive", "--dereference-recursive",
-  "-h", "--help", "-V", "--version",
+  "-r", "-R", "--recursive", "--dereference-recursive", "--help", "-V", "--version",
 ];
-const NON_PATH_VALUE: string[] = [
+const ATTACHED_ONLY = ["--color", "--colour"];
+const NON_PATH_VALUE = [
   "-m", "--max-count", "-A", "--after-context", "-B", "--before-context",
   "-C", "--context", "-d", "--directories", "--binary-files", "--label",
   "-e", "--regexp", "--include", "--exclude", "--devices",
 ];
-const PATH_VALUE: string[] = ["-f", "--file", "--exclude-from"];
+const PATH_VALUE = ["-f", "--file", "--exclude-from"];
 
 const flags: FlagSpec[] = [
-  ...NO_VALUE.map((name) => ({ name, takesValue: false, valueIsPath: false })),
-  ...NON_PATH_VALUE.map((name) => ({ name, takesValue: true, valueIsPath: false })),
-  ...PATH_VALUE.map((name) => ({ name, takesValue: true, valueIsPath: true })),
+  ...NO_VALUE.map((name): FlagSpec => ({ name, value: "none" })),
+  ...ATTACHED_ONLY.map((name): FlagSpec => ({ name, value: "attached-only" })),
+  ...NON_PATH_VALUE.map((name): FlagSpec => ({ name, value: "required" })),
+  ...PATH_VALUE.map((name): FlagSpec => ({ name, value: "required", valueIsPath: true })),
 ];
 
 /**
- * pattern 是否由位置參數提供。回 false（pattern 由 -e / -f 旗標提供）時，
- * 全部位置參數都是 FILE。任一 token 動態時保守回 false（多做一次路徑檢查）。
+ * pattern 是否由位置參數提供。`-e` / `--regexp` / `-f` / `--file` 任一形式出現時，
+ * pattern 改由旗標提供，全部位置參數都是 FILE。
+ * 群集偵測不限字母：`-rex.y` 是 `-r -e x.y`，故只要群集的**前綴字母**出現 e / f 即算命中；
+ * 任一 token 動態時保守回 false（多做一次路徑檢查）。
  */
 function patternIsLeadingPositional(argv: Word[]): boolean {
   for (const w of argv) {
     const t = staticValue(w);
     if (t === null) return false;
-    if (!t.startsWith("-")) continue;
-    if (t === "-e" || t === "--regexp" || t.startsWith("--regexp=")) return false;
-    if (t === "-f" || t === "--file" || t.startsWith("--file=")) return false;
-    if (t.startsWith("-e") && t.length > 2 && !t.startsWith("--")) return false;
-    if (t.startsWith("-f") && t.length > 2 && !t.startsWith("--")) return false;
-    if (/^-[A-Za-z]+$/.test(t) && /[ef]/.test(t.slice(1))) return false;
+    if (!t.startsWith("-") || t === "-") continue;
+    if (t === "--") break;
+    if (t.startsWith("--")) {
+      if (t === "--regexp" || t.startsWith("--regexp=")) return false;
+      if (t === "--file" || t.startsWith("--file=")) return false;
+      continue;
+    }
+    // 短旗標群集：逐字母掃到第一個吃值字母為止；e / f 出現即命中
+    for (let k = 1; k < t.length; k++) {
+      const c = t[k];
+      if (c === "e" || c === "f") return false;
+      if (!/[A-Za-z]/.test(c)) break; // 已進入某個旗標的黏寫值
+    }
   }
   return true;
 }
 
-function specFor(patternPositional: boolean): CommandSpec {
+function specFor(_name: string, argv: Word[]): CommandSpec {
   return {
     flags,
-    positionals: patternPositional ? "pattern-then-paths" : "paths",
+    positionals: patternIsLeadingPositional(argv) ? "pattern-then-paths" : "paths",
     recursive: isRecursive,
   };
 }
 
-/**
- * grep 的 positionals 語義依「pattern 是否由旗標提供」而變，故 spec 需依 argv 動態選擇。
- * 這仍是單一解析：parseArgv 對同一個 RuleContext 只跑一次並快取結果。
- */
-function grepSpecs(argv: Word[]): Record<string, CommandSpec> {
-  const spec = specFor(patternIsLeadingPositional(argv));
-  return { grep: spec, egrep: spec, fgrep: spec, rg: spec };
-}
-
-const base = flagGatedReader({
+export const grepRule: CommandRule = flagGatedReader({
   names: ["grep", "egrep", "fgrep", "rg"],
-  specs: {}, // 由下方 wrapper 依 argv 覆寫
+  spec: specFor,
   cwdIndependentWhenNoPaths: true,
+  // rg 恆為遞迴，isRecursive 已排除；列出僅為明示意圖
+  cwdDependentNames: ["rg"],
 });
-
-export const grepRule: CommandRule = {
-  names: base.names,
-  evaluate: (ctx) =>
-    flagGatedReader({
-      names: base.names,
-      specs: grepSpecs(ctx.argv),
-      cwdIndependentWhenNoPaths: true,
-    }).evaluate(ctx),
-  cwdIndependent: (ctx) =>
-    flagGatedReader({
-      names: base.names,
-      specs: grepSpecs(ctx.argv),
-      cwdIndependentWhenNoPaths: true,
-    }).cwdIndependent!(ctx),
-};
 ```
 
-> The two `flagGatedReader(...)` constructions build a fresh options object but both call
-> `parseArgv(ctx, spec)`, which is memoized on `ctx` — so the actual parse still happens once per
-> invocation and both consumers read the identical `ArgvParse`. `rg` is in `specs` so its evaluate
-> works, but `isRecursive` is always true for it, which blocks the exemption.
+- [ ] **Step 5: Run the tests, full suite, type check and lint**
 
-- [ ] **Step 4: Run the tests to verify they pass**
-
-Run: `deno test --allow-env src/rules/commands/grep_test.ts`
-Expected: PASS.
-
-- [ ] **Step 5: Type check**
-
-Run: `deno task check`
-Expected: still failing for the not-yet-converted callers (Tasks 7–8). `grep_test.ts` passing is
-the gate for this task.
+Run: `deno task check && deno task lint && deno task test`
+Expected: all green.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add src/rules/commands/grep.ts src/rules/commands/grep_test.ts
-git commit -m "fix(rules): grep PATTERN is not a path; convert to CommandSpec"
+git add src/rules/factory.ts src/rules/commands/grep.ts src/rules/commands/grep_test.ts
+git commit -m "fix(rules): grep PATTERN is not a path; --color takes no separate value"
 ```
 
 ---
 
-### Task 7: convert `coreutils` + `simple-flag` + `positional-output` + `tail`
-
-**Files:**
-- Modify: `src/rules/commands/coreutils.ts`, `simple-flag.ts`, `positional-output.ts`, `tail.ts`
-- Test: `src/rules/commands/coreutils_test.ts`, `simple-flag_test.ts`, `positional-output_test.ts`, `tail_test.ts`
-
-- [ ] **Step 1: Write the failing tests**
-
-Append to `src/rules/commands/coreutils_test.ts` (this file calls rules explicitly — follow that
-style; `ctxOf(name, src)` is its existing helper):
-
-```ts
-Deno.test("wc --files0-from is scope-checked in both forms", () => {
-  assertEquals(fileReaderRule.evaluate(ctxOf("wc", "wc --files0-from=list.txt")).kind, "allow");
-  assertEquals(fileReaderRule.evaluate(ctxOf("wc", "wc --files0-from=../out/list.txt")).kind, "ask");
-  assertEquals(fileReaderRule.evaluate(ctxOf("wc", "wc --files0-from ../out/list.txt")).kind, "ask");
-});
-
-Deno.test("realpath --relative-to / --relative-base are scope-checked", () => {
-  assertEquals(fileReaderRule.evaluate(ctxOf("realpath", "realpath --relative-to=sub a.txt")).kind, "allow");
-  assertEquals(fileReaderRule.evaluate(ctxOf("realpath", "realpath --relative-to=../out a.txt")).kind, "ask");
-  assertEquals(fileReaderRule.evaluate(ctxOf("realpath", "realpath --relative-base=../out a.txt")).kind, "ask");
-});
-
-Deno.test("tr operands are character sets, not paths", () => {
-  assertEquals(fileReaderRule.evaluate(ctxOf("tr", "tr a b")).kind, "allow");
-  assertEquals(fileReaderRule.evaluate(ctxOf("tr", "tr -d /etc/passwd")).kind, "allow");
-});
-
-Deno.test("non-path flag values are not treated as paths", () => {
-  assertEquals(fileReaderRule.evaluate(ctxOf("fold", "fold -w 80")).kind, "allow");
-  assertEquals(fileReaderRule.evaluate(ctxOf("head", "head -n 10")).kind, "allow");
-  assertEquals(fileReaderRule.evaluate(ctxOf("head", "head -100")).kind, "allow");
-});
-
-Deno.test("diff -X / -S are scope-checked in both forms", () => {
-  assertEquals(diffRule.evaluate(ctxOf("diff", "diff -X ex.txt a.txt b.txt")).kind, "allow");
-  assertEquals(diffRule.evaluate(ctxOf("diff", "diff -X ../out.txt a.txt b.txt")).kind, "ask");
-  assertEquals(diffRule.evaluate(ctxOf("diff", "diff -X../out.txt a.txt b.txt")).kind, "ask");
-  assertEquals(diffRule.evaluate(ctxOf("diff", "diff --starting-file=../out a.txt b.txt")).kind, "ask");
-});
-
-Deno.test("unknown coreutils flags ask", () => {
-  assertEquals(fileReaderRule.evaluate(ctxOf("cat", "cat --totally-unknown")).kind, "ask");
-  assertEquals(fileReaderRule.evaluate(ctxOf("cat", "cat -1unknown")).kind, "ask");
-});
-```
-
-Append to `src/rules/commands/simple-flag_test.ts` (its helper is `v(rule, name, src)`):
-
-```ts
-Deno.test("sort --files0-from is scope-checked", () => {
-  assertEquals(v(sortRule, "sort", "sort --files0-from=list.txt"), "allow");
-  assertEquals(v(sortRule, "sort", "sort --files0-from=../out/list.txt"), "ask");
-});
-
-Deno.test("unknown sort / yq flags ask", () => {
-  assertEquals(v(sortRule, "sort", "sort --totally-unknown"), "ask");
-  assertEquals(v(yqRule, "yq", "yq --totally-unknown '.'"), "ask");
-});
-```
-
-- [ ] **Step 2: Run the tests to verify they fail**
-
-Run: `deno test --allow-env src/rules/commands/coreutils_test.ts src/rules/commands/simple-flag_test.ts`
-Expected: FAIL.
-
-- [ ] **Step 3: Convert `src/rules/commands/coreutils.ts`**
-
-```ts
-import type { CommandRule } from "../types.ts";
-import { allow } from "../types.ts";
-import type { CommandSpec, FlagSpec } from "../command_spec.ts";
-import { flagGatedReader } from "../factory.ts";
-import { exact, hasAnyFlag } from "../flags.ts";
-
-/** 建構 spec 的小工具：三類旗標各給一組名稱。 */
-function spec(
-  noValue: string[],
-  nonPathValue: string[],
-  opts: Partial<CommandSpec> = {},
-): CommandSpec {
-  const flags: FlagSpec[] = [
-    ...noValue.map((name) => ({ name, takesValue: false, valueIsPath: false })),
-    ...nonPathValue.map((name) => ({ name, takesValue: true, valueIsPath: false })),
-    ...(opts.flags ?? []),
-  ];
-  return { flags, positionals: opts.positionals ?? "paths", ...opts, flags };
-}
-
-const pathFlag = (name: string): FlagSpec => ({ name, takesValue: true, valueIsPath: true });
-
-const SPECS: Record<string, CommandSpec> = {
-  cat: spec(["-A", "--show-all", "-b", "--number-nonblank", "-e", "-E", "--show-ends", "-n", "--number", "-s", "--squeeze-blank", "-t", "-T", "--show-tabs", "-u", "-v", "--show-nonprinting"], []),
-  head: spec(["-q", "--quiet", "--silent", "-v", "--verbose", "-z", "--zero-terminated"], ["-c", "--bytes", "-n", "--lines"], { numericShorthand: true }),
-  wc: spec(["-c", "--bytes", "-m", "--chars", "-l", "--lines", "-L", "--max-line-length", "-w", "--words"], [], { flags: [pathFlag("--files0-from")] }),
-  // ls 無操作元時列出 cwd，故 cwdDependentNames 排除；-R 觸發遞迴偵測
-  ls: spec(["-a", "--all", "-A", "-l", "-h", "--human-readable", "-1", "-R", "--recursive", "-r", "--reverse", "-S", "-t", "-d", "--directory", "-F", "--classify", "-i", "--inode", "-n", "--numeric-uid-gid", "-p"], ["--color", "--time-style", "--sort", "--format"]),
-  stat: spec(["-L", "--dereference", "-t", "--terse", "-f", "--file-system"], ["-c", "--format", "--printf"]),
-  cut: spec(["-s", "--only-delimited", "--complement", "-z", "--zero-terminated", "-n"], ["-b", "--bytes", "-c", "--characters", "-d", "--delimiter", "-f", "--fields", "--output-delimiter"]),
-  // tr 的操作元是 SET1 / SET2，不是檔案；tr 只讀 stdin
-  tr: spec(["-c", "-C", "--complement", "-d", "--delete", "-s", "--squeeze-repeats", "-t", "--truncate-set1"], [], { positionals: "none" }),
-  column: spec(["-t", "-x", "-e"], ["-c", "-s", "-o"]),
-  cmp: spec(["-b", "--print-bytes", "-l", "--verbose", "-s", "--silent", "--quiet"], ["-i", "--ignore-initial", "-n", "--bytes"]),
-  comm: spec(["-1", "-2", "-3", "--total", "-z", "--zero-terminated", "--check-order", "--nocheck-order"], ["--output-delimiter"]),
-  md5sum: spec(["-b", "--binary", "-t", "--text", "-z", "--zero", "--tag", "-c", "--check"], []),
-  sha256sum: spec(["-b", "--binary", "-t", "--text", "-z", "--zero", "--tag", "-c", "--check"], []),
-  hexdump: spec(["-b", "-c", "-C", "-d", "-o", "-x", "-v"], ["-e", "-n", "-s"]),
-  nl: spec(["-p", "--no-renumber"], ["-b", "--body-numbering", "-d", "--section-delimiter", "-f", "--footer-numbering", "-h", "--header-numbering", "-i", "--line-increment", "-l", "--join-blank-lines", "-n", "--number-format", "-s", "--number-separator", "-v", "--starting-line-number", "-w", "--number-width"]),
-  fold: spec(["-b", "--bytes", "-s", "--spaces"], ["-w", "--width"]),
-  basename: spec(["-a", "--multiple", "-z", "--zero"], ["-s", "--suffix"]),
-  dirname: spec(["-z", "--zero"], []),
-  realpath: spec(["-e", "--canonicalize-existing", "-m", "--canonicalize-missing", "-L", "--logical", "-P", "--physical", "-q", "--quiet", "-s", "--strip", "--no-symlinks", "-z", "--zero"], [], { flags: [pathFlag("--relative-to"), pathFlag("--relative-base")] }),
-  readlink: spec(["-f", "--canonicalize", "-e", "--canonicalize-existing", "-m", "--canonicalize-missing", "-n", "--no-newline", "-q", "--quiet", "-s", "--silent", "-v", "--verbose", "-z", "--zero"], []),
-};
-
-// ls -R 是唯一會遞迴的成員
-for (const name of Object.keys(SPECS)) {
-  SPECS[name].recursive = (n, a) => n === "ls" && hasAnyFlag(a, [exact("-R", "--recursive")]);
-}
-
-export const fileReaderRule: CommandRule = flagGatedReader({
-  names: Object.keys(SPECS),
-  specs: SPECS,
-  cwdIndependentWhenNoPaths: true,
-  cwdDependentNames: ["ls"],
-});
-
-const DIFF_SPEC: CommandSpec = {
-  flags: [
-    ...["-q", "--brief", "-s", "--report-identical-files", "-u", "-c", "-y", "--side-by-side", "-i", "--ignore-case", "-w", "--ignore-all-space", "-b", "--ignore-space-change", "-B", "--ignore-blank-lines", "-a", "--text", "-r", "--recursive", "-N", "--new-file", "-E", "-Z", "-t", "--expand-tabs"]
-      .map((name) => ({ name, takesValue: false, valueIsPath: false })),
-    ...["-U", "--unified", "-C", "--context", "-W", "--width", "--label", "-D", "--ifdef", "--color", "--tabsize"]
-      .map((name) => ({ name, takesValue: true, valueIsPath: false })),
-    pathFlag("--from-file"), pathFlag("--to-file"),
-    pathFlag("-X"), pathFlag("--exclude-from"),
-    pathFlag("-S"), pathFlag("--starting-file"),
-  ],
-  positionals: "paths",
-  // diff -r 會遞迴比對目錄，故納入遞迴偵測（cwd 豁免因此自然排除）
-  recursive: (_n, a) => hasAnyFlag(a, [exact("-r", "--recursive")]),
-};
-
-export const diffRule: CommandRule = flagGatedReader({
-  names: ["diff"],
-  specs: { diff: DIFF_SPEC },
-  cwdIndependentWhenNoPaths: true,
-});
-
-/**
- * 不接受檔案路徑操作元、且無寫入能力的純工具：一律 allow。
- * cwd 無關宣告排除 `which`：它依 PATH 逐段搜尋，而 PATH 合法地可能含 `.` 或空字串段，
- * 兩者都相對於 cwd 解析 —— `cd /outside && which x` 等於探測 /outside/x 是否存在。
- * 執行期 PATH 無法靜態得知，故一律不豁免。
- */
-export const pureUtilRule: CommandRule = {
-  names: ["echo", "pwd", "whoami", "which"],
-  evaluate: () => allow(),
-  cwdIndependent: (ctx) => ctx.name !== "which",
-};
-
-/** cd 本身不寫檔（cwd 變動由 walk 處理）：一律 allow。 */
-export const cdRule: CommandRule = {
-  names: ["cd"],
-  evaluate: () => allow(),
-};
-```
-
-> `jq` is absent from `SPECS` — Task 9 gives it its own rule. Removing it here is what makes
-> `allowlist.ts`'s duplicate-name check pass once `jqRule` is registered.
-
-- [ ] **Step 4: Convert `src/rules/commands/simple-flag.ts`**
-
-Replace `sortRule` / `yqRule` / `treeRule` / `fileCmdRule` / `dateRule`:
-
-```ts
-import type { CommandRule } from "../types.ts";
-import type { CommandSpec, FlagSpec } from "../command_spec.ts";
-import { flagGatedReader } from "../factory.ts";
-import { exact, prefix } from "../flags.ts";
-
-const noVal = (names: string[]): FlagSpec[] =>
-  names.map((name) => ({ name, takesValue: false, valueIsPath: false }));
-const val = (names: string[]): FlagSpec[] =>
-  names.map((name) => ({ name, takesValue: true, valueIsPath: false }));
-const pathVal = (names: string[]): FlagSpec[] =>
-  names.map((name) => ({ name, takesValue: true, valueIsPath: true }));
-
-const SORT_SPEC: CommandSpec = {
-  flags: [
-    ...noVal(["-b", "--ignore-leading-blanks", "-d", "--dictionary-order", "-f", "--ignore-case", "-g", "--general-numeric-sort", "-h", "--human-numeric-sort", "-i", "--ignore-nonprinting", "-M", "--month-sort", "-n", "--numeric-sort", "-r", "--reverse", "-R", "--random-sort", "-u", "--unique", "-V", "--version-sort", "-z", "--zero-terminated", "-c", "--check", "-C", "--check=quiet", "-s", "--stable", "-m", "--merge"]),
-    ...val(["-k", "--key", "-t", "--field-separator", "-S", "--buffer-size", "--parallel", "--compress-program", "--random-source"]),
-    ...pathVal(["--files0-from"]),
-    // -o / -T 會寫檔或指定暫存目錄，由 askFlags 先攔下；仍列入 spec 以免被當未知旗標
-    ...val(["-o", "--output", "-T", "--temporary-directory"]),
-  ],
-  positionals: "paths",
-};
-
-export const sortRule: CommandRule = flagGatedReader({
-  names: ["sort"],
-  specs: { sort: SORT_SPEC },
-  askFlags: [exact("-o", "--output", "-T", "--temporary-directory"), prefix("-o", "--output=", "-T", "--temporary-directory=")],
-  askReason: () => "sort：-o / -T 會寫檔或指定暫存目錄",
-  cwdIndependentWhenNoPaths: true,
-});
-
-const YQ_SPEC: CommandSpec = {
-  flags: [
-    ...noVal(["-r", "--raw-output", "-n", "--null-input", "-e", "--exit-status", "-N", "--no-colors", "-C", "--colors", "-M", "-P", "--prettyPrint", "-s", "--slurp", "-j", "--tojson", "-i", "--inplace", "--in-place"]),
-    ...val(["-o", "--output-format", "-p", "--input-format", "-I", "--indent", "--expression"]),
-  ],
-  // yq 的第一個位置參數是表達式，不是路徑
-  positionals: "pattern-then-paths",
-};
-
-export const yqRule: CommandRule = flagGatedReader({
-  names: ["yq"],
-  specs: { yq: YQ_SPEC },
-  askFlags: [exact("-i", "--inplace", "--in-place")],
-  askReason: () => "yq：-i / --inplace 會就地修改輸入檔",
-  cwdIndependentWhenNoPaths: true,
-});
-
-const TREE_SPEC: CommandSpec = {
-  flags: [
-    ...noVal(["-a", "-d", "-f", "-i", "-l", "-n", "-C", "-p", "-s", "-h", "-u", "-g", "-D", "-r", "-t", "--dirsfirst", "--noreport", "-J", "-x", "-q"]),
-    ...val(["-L", "-P", "-I", "--timefmt", "--charset"]),
-    ...pathVal(["-o"]),
-  ],
-  positionals: "paths",
-  recursive: () => true,
-};
-
-// 刻意不宣告 cwdIndependentWhenNoPaths：tree 無操作元時遞迴 cwd。
-export const treeRule: CommandRule = flagGatedReader({
-  names: ["tree"],
-  specs: { tree: TREE_SPEC },
-  askFlags: [exact("-o"), prefix("-o")],
-  askReason: () => "tree：-o 會把輸出寫入檔案",
-});
-
-const FILE_SPEC: CommandSpec = {
-  flags: [
-    ...noVal(["-b", "--brief", "-i", "--mime", "-L", "--dereference", "-z", "--uncompress", "-k", "--keep-going", "-h", "--no-dereference", "-s", "--special-files", "-C", "--compile"]),
-    ...pathVal(["-m", "--magic-file", "-f", "--files-from"]),
-  ],
-  positionals: "paths",
-};
-
-// 刻意不宣告 cwdIndependentWhenNoPaths：見 spec 的既有缺口說明（-m / -f 的值歷來未檢查）。
-// 本次已把它們列為 pathValue，但仍不開放豁免，避免同時改動兩件事。
-export const fileCmdRule: CommandRule = flagGatedReader({
-  names: ["file"],
-  specs: { file: FILE_SPEC },
-  askFlags: [exact("-C", "--compile")],
-  askReason: () => "file：-C / --compile 會寫出 magic.mgc",
-});
-
-const DATE_SPEC: CommandSpec = {
-  flags: [
-    ...noVal(["-u", "--utc", "--universal", "-R", "--rfc-email", "-s", "--set"]),
-    ...val(["-d", "--date", "-I", "--iso-8601", "--rfc-3339"]),
-    ...pathVal(["-r", "--reference", "-f", "--file"]),
-  ],
-  positionals: "none", // date 的位置參數是 +FORMAT，不是路徑
-};
-
-// 刻意不宣告 cwdIndependentWhenNoPaths：與 file 同理。
-export const dateRule: CommandRule = flagGatedReader({
-  names: ["date"],
-  specs: { date: DATE_SPEC },
-  askFlags: [exact("-s", "--set"), prefix("--set=", "-s")],
-  askReason: () => "date：-s / --set 會修改系統時間",
-});
-```
-
-- [ ] **Step 5: Convert `src/rules/commands/positional-output.ts`**
-
-```ts
-import type { CommandRule, RuleContext, RuleVerdict } from "../types.ts";
-import { allow, ask } from "../types.ts";
-import { type CommandSpec, parseArgv } from "../command_spec.ts";
-
-const XXD_SPEC: CommandSpec = {
-  flags: [
-    ...["-a", "-b", "-C", "-E", "-e", "-i", "-t", "-u", "-r", "-p", "-ps", "-h"]
-      .map((name) => ({ name, takesValue: false, valueIsPath: false })),
-    ...["-c", "-g", "-l", "-n", "-o", "-s", "-seek"]
-      .map((name) => ({ name, takesValue: true, valueIsPath: false })),
-  ],
-  positionals: "paths",
-};
-
-const UNIQ_SPEC: CommandSpec = {
-  flags: [
-    ...["-c", "--count", "-d", "--repeated", "-D", "--all-repeated", "-i", "--ignore-case", "-u", "--unique", "-z", "--zero-terminated"]
-      .map((name) => ({ name, takesValue: false, valueIsPath: false })),
-    ...["-f", "--skip-fields", "-s", "--skip-chars", "-w", "--check-chars", "--group"]
-      .map((name) => ({ name, takesValue: true, valueIsPath: false })),
-  ],
-  positionals: "paths",
-};
-
-/**
- * `cmd [INPUT [OUTPUT]]`：≥2 個位置參數代表有輸出檔 → ask；否則檢查輸入路徑。
- * 分類全部來自 parseArgv 的單一快取結果，evaluate 與 cwdIndependent 共用。
- */
-function positionalOutputRule(names: string[], spec: CommandSpec): CommandRule {
-  return {
-    names,
-    evaluate(ctx: RuleContext): RuleVerdict {
-      const p = parseArgv(ctx, spec);
-      if (p.dynamic) return ask(`${ctx.name}：含動態 token，無法靜態判定`);
-      if (p.unknownFlag !== null) {
-        return ask(`${ctx.name}：未列入安全集合的旗標 ${p.unknownFlag}`);
-      }
-      if (p.pathOperands.length >= 2) {
-        return ask(`${ctx.name}：第二個位置參數為輸出檔（會寫檔）`);
-      }
-      if (p.pathOperands.length === 1 && ctx.resolvePath(p.pathOperands[0]) !== "in-project") {
-        return ask(`${ctx.name}：輸入路徑超出專案範圍或無法解析（${p.pathOperands[0].value}）`);
-      }
-      return allow();
-    },
-    cwdIndependent(ctx: RuleContext): boolean {
-      const p = parseArgv(ctx, spec);
-      return !p.dynamic && p.unknownFlag === null && p.pathOperands.length === 0 &&
-        p.pathValues.length === 0;
-    },
-  };
-}
-
-export const xxdRule = positionalOutputRule(["xxd"], XXD_SPEC);
-export const uniqRule = positionalOutputRule(["uniq"], UNIQ_SPEC);
-```
-
-- [ ] **Step 6: Convert `src/rules/commands/tail.ts`**
-
-```ts
-import type { CommandRule } from "../types.ts";
-import type { CommandSpec } from "../command_spec.ts";
-import type { FlagMatcher } from "../flags.ts";
-import { exact, prefix } from "../flags.ts";
-import { flagGatedReader } from "../factory.ts";
-
-/** 短旗標群集含 f / F（如 -fn、-Fq、-fn10），代表 follow 模式。 */
-const shortClusterHasF: FlagMatcher = (t) =>
-  /^-[A-Za-z0-9]+$/.test(t) && /[fF]/.test(t.slice(1));
-
-const TAIL_SPEC: CommandSpec = {
-  flags: [
-    ...["-q", "--quiet", "--silent", "-v", "--verbose", "-z", "--zero-terminated", "-f", "-F", "--follow", "--retry"]
-      .map((name) => ({ name, takesValue: false, valueIsPath: false })),
-    ...["-n", "--lines", "-c", "--bytes", "-s", "--sleep-interval", "--pid", "--max-unchanged-stats"]
-      .map((name) => ({ name, takesValue: true, valueIsPath: false })),
-  ],
-  positionals: "paths",
-  numericShorthand: true,
-};
-
-export const tailRule: CommandRule = flagGatedReader({
-  names: ["tail"],
-  specs: { tail: TAIL_SPEC },
-  askFlags: [exact("-f", "-F", "--follow", "--retry"), prefix("--follow="), shortClusterHasF],
-  askReason: () => "tail：-f / --follow 會持續跟隨（無界等待 / 輪詢）",
-  cwdIndependentWhenNoPaths: true,
-});
-```
-
-- [ ] **Step 7: Run the affected tests**
-
-Run: `deno test --allow-env src/rules/commands/coreutils_test.ts src/rules/commands/simple-flag_test.ts src/rules/commands/positional-output_test.ts src/rules/commands/tail_test.ts`
-Expected: PASS. If an existing assertion in these files now yields a different (and correct)
-verdict — e.g. one that relied on `tr`'s operands being paths — update that assertion and note why
-in the commit message.
-
-- [ ] **Step 8: Type check**
-
-Run: `deno task check`
-Expected: still failing only for `sed` / `awk` / `gh` / `curl` (Tasks 8–11) if they touch the
-changed factory signature; `sed`/`awk` do not use `flagGatedReader`, so the remaining errors should
-be confined to imports removed from `flags.ts` usage. Fix any import that this task orphaned.
-
-- [ ] **Step 9: Commit**
-
-```bash
-git add src/rules/commands/coreutils.ts src/rules/commands/simple-flag.ts src/rules/commands/positional-output.ts src/rules/commands/tail.ts src/rules/commands/coreutils_test.ts src/rules/commands/simple-flag_test.ts
-git commit -m "refactor(rules): convert reader rules to CommandSpec; scope-check missed path flags"
-```
-
----
-
-### Task 8: `sed` / `awk` — known-flag enforcement + cwd-independence
-
-**Files:**
-- Modify: `src/rules/commands/sed.ts`, `src/rules/commands/awk.ts`
-- Test: `src/rules/commands/sed_test.ts`, `src/rules/commands/awk_test.ts`
-
-`sed` and `awk` keep their hand-written program scanning (their positional layout is
-program-then-files, which `CommandSpec` does not model), but they must still enforce a known-flag
-allowlist — otherwise `sed --unknown 'p'` would obtain the exemption.
-
-- [ ] **Step 1: Write the failing tests**
-
-Append to `src/rules/commands/sed_test.ts` (use its existing helper):
-
-```ts
-Deno.test("unknown sed flags ask", () => {
-  assertEquals(v("sed --totally-unknown 'p'"), "ask");
-  assertEquals(v("sed -Z 'p'"), "ask");
-});
-
-Deno.test("sed cwdIndependent requires zero input paths and known flags", () => {
-  assertEquals(sedRule.cwdIndependent!(ctxOf("sed -n '1,5p'")), true);
-  assertEquals(sedRule.cwdIndependent!(ctxOf("sed -n '1,5p' a.txt")), false);
-  assertEquals(sedRule.cwdIndependent!(ctxOf("sed --totally-unknown 'p'")), false);
-});
-```
-
-Append to `src/rules/commands/awk_test.ts`:
-
-```ts
-Deno.test("unknown awk flags ask", () => {
-  assertEquals(v("awk --totally-unknown '{print}'"), "ask");
-});
-
-Deno.test("awk cwdIndependent requires zero input paths and known flags", () => {
-  assertEquals(awkRule.cwdIndependent!(ctxOf("awk '{print $1}'")), true);
-  assertEquals(awkRule.cwdIndependent!(ctxOf("awk '{print $1}' a.txt")), false);
-  assertEquals(awkRule.cwdIndependent!(ctxOf("awk --totally-unknown '{print}'")), false);
-});
-```
-
-(If either test file does not export `ctxOf`, add `export` to it — the tests need to build a
-context for the predicate.)
-
-- [ ] **Step 2: Run the tests to verify they fail**
-
-Run: `deno test --allow-env src/rules/commands/sed_test.ts src/rules/commands/awk_test.ts`
-Expected: FAIL.
-
-- [ ] **Step 3: Add flag enforcement to `src/rules/commands/sed.ts`**
-
-Add above `sedRule`:
-
-```ts
-/** sed 的已知旗標。未列入者一律 ask（新版 sed 新增的旗標因此不會被誤放行）。 */
-const SED_NO_VALUE = new Set([
-  "-n", "--quiet", "--silent", "-E", "-r", "--regexp-extended", "-s", "--separate",
-  "-u", "--unbuffered", "-z", "--null-data", "--posix", "--debug", "--sandbox",
-  "--help", "--version",
-]);
-const SED_ONE_VALUE = new Set(["-e", "--expression", "-l", "-i", "--in-place", "-f", "--file"]);
-
-/** 回傳第一個未知旗標；全部已知回 null。 */
-function unknownSedFlag(ctx: RuleContext): string | null {
-  const argv = ctx.argv;
-  for (let i = 0; i < argv.length; i++) {
-    const t = staticValue(argv[i]);
-    if (t === null) return null; // 動態由既有流程處理
-    if (!t.startsWith("-") || t === "-") continue;
-    if (t === "--") break;
-    if (t.startsWith("--")) {
-      const eq = t.indexOf("=");
-      const name = eq === -1 ? t : t.slice(0, eq);
-      if (SED_NO_VALUE.has(name)) { if (eq !== -1) return name; continue; }
-      if (SED_ONE_VALUE.has(name)) { if (eq === -1) i++; continue; }
-      return name;
-    }
-    for (let k = 1; k < t.length; k++) {
-      const short = `-${t[k]}`;
-      if (SED_NO_VALUE.has(short)) continue;
-      if (SED_ONE_VALUE.has(short)) { if (t.slice(k + 1) === "") i++; break; }
-      return short;
-    }
-  }
-  return null;
-}
-```
-
-Insert at the top of `sedRule.evaluate`, before the existing `ASK_FLAGS` check:
-
-```ts
-    const unknown = unknownSedFlag(ctx);
-    if (unknown !== null) return ask(`sed：未列入安全集合的旗標 ${unknown}`);
-```
-
-Add the predicate to the exported object:
-
-```ts
-  /** 程式碼已與輸入路徑分離；無輸入路徑、旗標全已知時判定與 cwd 無關。 */
-  cwdIndependent(ctx: RuleContext): boolean {
-    if (unknownSedFlag(ctx) !== null) return false;
-    if (hasAnyFlag(ctx.argv, ASK_FLAGS)) return false;
-    const { text, explicitExpr } = collectProgram(ctx);
-    if (text === null) return false;
-    if (programHasSideEffect(text)) return false;
-    return inputPaths(ctx, explicitExpr).length === 0;
-  },
-```
-
-- [ ] **Step 4: Add the same to `src/rules/commands/awk.ts`**
-
-```ts
-/** awk / gawk / mawk 的已知旗標。未列入者一律 ask。 */
-const AWK_NO_VALUE = new Set([
-  "--posix", "--traditional", "--re-interval", "--csv", "--help", "--version",
-  "-W", "--lint", "--sandbox", "-i", "--in-place",
-]);
-const AWK_ONE_VALUE = new Set(["-F", "--field-separator", "-v", "--assign", "-f", "--file", "-e", "--source"]);
-
-function unknownAwkFlag(ctx: RuleContext): string | null {
-  // 與 sed 版本結構相同，換成 AWK_* 兩張表
-  const argv = ctx.argv;
-  for (let i = 0; i < argv.length; i++) {
-    const t = staticValue(argv[i]);
-    if (t === null) return null;
-    if (!t.startsWith("-") || t === "-") continue;
-    if (t === "--") break;
-    if (t.startsWith("--")) {
-      const eq = t.indexOf("=");
-      const name = eq === -1 ? t : t.slice(0, eq);
-      if (AWK_NO_VALUE.has(name)) { if (eq !== -1) return name; continue; }
-      if (AWK_ONE_VALUE.has(name)) { if (eq === -1) i++; continue; }
-      return name;
-    }
-    for (let k = 1; k < t.length; k++) {
-      const short = `-${t[k]}`;
-      if (AWK_NO_VALUE.has(short)) continue;
-      if (AWK_ONE_VALUE.has(short)) { if (t.slice(k + 1) === "") i++; break; }
-      return short;
-    }
-  }
-  return null;
-}
-```
-
-Insert at the top of `awkRule.evaluate`:
-
-```ts
-    const unknown = unknownAwkFlag(ctx);
-    if (unknown !== null) return ask(`awk：未列入安全集合的旗標 ${unknown}`);
-```
-
-And add:
-
-```ts
-  /** 程式碼已與輸入路徑分離；無輸入路徑、旗標全已知時判定與 cwd 無關。 */
-  cwdIndependent(ctx: RuleContext): boolean {
-    if (unknownAwkFlag(ctx) !== null) return false;
-    if (hasAnyFlag(ctx.argv, ASK_FLAGS)) return false;
-    const { text, pos } = collectProgram(ctx);
-    if (text === null) return false;
-    if (programHasSideEffect(text)) return false;
-    return pos.length === 0;
-  },
-```
-
-- [ ] **Step 5: Run the tests to verify they pass**
-
-Run: `deno test --allow-env src/rules/commands/sed_test.ts src/rules/commands/awk_test.ts`
-Expected: PASS.
-
-- [ ] **Step 6: Commit**
-
-```bash
-git add src/rules/commands/sed.ts src/rules/commands/awk.ts src/rules/commands/sed_test.ts src/rules/commands/awk_test.ts
-git commit -m "feat(rules): enforce known-flag allowlists for sed and awk; declare cwd-independence"
-```
-
----
-
-### Task 9: extract `jq` into its own rule
+### Task 8: extract `jq` into its own rule
 
 **Files:**
 - Create: `src/rules/commands/jq.ts`, `src/rules/commands/jq_test.ts`
-- Modify: `src/rules/allowlist.ts`
+- Modify: `src/rules/commands/coreutils.ts` (drop `"jq"` from `fileReaderRule` names), `src/rules/allowlist.ts`
 
-`jq`'s option grammar (two-value flags, `--args` switching the meaning of *subsequent* positionals,
-`-fn` meaning `-f -n`) is not expressible in `CommandSpec`, so it gets a hand-written single `scan`
-whose result both `evaluate` and `cwdIndependent` read.
-
-**Verified jq 1.8.1 behavior driving three details the first draft got wrong:**
-1. Every consumed value must still be static — `jq --arg n $V .` must ask.
-2. `--args` affects only positionals **after** it; `jq . a.json --args x` still reads `a.json`.
-3. `-fn` is `-f -n`, so the filename is the **next token**, not the cluster remainder.
+**Three verified jq facts the parser must honor** (see the Conventions table):
+`-f`/`--from-file` is **boolean** and makes the **first positional** the program file regardless of
+where the flag appears; `-L` accepts an **attached** value; every consumed value must still be
+static.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1704,29 +1177,44 @@ Deno.test("jq input files are scope-checked", () => {
   assertEquals(v("jq . ../outside.json"), "ask");
 });
 
-Deno.test("jq path-valued flags are scope-checked", () => {
+Deno.test("-f makes the FIRST POSITIONAL the program file, wherever -f appears", () => {
   assertEquals(v("jq -f prog.jq data.json"), "allow");
-  assertEquals(v("jq -f ../outside.jq"), "ask");
-  assertEquals(v("jq --from-file=../outside.jq"), "ask");
-  assertEquals(v("jq -L ../outside/mods ."), "ask");
-  assertEquals(v("jq --rawfile n ../outside.txt ."), "ask");
-  assertEquals(v("jq --slurpfile n ../outside.json ."), "ask");
-});
-
-Deno.test("-fn means -f -n: the filename is the next token", () => {
+  assertEquals(v("jq -f ../outside.jq data.json"), "ask");
+  // 旗標寫在位置參數之後也一樣：第一個位置參數才是 program 檔
+  assertEquals(v("jq ../outside.jq -f data.json"), "ask");
+  assertEquals(v("jq prog.jq --from-file data.json"), "allow");
+  // -fn 是 -f -n：program 檔仍是第一個位置參數
   assertEquals(v("jq -fn ../outside.jq"), "ask");
   assertEquals(v("jq -fn prog.jq"), "allow");
+});
+
+Deno.test("-L accepts an attached value", () => {
+  assertEquals(v("jq -L mods '.' data.json"), "allow");
+  assertEquals(v("jq -Lmods '.' data.json"), "allow");
+  assertEquals(v("jq -L ../outside/mods '.'"), "ask");
+  assertEquals(v("jq -L../outside/mods '.'"), "ask");
+  // -Ln '.' data.json：`n` 是 -L 的值，`.` 是 filter，data.json 是輸入
+  assertEquals(v("jq -Ln '.' data.json"), "allow");
+  assertEquals(v("jq -Ln '.' ../outside.json"), "ask");
+});
+
+Deno.test("two-value flags scope-check only the file half", () => {
+  assertEquals(v("jq --rawfile n data.txt '.'"), "allow");
+  assertEquals(v("jq --rawfile n ../outside.txt '.'"), "ask");
+  assertEquals(v("jq --slurpfile n ../outside.json '.'"), "ask");
+  assertEquals(v("jq --arg name ../outside '.'"), "allow");
+  assertEquals(v("jq --argjson n 1 '.'"), "allow");
 });
 
 Deno.test("every consumed value must be static", () => {
   assertEquals(v("jq --arg n $V '.'"), "ask");
   assertEquals(v("jq --indent $N '.'"), "ask");
   assertEquals(v("jq --rawfile $N f.txt '.'"), "ask");
+  assertEquals(v("jq -L $D '.'"), "ask");
 });
 
 Deno.test("--args affects only subsequent positionals", () => {
   assertEquals(v("jq -n '$ARGS.positional' --args ../outside a"), "allow");
-  // a.json 出現在 --args 之前 → 仍是輸入檔，仍受範圍檢查
   assertEquals(v("jq . ../outside.json --args x"), "ask");
 });
 
@@ -1744,11 +1232,12 @@ Deno.test("jq cwdIndependent requires zero inputs and no path flag", () => {
   assertEquals(jqRule.cwdIndependent!(ctxOf("jq -r '.name'")), true);
   assertEquals(jqRule.cwdIndependent!(ctxOf("jq -r '.name' a.json")), false);
   assertEquals(jqRule.cwdIndependent!(ctxOf("jq -f prog.jq")), false);
+  assertEquals(jqRule.cwdIndependent!(ctxOf("jq -L mods '.'")), false);
   assertEquals(jqRule.cwdIndependent!(ctxOf("jq -n '$ARGS.positional' --args a b")), true);
 });
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [ ] **Step 2: Run them to verify they fail**
 
 Run: `deno test --allow-env src/rules/commands/jq_test.ts`
 Expected: FAIL — module not found.
@@ -1771,19 +1260,26 @@ const NO_VALUE_LONG = new Set([
   "--monochrome-output", "--tab", "--unbuffered", "--stream", "--stream-errors",
   "--seq", "--args", "--jsonargs", "--exit-status", "--binary", "--version",
   "--build-configuration", "--help",
+  // --from-file 是布林：它不吃檔名，只把「第一個位置參數」的語義改成 program 檔路徑
+  "--from-file",
 ]);
-const NO_VALUE_SHORT = new Set(["n", "R", "s", "c", "r", "j", "a", "S", "C", "M", "e", "b", "V", "h"]);
+const NO_VALUE_SHORT = new Set([
+  "n", "R", "s", "c", "r", "j", "a", "S", "C", "M", "e", "b", "V", "h",
+  "f", // -f 同 --from-file：布林
+]);
 const ONE_NON_PATH = new Set(["--indent"]);
-const ONE_PATH = new Set(["-f", "--from-file", "-L", "--library-path"]);
+/** 吃一個路徑值；短形式接受黏寫（`-Lmods` 等於 `-L mods`）。 */
+const ONE_PATH = new Set(["-L", "--library-path"]);
 const TWO_NON_PATH = new Set(["--arg", "--argjson"]);
+/** 吃兩個值，第二個是路徑。 */
 const TWO_SECOND_PATH = new Set(["--slurpfile", "--rawfile"]);
 
 interface JqScan {
-  /** 需做範圍檢查的輸入檔（已扣除 filter 與 --args 之後的字串）。 */
-  inputs: Word[];
-  /** 吃路徑值的旗標帶的值。 */
+  /** 需做範圍檢查的路徑：program 檔（-f 時的第一個位置參數）＋ 輸入檔。 */
+  paths: Word[];
+  /** 吃路徑值的旗標帶的值（字串）。 */
   pathValues: string[];
-  /** 是否用過任何吃路徑的旗標。 */
+  /** 是否用過任何吃路徑的旗標，或 -f（program 檔本身就是路徑）。 */
   pathFlagUsed: boolean;
   /** 第一個未知旗標；全部已知回 null。 */
   unknownFlag: string | null;
@@ -1804,35 +1300,21 @@ function scan(ctx: RuleContext): JqScan {
 
 function doScan(ctx: RuleContext): JqScan {
   const argv = ctx.argv;
-  const inputs: Word[] = [];
+  const positional: Word[] = [];
   const pathValues: string[] = [];
   let pathFlagUsed = false;
   let unknownFlag: string | null = null;
   let dynamic = false;
-  let filterFromFile = false;
-  let argsMode = false;
-  let sawFilter = false;
+  let fromFile = false;
+  /** --args / --jsonargs 出現之後才生效，故記下它出現時已有幾個位置參數。 */
+  let argsModeFrom = -1;
   let optionsDone = false;
-
-  /** 取得旗標的值：inline 優先，否則吃下一 token。 */
-  const takeValue = (i: number, inline: string | null): { value: string | null; next: number } => {
-    if (inline !== null) return { value: inline, next: i };
-    const j = i + 1;
-    if (j >= argv.length) return { value: null, next: i };
-    return { value: staticValue(argv[j]), next: j };
-  };
 
   for (let i = 0; i < argv.length; i++) {
     const t = staticValue(argv[i]);
     if (t === null) { dynamic = true; continue; }
 
-    if (optionsDone || !t.startsWith("-") || t === "-") {
-      // filter 是第一個位置參數（除非 -f 已提供）；--args 之後的位置參數是字串
-      if (!filterFromFile && !sawFilter) { sawFilter = true; continue; }
-      if (argsMode) continue;
-      inputs.push(argv[i]);
-      continue;
-    }
+    if (optionsDone || !t.startsWith("-") || t === "-") { positional.push(argv[i]); continue; }
     if (t === "--") { optionsDone = true; continue; }
 
     if (t.startsWith("--")) {
@@ -1841,64 +1323,78 @@ function doScan(ctx: RuleContext): JqScan {
       const inline = eq === -1 ? null : t.slice(eq + 1);
       if (NO_VALUE_LONG.has(name)) {
         if (inline !== null) { unknownFlag ??= name; continue; }
-        if (name === "--args" || name === "--jsonargs") argsMode = true;
+        if (name === "--from-file") fromFile = true;
+        if (name === "--args" || name === "--jsonargs") argsModeFrom = positional.length;
         continue;
       }
-      if (ONE_NON_PATH.has(name)) {
-        const r = takeValue(i, inline);
-        if (r.value === null) dynamic = true;
-        i = r.next;
+      if (ONE_NON_PATH.has(name) || ONE_PATH.has(name)) {
+        let value = inline;
+        if (value === null) {
+          i++;
+          if (i >= argv.length) { unknownFlag ??= name; break; }
+          value = staticValue(argv[i]);
+          if (value === null) { dynamic = true; continue; }
+        }
+        if (ONE_PATH.has(name)) { pathValues.push(value); pathFlagUsed = true; }
         continue;
       }
-      if (ONE_PATH.has(name)) {
-        const r = takeValue(i, inline);
-        if (r.value === null) { dynamic = true; i = r.next; continue; }
-        pathValues.push(r.value);
-        pathFlagUsed = true;
-        if (name === "--from-file") filterFromFile = true;
-        i = r.next;
-        continue;
-      }
-      if (TWO_NON_PATH.has(name)) {
-        const a = takeValue(i, inline);
-        if (a.value === null) dynamic = true;
-        const b = takeValue(a.next, null);
-        if (b.value === null) dynamic = true;
-        i = b.next;
-        continue;
-      }
-      if (TWO_SECOND_PATH.has(name)) {
-        const a = takeValue(i, inline); // name（非路徑）
-        if (a.value === null) dynamic = true;
-        const b = takeValue(a.next, null); // file（路徑）
-        if (b.value === null) dynamic = true;
-        else { pathValues.push(b.value); pathFlagUsed = true; }
-        i = b.next;
+      if (TWO_NON_PATH.has(name) || TWO_SECOND_PATH.has(name)) {
+        // 第一個值：inline 或下一 token
+        let first = inline;
+        if (first === null) {
+          i++;
+          if (i >= argv.length) { unknownFlag ??= name; break; }
+          first = staticValue(argv[i]);
+          if (first === null) dynamic = true;
+        }
+        // 第二個值：一定是下一 token
+        i++;
+        if (i >= argv.length) { unknownFlag ??= name; break; }
+        const second = staticValue(argv[i]);
+        if (second === null) dynamic = true;
+        else if (TWO_SECOND_PATH.has(name)) { pathValues.push(second); pathFlagUsed = true; }
         continue;
       }
       unknownFlag ??= name;
       continue;
     }
 
-    // 短旗標群集：jq 的 -f 不吃同 token 剩餘字元（`-fn` 等於 `-f -n`），
-    // 故吃值的短旗標一律從下一個 token 取值。
+    // 短旗標群集：`-f` 是布林；`-L` 吃值且接受黏寫（-Lmods）
+    let ate = false;
     for (let k = 1; k < t.length; k++) {
       const c = t[k];
-      if (NO_VALUE_SHORT.has(c)) continue;
+      if (NO_VALUE_SHORT.has(c)) { if (c === "f") fromFile = true; continue; }
       const short = `-${c}`;
       if (ONE_PATH.has(short)) {
-        const r = takeValue(i, null);
-        if (r.value === null) dynamic = true;
-        else { pathValues.push(r.value); pathFlagUsed = true; if (c === "f") filterFromFile = true; }
-        i = r.next;
-        continue;
+        const rest = t.slice(k + 1);
+        let value: string | null = rest;
+        if (rest === "") {
+          i++;
+          if (i >= argv.length) { unknownFlag ??= short; ate = true; break; }
+          value = staticValue(argv[i]);
+          if (value === null) { dynamic = true; ate = true; break; }
+        }
+        if (value !== null) { pathValues.push(value); pathFlagUsed = true; }
+        ate = true;
+        break;
       }
       unknownFlag ??= short;
+      ate = true;
       break;
     }
+    if (ate) continue;
   }
 
-  return { inputs, pathValues, pathFlagUsed, unknownFlag, dynamic };
+  // 位置參數語義：
+  //  - 無 -f：第一個是 filter（不是路徑），其餘是輸入檔；
+  //  - 有 -f：第一個是 program 檔（是路徑），其餘是輸入檔。
+  //  - --args / --jsonargs 之後出現的位置參數是字串，不是檔案。
+  const cutoff = argsModeFrom >= 0 ? argsModeFrom : positional.length;
+  const considered = positional.slice(0, cutoff);
+  const paths = fromFile ? considered : considered.slice(1);
+  if (fromFile && considered.length > 0) pathFlagUsed = true;
+
+  return { paths, pathValues, pathFlagUsed, unknownFlag, dynamic };
 }
 
 export const jqRule: CommandRule = {
@@ -1912,59 +1408,369 @@ export const jqRule: CommandRule = {
         return ask(`jq：旗標的路徑值超出專案範圍或無法解析（${v}）`);
       }
     }
-    for (const p of r.inputs) {
+    for (const p of r.paths) {
       if (ctx.resolvePath(p) !== "in-project") {
-        return ask(`jq：輸入路徑超出專案範圍或無法解析（${p.value}）`);
+        return ask(`jq：路徑超出專案範圍或無法解析（${p.value}）`);
       }
     }
     return allow();
   },
-  /** filter 不是路徑；無輸入檔且未用到吃路徑的旗標時，判定與 cwd 無關。 */
+  /** filter 不是路徑；無任何路徑（含 program 檔）且未用到吃路徑的旗標時與 cwd 無關。 */
   cwdIndependent(ctx: RuleContext): boolean {
     const r = scan(ctx);
-    return !r.dynamic && r.unknownFlag === null && r.inputs.length === 0 && !r.pathFlagUsed;
+    return !r.dynamic && r.unknownFlag === null && r.paths.length === 0 && !r.pathFlagUsed;
   },
 };
 ```
 
-- [ ] **Step 4: Register in `src/rules/allowlist.ts`**
+- [ ] **Step 4: Remove `jq` from `fileReaderRule` and register the new rule**
 
-Add `import { jqRule } from "./commands/jq.ts";` and put `jqRule,` in the `RULES` array after
-`grepRule,`.
+In `src/rules/commands/coreutils.ts`, drop `"jq"` from `fileReaderRule`'s `names`.
+In `src/rules/allowlist.ts`, add `import { jqRule } from "./commands/jq.ts";` and put `jqRule,`
+in the `RULES` array after `grepRule,`.
 
-- [ ] **Step 5: Run the tests to verify they pass**
+- [ ] **Step 5: Run the tests, full suite, type check and lint**
 
-Run: `deno test --allow-env src/rules/commands/jq_test.ts src/rules/allowlist_test.ts`
-Expected: PASS. `allowlist.ts` throws on duplicate names, so a clean load also proves Task 7
-removed `jq` from `fileReaderRule`.
+Run: `deno task check && deno task lint && deno task test`
+Expected: all green. `allowlist.ts` throws on duplicate names, so a clean load also proves `jq`
+left `fileReaderRule`.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add src/rules/commands/jq.ts src/rules/commands/jq_test.ts src/rules/allowlist.ts
-git commit -m "feat(rules): extract jq into its own rule; filter is not a path"
+git add src/rules/commands/jq.ts src/rules/commands/jq_test.ts src/rules/commands/coreutils.ts src/rules/allowlist.ts
+git commit -m "feat(rules): extract jq into its own rule; -f is boolean, -L takes an attached value"
 ```
 
 ---
 
-### Task 10: `gh` — flag-aware parse, flag allowlist, local side effects, endpoint operand
+### Task 9: `head` / `wc` / `tail` specs + `pureUtilRule` declaration
+
+**Files:**
+- Modify: `src/rules/commands/coreutils.ts`, `src/rules/commands/tail.ts`
+- Test: `src/rules/commands/coreutils_test.ts`, `src/rules/commands/tail_test.ts`
+
+Only `head`, `wc`, and `tail` get a `CommandSpec` — every other `fileReaderRule` member keeps the
+legacy path and never opts in, so their flag grammars need no modelling.
+
+- [ ] **Step 1: Write the failing tests**
+
+Append to `src/rules/commands/coreutils_test.ts`:
+
+```ts
+Deno.test("head / wc non-path flag values are not treated as paths", () => {
+  assertEquals(fileReaderRule.evaluate(ctxOf("head -n 10")).kind, "allow");
+  assertEquals(fileReaderRule.evaluate(ctxOf("head -100")).kind, "allow");
+  assertEquals(fileReaderRule.evaluate(ctxOf("wc -l")).kind, "allow");
+});
+
+Deno.test("head / wc still scope-check their file operands", () => {
+  assertEquals(fileReaderRule.evaluate(ctxOf("head -100 ../out.txt")).kind, "ask");
+  assertEquals(fileReaderRule.evaluate(ctxOf("wc -l ../out.txt")).kind, "ask");
+});
+
+Deno.test("unknown head / wc flags ask; other members keep legacy behavior", () => {
+  assertEquals(fileReaderRule.evaluate(ctxOf("head --totally-unknown")).kind, "ask");
+  assertEquals(fileReaderRule.evaluate(ctxOf("wc -1unknown")).kind, "ask");
+  // cat 沒有 spec，走既有路徑：未知旗標照舊被當一般 flag 跳過
+  assertEquals(fileReaderRule.evaluate(ctxOf("cat --totally-unknown a.txt")).kind, "allow");
+});
+
+Deno.test("head / wc declare cwd-independence only with no operands", () => {
+  assertEquals(fileReaderRule.cwdIndependent!(ctxOf("head -100")), true);
+  assertEquals(fileReaderRule.cwdIndependent!(ctxOf("wc -l")), true);
+  assertEquals(fileReaderRule.cwdIndependent!(ctxOf("head -100 a.txt")), false);
+  assertEquals(fileReaderRule.cwdIndependent!(ctxOf("wc --files0-from=list")), false);
+  // 未宣告的成員一律 false
+  assertEquals(fileReaderRule.cwdIndependent!(ctxOf("cat")), false);
+  assertEquals(fileReaderRule.cwdIndependent!(ctxOf("ls")), false);
+  assertEquals(fileReaderRule.cwdIndependent!(ctxOf("tr a b")), false);
+});
+```
+
+Append to `src/rules/commands/tail_test.ts` (use its existing helper):
+
+```ts
+Deno.test("tail numeric shorthand and -n value are not paths", () => {
+  assertEquals(v("tail -200"), "allow");
+  assertEquals(v("tail -n 200"), "allow");
+});
+
+Deno.test("tail declares cwd-independence only with no operands", () => {
+  assertEquals(tailRule.cwdIndependent!(ctxOf("tail -200")), true);
+  assertEquals(tailRule.cwdIndependent!(ctxOf("tail -200 a.txt")), false);
+});
+
+Deno.test("tail -f still asks", () => {
+  assertEquals(v("tail -f a.txt"), "ask");
+  assertEquals(v("tail -f"), "ask");
+});
+```
+
+If `tail_test.ts` lacks `ctxOf` / `v`, add them following `grep_test.ts`'s shape, bound to
+`name: "tail"`.
+
+- [ ] **Step 2: Run them to verify they fail**
+
+Run: `deno test --allow-env src/rules/commands/coreutils_test.ts src/rules/commands/tail_test.ts`
+Expected: FAIL.
+
+- [ ] **Step 3: Add the three specs to `src/rules/commands/coreutils.ts`**
+
+```ts
+import type { CommandSpec, FlagSpec } from "../command_spec.ts";
+
+/** head / wc 的旗標表。只有這兩個成員參與 cwd 豁免，故只為它們建模。 */
+const HEAD_SPEC: CommandSpec = {
+  flags: [
+    ...["-q", "--quiet", "--silent", "-v", "--verbose", "-z", "--zero-terminated"]
+      .map((name): FlagSpec => ({ name, value: "none" })),
+    ...["-c", "--bytes", "-n", "--lines"]
+      .map((name): FlagSpec => ({ name, value: "required" })),
+  ],
+  positionals: "paths",
+  numericShorthand: true, // head -100
+};
+
+const WC_SPEC: CommandSpec = {
+  flags: [
+    ...["-c", "--bytes", "-m", "--chars", "-l", "--lines", "-L", "--max-line-length", "-w", "--words"]
+      .map((name): FlagSpec => ({ name, value: "none" })),
+    { name: "--files0-from", value: "required", valueIsPath: true },
+  ],
+  positionals: "paths",
+};
+
+const SPECS: Record<string, CommandSpec> = { head: HEAD_SPEC, wc: WC_SPEC };
+```
+
+Update `fileReaderRule` (keeping the Task 5 legacy flags for the other members):
+
+```ts
+export const fileReaderRule: CommandRule = flagGatedReader({
+  names: [
+    "cat", "head", "wc", "ls", "stat", "cut", "tr", "column",
+    "cmp", "comm", "md5sum", "sha256sum", "hexdump", "nl", "fold",
+    "basename", "dirname", "realpath", "readlink",
+  ],
+  // head / wc 走 CommandSpec；其餘成員沿用下方 legacy 設定，且一律不參與 cwd 豁免。
+  spec: (name) => SPECS[name],
+  valueFlags: [exact("--files0-from", "--relative-to", "--relative-base")],
+  pathValueFlags: ["--files0-from", "--relative-to", "--relative-base"],
+  recursive: (n, a) => n === "ls" && hasAnyFlag(a, [exact("-R", "--recursive")]),
+  cwdIndependentWhenNoPaths: true,
+  // ls 無操作元時列出 cwd。其餘未提供 spec 的成員由「無 spec → 不豁免」自動排除。
+  cwdDependentNames: ["ls"],
+});
+```
+
+Also declare `pureUtilRule`:
+
+```ts
+/**
+ * 不接受檔案路徑操作元、且無寫入能力的純工具：一律 allow。
+ * cwd 無關宣告排除 `which`：它依 PATH 逐段搜尋，而 PATH 合法地可能含 `.` 或空字串段，
+ * 兩者都相對於 cwd 解析 —— `cd /outside && which x` 等於探測 /outside/x 是否存在。
+ * 執行期 PATH 無法靜態得知，故一律不豁免。
+ */
+export const pureUtilRule: CommandRule = {
+  names: ["echo", "pwd", "whoami", "which"],
+  evaluate: () => allow(),
+  cwdIndependent: (ctx) => ctx.name !== "which",
+};
+```
+
+- [ ] **Step 4: Add the spec to `src/rules/commands/tail.ts`**
+
+```ts
+const TAIL_SPEC: CommandSpec = {
+  flags: [
+    ...["-q", "--quiet", "--silent", "-v", "--verbose", "-z", "--zero-terminated", "-f", "-F", "--follow", "--retry"]
+      .map((name): FlagSpec => ({ name, value: "none" })),
+    ...["-n", "--lines", "-c", "--bytes", "-s", "--sleep-interval", "--pid", "--max-unchanged-stats"]
+      .map((name): FlagSpec => ({ name, value: "required" })),
+  ],
+  positionals: "paths",
+  numericShorthand: true, // tail -200
+};
+
+export const tailRule: CommandRule = flagGatedReader({
+  names: ["tail"],
+  spec: () => TAIL_SPEC,
+  askFlags: [exact("-f", "-F", "--follow", "--retry"), prefix("--follow="), shortClusterHasF],
+  askReason: () => "tail：-f / --follow 會持續跟隨（無界等待 / 輪詢）",
+  cwdIndependentWhenNoPaths: true,
+});
+```
+
+`askFlags` runs before the spec path, so `tail -f` still asks before any spec parsing. Note that
+`cwdIndependent` does **not** consult `askFlags`; add the guard explicitly by keeping `-f`/`-F` in
+the spec as `"none"` flags **and** relying on Task 10's guardrail 1 (`evaluate` must return
+`allow`), which `tail -f` never does.
+
+- [ ] **Step 5: Run the tests, full suite, type check and lint**
+
+Run: `deno task check && deno task lint && deno task test`
+Expected: all green.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add src/rules/commands/coreutils.ts src/rules/commands/tail.ts src/rules/commands/coreutils_test.ts src/rules/commands/tail_test.ts
+git commit -m "feat(rules): CommandSpec for head/wc/tail; declare pureUtilRule cwd-independence"
+```
+
+---
+
+### Task 10: `sed` — known-flag allowlist + cwd-independence
+
+**Files:**
+- Modify: `src/rules/commands/sed.ts`
+- Test: `src/rules/commands/sed_test.ts`
+
+`sed` keeps its hand-written program scanner (its layout is program-then-files, which
+`CommandSpec` does not model), but must enforce a known-flag allowlist and, critically, catch
+`-f` in **every** form — including clustered and attached (`-nfprog.sed`), which the existing
+`ASK_FLAGS` matcher misses.
+
+- [ ] **Step 1: Write the failing tests**
+
+Append to `src/rules/commands/sed_test.ts` (export its `ctxOf` if it is not already exported):
+
+```ts
+Deno.test("unknown sed flags ask", () => {
+  assertEquals(v("sed --totally-unknown 'p'"), "ask");
+  assertEquals(v("sed -Z 'p'"), "ask");
+});
+
+Deno.test("sed -f is caught in every form", () => {
+  assertEquals(v("sed -f prog.sed a.txt"), "ask");
+  assertEquals(v("sed -fprog.sed a.txt"), "ask");
+  assertEquals(v("sed -nfprog.sed a.txt"), "ask"); // 群集 + 黏寫
+  assertEquals(v("sed --file=prog.sed a.txt"), "ask");
+});
+
+Deno.test("sed cwdIndependent requires zero input paths and known flags", () => {
+  assertEquals(sedRule.cwdIndependent!(ctxOf("sed -n '1,5p'")), true);
+  assertEquals(sedRule.cwdIndependent!(ctxOf("sed -n '1,5p' a.txt")), false);
+  assertEquals(sedRule.cwdIndependent!(ctxOf("sed --totally-unknown 'p'")), false);
+  assertEquals(sedRule.cwdIndependent!(ctxOf("sed -nfprog.sed p")), false);
+  assertEquals(sedRule.cwdIndependent!(ctxOf("sed -i 's/a/b/'")), false);
+});
+```
+
+- [ ] **Step 2: Run them to verify they fail**
+
+Run: `deno test --allow-env src/rules/commands/sed_test.ts`
+Expected: FAIL — `sed -nfprog.sed a.txt` currently allows.
+
+- [ ] **Step 3: Add flag enforcement to `src/rules/commands/sed.ts`**
+
+Add above `sedRule`:
+
+```ts
+/** sed 的已知旗標。未列入者一律 ask，故新版 sed 新增的旗標不會被誤放行。 */
+const SED_NO_VALUE = new Set([
+  "-n", "--quiet", "--silent", "-E", "-r", "--regexp-extended", "-s", "--separate",
+  "-u", "--unbuffered", "-z", "--null-data", "--posix", "--debug", "--sandbox",
+  "--help", "--version",
+]);
+const SED_ONE_VALUE = new Set(["-e", "--expression", "-l", "--line-length"]);
+/** 會就地寫檔或載入不可見腳本；任何形式出現即 ask。 */
+const SED_UNSAFE = new Set(["-i", "--in-place", "-f", "--file"]);
+
+interface SedFlagScan {
+  /** 第一個未知旗標。 */
+  unknownFlag: string | null;
+  /** 是否出現 -i / -f（含群集與黏寫形式）。 */
+  unsafe: boolean;
+}
+
+/** 掃描旗標。長短、黏寫、群集三種形式皆處理。 */
+function scanSedFlags(ctx: RuleContext): SedFlagScan {
+  const argv = ctx.argv;
+  let unknownFlag: string | null = null;
+  let unsafe = false;
+  for (let i = 0; i < argv.length; i++) {
+    const t = staticValue(argv[i]);
+    if (t === null) continue; // 動態由既有流程判 ask
+    if (!t.startsWith("-") || t === "-") continue;
+    if (t === "--") break;
+    if (t.startsWith("--")) {
+      const eq = t.indexOf("=");
+      const name = eq === -1 ? t : t.slice(0, eq);
+      if (SED_UNSAFE.has(name)) { unsafe = true; continue; }
+      if (SED_NO_VALUE.has(name)) { if (eq !== -1) unknownFlag ??= name; continue; }
+      if (SED_ONE_VALUE.has(name)) { if (eq === -1) i++; continue; }
+      unknownFlag ??= name;
+      continue;
+    }
+    for (let k = 1; k < t.length; k++) {
+      const short = `-${t[k]}`;
+      if (SED_UNSAFE.has(short)) { unsafe = true; break; } // 黏寫值歸此旗標，無須再掃
+      if (SED_NO_VALUE.has(short)) continue;
+      if (SED_ONE_VALUE.has(short)) { if (t.slice(k + 1) === "") i++; break; }
+      unknownFlag ??= short;
+      break;
+    }
+  }
+  return { unknownFlag, unsafe };
+}
+```
+
+Replace the top of `sedRule.evaluate`:
+
+```ts
+    const fs = scanSedFlags(ctx);
+    if (fs.unsafe) return ask("sed：-i / -f 可就地寫檔或載入不可見腳本");
+    if (fs.unknownFlag !== null) return ask(`sed：未列入安全集合的旗標 ${fs.unknownFlag}`);
+```
+
+(this replaces the existing `hasAnyFlag(ctx.argv, ASK_FLAGS)` check, which missed clustered forms),
+and add the predicate:
+
+```ts
+  /** 程式碼已與輸入路徑分離；無輸入路徑、旗標全已知且無 -i/-f 時與 cwd 無關。 */
+  cwdIndependent(ctx: RuleContext): boolean {
+    const fs = scanSedFlags(ctx);
+    if (fs.unsafe || fs.unknownFlag !== null) return false;
+    const { text, explicitExpr } = collectProgram(ctx);
+    if (text === null || programHasSideEffect(text)) return false;
+    return inputPaths(ctx, explicitExpr).length === 0;
+  },
+```
+
+- [ ] **Step 4: Run the tests, full suite, type check and lint**
+
+Run: `deno task check && deno task lint && deno task test`
+Expected: all green.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/rules/commands/sed.ts src/rules/commands/sed_test.ts
+git commit -m "fix(rules): catch sed -i/-f in clustered form; add known-flag allowlist and cwd predicate"
+```
+
+---
+
+### Task 11: `gh` — flag-aware parse, flag allowlist, local side effects, endpoint operand
 
 **Files:**
 - Modify: `src/rules/commands/gh.ts`
 - Test: `src/rules/commands/gh_test.ts`
 
-One `parseGh` produces the subcommand, the **flag-aware** operand positions, the unknown flag, and
-the single rescued operand index. `evaluate`, the mutation check, the placeholder check, and both
-predicates all read that one result — no separate `find((t) => !t.startsWith("-"))` scans that
-mistake a flag value for the endpoint.
+One memoized `parseGh` supplies the subcommand, the **flag-aware** operand positions, mutation
+detection, the unknown flag, and the rescued operand index. `evaluate` and both predicates read
+that single result — no separate `find((t) => !t.startsWith("-"))` that mistakes a flag value for
+the endpoint.
 
-**Placeholder behavior (corrected):** an endpoint containing `{owner}` / `{repo}` / `{branch}`
-only withholds the **cwd exemption**. An ordinary in-project `gh api 'repos/{owner}/...'` keeps its
-existing `allow`.
+**Placeholder behavior:** `{owner}` / `{repo}` / `{branch}` in an endpoint withholds the **cwd
+exemption** only. An ordinary in-project `gh api 'repos/{owner}/…'` keeps its existing `allow`.
 
 - [ ] **Step 1: Write the failing tests**
 
-Append to `src/rules/commands/gh_test.ts`:
+Append to `src/rules/commands/gh_test.ts` (export `ctxOf` if needed):
 
 ```ts
 Deno.test("gh local side-effect flags ask", () => {
@@ -1988,11 +1794,12 @@ Deno.test("gh known safe flags still allow", () => {
   assertEquals(v("gh issue list --repo o/r --state open"), "allow");
 });
 
-Deno.test("clustered non-GET methods still ask", () => {
+Deno.test("non-GET methods ask in every flag form", () => {
   assertEquals(v("gh api repos/o/r -X POST"), "ask");
   assertEquals(v("gh api repos/o/r -XPOST"), "ask");
   assertEquals(v("gh api repos/o/r -iXPOST"), "ask");
   assertEquals(v("gh api repos/o/r -iX DELETE"), "ask");
+  assertEquals(v("gh api repos/o/r --method=PATCH"), "ask");
   assertEquals(v("gh api repos/o/r -f a=b"), "ask");
   assertEquals(v("gh api repos/o/r --input body.json"), "ask");
 });
@@ -2000,7 +1807,7 @@ Deno.test("clustered non-GET methods still ask", () => {
 Deno.test("gh api tolerates a single-? query string in the endpoint", () => {
   assertEquals(v("gh api repos/o/r/tags?per_page=50"), "allow");
   assertEquals(v("gh api repos/o/r/contents/pkg/x.go?ref=v1.18.0"), "allow");
-  assertEquals(v("gh api -X GET repos/o/r/tags?per_page=50"), "allow"); // 旗標值不被誤認為 endpoint
+  assertEquals(v("gh api -X GET repos/o/r/tags?per_page=50"), "allow");
 });
 
 Deno.test("gh api rejects other glob shapes in the endpoint", () => {
@@ -2016,8 +1823,7 @@ Deno.test("the tolerance never applies to a flag value", () => {
   assertEquals(v("gh issue list --repo o/r?x"), "ask");
 });
 
-Deno.test("placeholder endpoints keep their ordinary in-project verdict", () => {
-  // 佔位符只取消 cwd 豁免，不改變一般判定
+Deno.test("placeholder endpoints keep their ordinary verdict but lose the exemption", () => {
   assertEquals(v("gh api 'repos/{owner}/{repo}/issues'"), "allow");
   assertEquals(ghRule.cwdIndependent!(ctxOf("gh api 'repos/{owner}/{repo}/issues'")), false);
   assertEquals(ghRule.cwdIndependent!(ctxOf("gh api -X GET 'repos/{owner}/{repo}/issues'")), false);
@@ -2029,12 +1835,11 @@ Deno.test("only api and search are cwd-independent", () => {
   assertEquals(ghRule.cwdIndependent!(ctxOf("gh pr diff")), false);
   assertEquals(ghRule.cwdIndependent!(ctxOf("gh repo view")), false);
   assertEquals(ghRule.cwdIndependent!(ctxOf("gh issue list --repo o/r")), false);
+  assertEquals(ghRule.cwdIndependent!(ctxOf("gh api x --cache 1h")), false);
 });
 ```
 
-`gh_test.ts` already has `ctxOf(src)` and `v(src)`; add `export` to `ctxOf` if it is not exported.
-
-- [ ] **Step 2: Run the tests to verify they fail**
+- [ ] **Step 2: Run them to verify they fail**
 
 Run: `deno test --allow-env src/rules/commands/gh_test.ts`
 Expected: FAIL.
@@ -2055,58 +1860,61 @@ const READ_SUBS: Record<string, Set<string>> = {
 };
 
 /** 開啟本機瀏覽器 / 寫入本機快取：對所有子指令一律 ask。 */
-const LOCAL_SIDE_EFFECT_LONG = new Set(["--web", "--cache"]);
-const LOCAL_SIDE_EFFECT_SHORT = new Set(["w"]);
+const SIDE_EFFECT_LONG = new Set(["--web", "--cache"]);
+const SIDE_EFFECT_SHORT = new Set(["w"]);
 
 /** 送出 request body 或非 GET 方法 → 寫入請求。 */
 const MUTATING_LONG = new Set(["--method", "--field", "--raw-field", "--input"]);
 const MUTATING_SHORT = new Set(["X", "f", "F"]);
 
-/** 全部子指令共用的安全旗標。 */
 const COMMON_NO_VALUE = ["-h", "--help"];
 const COMMON_ONE_VALUE = ["--json", "-q", "--jq", "-t", "--template"];
-
 const API_NO_VALUE = ["--paginate", "--silent", "--slurp", "-i", "--include", "--verbose"];
-const API_ONE_VALUE = ["-H", "--header", "--hostname", "-p", "--preview", "-X", "--method", "--cache", "--input", "-f", "--raw-field", "-F", "--field"];
-
+const API_ONE_VALUE = [
+  "-H", "--header", "--hostname", "-p", "--preview", "-X", "--method",
+  "--cache", "--input", "-f", "--raw-field", "-F", "--field",
+];
 const SEARCH_NO_VALUE = ["--archived", "-w", "--web"];
 const SEARCH_ONE_VALUE = [
   "-L", "--limit", "-R", "--repo", "--owner", "--language", "--match", "--sort",
   "--order", "--state", "--filename", "--extension", "--size", "--label",
   "--author", "--assignee", "--created", "--updated", "--visibility", "--include-forks",
 ];
-
 const READ_NO_VALUE = ["--patch", "--name-only", "-w", "--web"];
 const READ_ONE_VALUE = [
   "-R", "--repo", "-L", "--limit", "-s", "--state", "--label", "--author",
   "--assignee", "--search", "--color", "-e", "--exclude",
 ];
 
-interface GhTables { noValue: Set<string>; oneValue: Set<string> }
-
-function tablesFor(command: string): GhTables {
+function tablesFor(command: string): { noValue: Set<string>; oneValue: Set<string> } {
   if (command === "api") {
-    return { noValue: new Set([...COMMON_NO_VALUE, ...API_NO_VALUE]), oneValue: new Set([...COMMON_ONE_VALUE, ...API_ONE_VALUE]) };
+    return {
+      noValue: new Set([...COMMON_NO_VALUE, ...API_NO_VALUE]),
+      oneValue: new Set([...COMMON_ONE_VALUE, ...API_ONE_VALUE]),
+    };
   }
   if (command === "search") {
-    return { noValue: new Set([...COMMON_NO_VALUE, ...SEARCH_NO_VALUE]), oneValue: new Set([...COMMON_ONE_VALUE, ...SEARCH_ONE_VALUE]) };
+    return {
+      noValue: new Set([...COMMON_NO_VALUE, ...SEARCH_NO_VALUE]),
+      oneValue: new Set([...COMMON_ONE_VALUE, ...SEARCH_ONE_VALUE]),
+    };
   }
-  return { noValue: new Set([...COMMON_NO_VALUE, ...READ_NO_VALUE]), oneValue: new Set([...COMMON_ONE_VALUE, ...READ_ONE_VALUE]) };
+  return {
+    noValue: new Set([...COMMON_NO_VALUE, ...READ_NO_VALUE]),
+    oneValue: new Set([...COMMON_ONE_VALUE, ...READ_ONE_VALUE]),
+  };
 }
 
 interface GhParse {
-  /** 解析階段就能決定的否決理由；非 null 時其餘欄位不可信。 */
+  /** 解析階段即可決定的否決理由；非 null 時其餘欄位不可信。 */
   reject: string | null;
   command: string;
   /** 子指令之後的位置操作元（已排除所有旗標與旗標值）。 */
   operands: string[];
-  /** 被寬鬆取值救回的操作元索引（在 argv 中的位置）；無則 -1。 */
+  /** 被寬鬆取值救回的操作元在 argv 中的索引；無則 -1。 */
   relaxedIdx: number;
-  /** 命中本機副作用旗標。 */
-  localSideEffect: boolean;
-  /** 命中寫入旗標（非 GET 方法或帶 body）。 */
+  sideEffect: boolean;
   mutating: boolean;
-  /** 第一個未知旗標；全部已知回 null。 */
   unknownFlag: string | null;
 }
 
@@ -2121,25 +1929,24 @@ function parseGh(ctx: RuleContext): GhParse {
   return r;
 }
 
-const REJECT = (reason: string): GhParse => ({
+const reject = (reason: string): GhParse => ({
   reject: reason, command: "", operands: [], relaxedIdx: -1,
-  localSideEffect: false, mutating: false, unknownFlag: null,
+  sideEffect: false, mutating: false, unknownFlag: null,
 });
 
 function doParseGh(ctx: RuleContext): GhParse {
   const argv = ctx.argv;
-  const toks: (string | null)[] = argv.map((w) => staticValue(w));
-  const nullIdxs = toks.map((t, i) => (t === null ? i : -1)).filter((i) => i >= 0);
-  if (nullIdxs.length > 1) return REJECT("gh：含一個以上動態 token，無法靜態判定");
+  const toks = argv.map((w) => staticValue(w));
+  const nullCount = toks.filter((t) => t === null).length;
+  if (nullCount > 1) return reject("gh：含一個以上動態 token，無法靜態判定");
 
   const cmdIdx = toks.findIndex((t) => t !== null && !t.startsWith("-"));
-  if (cmdIdx === -1) return REJECT("gh：未指定指令或指令為動態");
+  if (cmdIdx === -1) return reject("gh：未指定指令或指令為動態");
   const command = toks[cmdIdx]!;
   const tables = tablesFor(command);
 
-  // 第一遍：flag-aware 掃描，確定每個 token 的角色
   const operandIdxs: number[] = [];
-  let localSideEffect = false;
+  let sideEffect = false;
   let mutating = false;
   let unknownFlag: string | null = null;
   let optionsDone = false;
@@ -2154,11 +1961,12 @@ function doParseGh(ctx: RuleContext): GhParse {
       const eq = t.indexOf("=");
       const name = eq === -1 ? t : t.slice(0, eq);
       const inline = eq === -1 ? null : t.slice(eq + 1);
-      if (LOCAL_SIDE_EFFECT_LONG.has(name)) localSideEffect = true;
+      if (SIDE_EFFECT_LONG.has(name)) sideEffect = true;
       if (MUTATING_LONG.has(name)) {
-        const val = inline ?? (i + 1 < argv.length ? toks[i + 1] : null);
-        if (name === "--method") { if ((val ?? "").toUpperCase() !== "GET") mutating = true; }
-        else mutating = true;
+        if (name === "--method") {
+          const val = inline ?? (i + 1 < argv.length ? toks[i + 1] : null);
+          if ((val ?? "").toUpperCase() !== "GET") mutating = true;
+        } else mutating = true;
       }
       if (tables.noValue.has(name)) { if (inline !== null) unknownFlag ??= name; continue; }
       if (tables.oneValue.has(name)) { if (inline === null) i++; continue; }
@@ -2166,12 +1974,13 @@ function doParseGh(ctx: RuleContext): GhParse {
       continue;
     }
 
-    // 短旗標群集：逐字母；吃值字母吃掉剩餘字元，剩餘為空則吃下一 token
+    // 短旗標群集：逐字母。吃值字母吃掉同 token 剩餘字元，剩餘為空則吃下一 token。
+    // 群集內的 X / f / F 同樣算寫入旗標（`-iXPOST` 必須被攔下）。
     let ate = false;
     for (let k = 1; k < t.length; k++) {
       const c = t[k];
       const short = `-${c}`;
-      if (LOCAL_SIDE_EFFECT_SHORT.has(c)) localSideEffect = true;
+      if (SIDE_EFFECT_SHORT.has(c)) sideEffect = true;
       if (MUTATING_SHORT.has(c)) {
         if (c === "X") {
           const rest = t.slice(k + 1);
@@ -2188,36 +1997,36 @@ function doParseGh(ctx: RuleContext): GhParse {
     if (ate) continue;
   }
 
-  // 第二遍：若有唯一的 null token，它必須就是第一個位置操作元，且只有 gh api 可救
+  // 唯一的 null token 必須就是 api 之後的第一個位置操作元，且只有 gh api 可救
   let relaxedIdx = -1;
   const operands: string[] = [];
   for (const idx of operandIdxs) {
     const t = toks[idx];
     if (t !== null) { operands.push(t); continue; }
     if (command !== "api" || idx !== operandIdxs[0]) {
-      return REJECT("gh：動態 token 不在 endpoint 位置");
+      return reject("gh：動態 token 不在 endpoint 位置");
     }
     const relaxed = nonPathStaticValue(argv[idx]);
     if (relaxed === null || relaxed.startsWith("-")) {
-      return REJECT("gh：含動態 token，無法靜態判定");
+      return reject("gh：含動態 token，無法靜態判定");
     }
-    // endpoint 的萬用字元必須落在第一個 `/` 之後，確保第一段（repos/orgs/…）為字面
+    // endpoint 的萬用字元必須落在第一個 `/` 之後，確保第一段（repos / orgs / …）為字面
     const g = firstGlobMetacharIndex(relaxed);
     const slash = relaxed.indexOf("/");
     if (g !== -1 && (slash === -1 || g <= slash)) {
-      return REJECT(`gh api：endpoint 的萬用字元位置不安全（${relaxed}）`);
+      return reject(`gh api：endpoint 的萬用字元位置不安全（${relaxed}）`);
     }
     relaxedIdx = idx;
     operands.push(relaxed);
   }
-  if (nullIdxs.length === 1 && relaxedIdx === -1) {
-    return REJECT("gh：含動態 token，無法靜態判定");
+  if (nullCount === 1 && relaxedIdx === -1) {
+    return reject("gh：含動態 token，無法靜態判定");
   }
 
-  return { reject: null, command, operands, relaxedIdx, localSideEffect, mutating, unknownFlag };
+  return { reject: null, command, operands, relaxedIdx, sideEffect, mutating, unknownFlag };
 }
 
-/** endpoint 含由 cwd 的 git repo 填值的佔位符。 */
+/** endpoint 含由 cwd 的 git repository 填值的佔位符。 */
 function hasCwdPlaceholder(endpoint: string): boolean {
   return endpoint.includes("{owner}") || endpoint.includes("{repo}") ||
     endpoint.includes("{branch}");
@@ -2228,7 +2037,7 @@ export const ghRule: CommandRule = {
   evaluate(ctx: RuleContext): RuleVerdict {
     const p = parseGh(ctx);
     if (p.reject !== null) return ask(p.reject);
-    if (p.localSideEffect) {
+    if (p.sideEffect) {
       return ask("gh：-w/--web 會開啟本機瀏覽器、--cache 會寫入本機快取");
     }
     if (p.unknownFlag !== null) {
@@ -2252,7 +2061,7 @@ export const ghRule: CommandRule = {
    */
   cwdIndependent(ctx: RuleContext): boolean {
     const p = parseGh(ctx);
-    if (p.reject !== null || p.localSideEffect || p.unknownFlag !== null) return false;
+    if (p.reject !== null || p.sideEffect || p.unknownFlag !== null) return false;
     if (p.command !== "api" && p.command !== "search") return false;
     if (p.command === "api") {
       if (p.mutating) return false;
@@ -2270,213 +2079,119 @@ export const ghRule: CommandRule = {
 };
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [ ] **Step 4: Run the tests, full suite, type check and lint**
 
-Run: `deno test --allow-env src/rules/commands/gh_test.ts`
-Expected: PASS.
+Run: `deno task check && deno task lint && deno task test`
+Expected: all green.
 
-- [ ] **Step 5: Type check and lint**
-
-Run: `deno task check && deno task lint`
-Expected: no errors (note there is no `Word` import — `gh.ts` does not need it).
-
-- [ ] **Step 6: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
 git add src/rules/commands/gh.ts src/rules/commands/gh_test.ts
-git commit -m "feat(rules): flag-aware gh parse, flag allowlist, local side-effect asks"
+git commit -m "feat(rules): flag-aware gh parse, flag allowlist, local side-effect asks, endpoint operand"
 ```
 
 ---
 
-### Task 11: `curl` — URL operand tolerance + authority guard
+### Task 12: `curl` — declare cwd-independence only (no relaxed parsing)
 
 **Files:**
 - Modify: `src/rules/commands/curl.ts`
 - Test: `src/rules/commands/curl_test.ts`
 
-**The allowed domain in `curl_test.ts`'s fixture is `api.example.com`** — use it, not
-`example.com`. If the file has no single-line helper, add one next to its existing `ctxOf`:
-
-```ts
-const v = (src: string) => curlRule.evaluate(ctxOf(src)).kind;
-```
+`curl` gets **no** relaxed operand value: its verdict compares preapproved **path prefixes**, not
+just the host, so an expanded `?` could change the verdict. Unquoted `?` therefore stays dynamic
+and asks. Quoted URLs are unaffected, and `curl` still gets the cwd exemption — that never
+depended on relaxed parsing.
 
 - [ ] **Step 1: Write the failing tests**
 
+The fixture's allowed domain is **`api.example.com`**. If the file has no one-liner, add
+`const v = (src: string) => curlRule.evaluate(ctxOf(src)).kind;` next to its `ctxOf`.
+
 ```ts
-Deno.test("curl tolerates an unquoted single-? query string in the URL path", () => {
-  assertEquals(v("curl -s https://api.example.com/p?q=1"), "allow");
-});
-
-Deno.test("curl asks for a URL with no path segment", () => {
-  // `https://host?q=1` 展開時 `?` 是 host 的一個字元 -> https://hostXq=1，主機會變
+Deno.test("curl leaves unquoted ? dynamic", () => {
+  // curl 的判定會比對 preapproved 的 path 前綴，展開會改變判定 → 不套用寬鬆取值
+  assertEquals(v("curl -s https://api.example.com/p?q=1"), "ask");
   assertEquals(v("curl -s https://api.example.com?q=1"), "ask");
-  assertEquals(v("curl -s https://ex?mple.com/p"), "ask");
-  assertEquals(v("curl -s http?://api.example.com/p"), "ask");
 });
 
-Deno.test("curl never tolerates metachars in flags or flag values", () => {
-  assertEquals(v("curl -H Accept:a?b https://api.example.com/p"), "ask");
-  assertEquals(v("curl --max-time 1?0 https://api.example.com/p"), "ask");
-});
-
-Deno.test("curl still rejects * and [ in the URL", () => {
-  assertEquals(v("curl -s https://api.example.com/a*b"), "ask");
-  assertEquals(v("curl -s 'https://api.example.com/a[1-3]b'"), "ask");
-});
-
-Deno.test("curl verdict is identical for every single-character expansion", () => {
-  const base = v("curl -s https://api.example.com/p?q=1");
-  assertEquals(base, "allow");
-  for (const ch of ["X", "-", ".", "1", "_"]) {
-    assertEquals(v(`curl -s https://api.example.com/p${ch}q=1`), base, ch);
-  }
-});
-
-Deno.test("curl verdict is unchanged when an expansion yields multiple URLs", () => {
-  assertEquals(
-    v("curl -s https://api.example.com/pXq=1 https://api.example.com/pYq=1"),
-    "allow",
-  );
+Deno.test("quoted curl URLs are unaffected", () => {
+  assertEquals(v("curl -s 'https://api.example.com/p?q=1'"), "allow");
+  assertEquals(v("curl -s 'https://api.example.com/p'"), "allow");
 });
 
 Deno.test("curl cwdIndependent tracks the evaluate verdict", () => {
-  assertEquals(curlRule.cwdIndependent!(ctxOf("curl -s https://api.example.com/p?q=1")), true);
-  assertEquals(curlRule.cwdIndependent!(ctxOf("curl -s https://not-allowed.test/p")), false);
+  assertEquals(curlRule.cwdIndependent!(ctxOf("curl -s 'https://api.example.com/p?q=1'")), true);
+  assertEquals(curlRule.cwdIndependent!(ctxOf("curl -s 'https://not-allowed.test/p'")), false);
+  assertEquals(curlRule.cwdIndependent!(ctxOf("curl -s https://api.example.com/p?q=1")), false);
 });
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [ ] **Step 2: Run them to verify they fail**
 
 Run: `deno test --allow-env src/rules/commands/curl_test.ts`
-Expected: FAIL.
+Expected: FAIL — `cwdIndependent` is undefined on `curlRule`.
 
-- [ ] **Step 3: Implement in `src/rules/commands/curl.ts`**
+- [ ] **Step 3: Add only the predicates to `src/rules/commands/curl.ts`**
 
-Add to the imports:
-
-```ts
-import { firstGlobMetacharIndex, nonPathStaticValue, staticValue } from "../../engine/word.ts";
-```
-
-Add after the flag sets:
+No parsing change at all. Append to the exported object:
 
 ```ts
-/**
- * URL 的 glob 元字元必須落在「終結 authority 的那個 `/`」之後。
- * 只有真正的 `/` 能終結 authority：`https://host?q=1` 的 `?` 展開時會被當成 host
- * 尾端的一個字元（變成 https://hostXq=1），主機因此會改變，故無路徑段的 URL 一律不容忍。
- * 這保證 scheme 與 host 完全落在字面前綴內，展開結果不可能換到別的主機。
- */
-function metacharAfterAuthority(url: string): boolean {
-  const g = firstGlobMetacharIndex(url);
-  if (g === -1) return true;
-  const schemeEnd = url.indexOf("://");
-  const from = schemeEnd === -1 ? 0 : schemeEnd + 3;
-  const slash = url.indexOf("/", from);
-  if (slash === -1) return false; // 無路徑段
-  return g > slash;
-}
-```
-
-In `evaluate`, compute the single rescuable index up front and use `staticValue` everywhere else:
-
-```ts
-    const argv = ctx.argv;
-    const urls: string[] = [];
-    const nullIdxs = argv.map((w, i) => (staticValue(w) === null ? i : -1)).filter((i) => i >= 0);
-    if (nullIdxs.length > 1) return ask("curl：含一個以上動態參數，無法判定");
-    const relaxIdx = nullIdxs.length === 1 ? nullIdxs[0] : -1;
-
-    for (let i = 0; i < argv.length; i++) {
-      let t = staticValue(argv[i]);
-      if (t === null) {
-        // 只有位置參數（URL 候選）可救；旗標與旗標值永不套用寬鬆取值。
-        // 走到這裡代表 i 尚未被任何旗標分支消費，故它就是位置參數。
-        const relaxed = i === relaxIdx ? nonPathStaticValue(argv[i]) : null;
-        if (relaxed === null || relaxed.startsWith("-")) {
-          return ask("curl：動態參數無法判定");
-        }
-        t = relaxed;
-      }
-```
-
-Leave every *flag value* read as `staticValue(argv[i])` with its existing `null → ask` — a dynamic
-flag value must never be rescued. Then before the domain check:
-
-```ts
-    if (urls.length === 0) return ask("curl：未發現 URL");
-    for (const u of urls) {
-      if (!metacharAfterAuthority(u)) {
-        return ask(`curl：URL 的萬用字元位置不安全（${u}）`);
-      }
-      if (ctx.resolveUrl(u) !== "allowed") {
-        return ask(`curl：URL 不在允許網域或形式不安全（${u}）`);
-      }
-    }
-    return allow();
-```
-
-Add the two predicates to the exported object:
-
-```ts
-  /** allow 形式只走網路；-H @file 已由 resolvePathValue 以真實 cwd 檢查。 */
+  /**
+   * allow 形式只走網路；`-H @file` 已由 resolvePathValue 以真實 cwd 檢查。
+   * evaluate 是 ctx 的純函式，故此處重入得到同一個判定；classify 只在 evaluate 已回
+   * allow 時才詢問本述詞，因此不可能放寬判定。
+   */
   cwdIndependent(ctx: RuleContext): boolean {
     return curlRule.evaluate(ctx).kind === "allow";
   },
-  /** 唯一容忍的非靜態 token 是 URL 操作元；旗標與旗標值永不容忍。 */
-  toleratesNonStaticOperand(ctx: RuleContext): boolean {
-    return curlRule.evaluate(ctx).kind === "allow";
-  },
 ```
 
-`curlRule.evaluate` is a pure function of `ctx`, so re-entering it yields the identical verdict;
-`classify` only consults the predicates when `evaluate` already returned `allow`, so neither
-predicate can widen the exemption.
+Do **not** add `toleratesNonStaticOperand` — `curl` tolerates no non-static token, so guardrail 4
+must reject any such call.
 
-- [ ] **Step 4: Run the tests to verify they pass**
-
-Run: `deno test --allow-env src/rules/commands/curl_test.ts`
-Expected: PASS.
-
-- [ ] **Step 5: Run the full suite, type check and lint**
+- [ ] **Step 4: Run the tests, full suite, type check and lint**
 
 Run: `deno task check && deno task lint && deno task test`
-Expected: all green — this is the first point where every rule has been converted.
+Expected: all green.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
 git add src/rules/commands/curl.ts src/rules/commands/curl_test.ts
-git commit -m "feat(rules): tolerate single-? query strings in the curl URL operand"
+git commit -m "feat(rules): declare curl cwd-independence; no relaxed URL parsing"
 ```
 
 ---
 
-### Task 12: wire the cwd exemption into `classify` / `evaluate`
+### Task 13: wire the cwd exemption into `classify` / `evaluate`
 
 **Files:**
-- Modify: `src/rules/types.ts`, `src/engine/classify.ts`, `src/engine/evaluate.ts`
+- Modify: `src/engine/classify.ts`, `src/engine/evaluate.ts`
 - Test: `src/engine/classify_test.ts`
 
 - [ ] **Step 1: Write the failing tests**
 
-Append to `src/engine/classify_test.ts` (its existing helpers are `only`, `onlyWith`, `rulesOf`):
+Append to `src/engine/classify_test.ts`. It **already imports `walk`** — do not re-import it.
 
 ```ts
-import { walk } from "./walk.ts";
-
 /** 整條指令鏈的最終決策（session cwd 預設為專案內）。 */
 function decide(src: string, start: CwdState = START) {
   return evaluate(src, ROOT, start);
 }
 
 /** 單一葉指令的判定，可指定 sessionCwdInScope，用於直接檢驗護欄 2。 */
-function leaf(src: string, name: string, sessionInScope: boolean, start: CwdState = START) {
+function leaf(
+  src: string,
+  name: string,
+  sessionInScope: boolean,
+  start: CwdState = START,
+  rules?: PermissionRules,
+) {
   const invs = walk(parseCommand(src).script, start, ROOT);
   const inv = invs.find((i) => i.name === name)!;
-  return classify(inv, ROOT, undefined, null, [], sessionInScope);
+  return classify(inv, ROOT, rules, null, [], sessionInScope);
 }
 
 Deno.test("chain cd out of project no longer asks for cwd-independent commands", () => {
@@ -2485,23 +2200,23 @@ Deno.test("chain cd out of project no longer asks for cwd-independent commands",
   assertEquals(decide("cd /tmp && whoami").verdict, "allow");
 });
 
+Deno.test("guardrail 1: a settings.allow upgrade never grants the exemption", () => {
+  // gh api --input 讀本地檔 → 規則自身判 ask；即使 permissions.allow 命中也不得豁免
+  const rules = rulesOf({ allow: ["Bash(gh api:*)"] });
+  assertEquals(leaf("cd /tmp && gh api x --input body.json", "gh", true, START, rules).kind, "ask");
+  // 對照：同一條規則在專案內 cwd 下會被升級成 allow
+  assertEquals(onlyWith("gh api x --input body.json", rules).kind, "allow");
+});
+
 Deno.test("guardrail 2 blocks the leaf itself, not just the chain", () => {
-  // 直接檢驗葉指令：sessionCwdInScope=false 時即使 origin 是 chain-cd 也不豁免
-  assertEquals(leaf("cd . && echo hi", "echo", false, { kind: "known", path: "/outside" }).kind, "ask");
-  assertEquals(leaf("cd /tmp && echo hi", "echo", false, { kind: "known", path: "/outside" }).kind, "ask");
-  // 起點可信時同一個葉指令才豁免
+  const dirty: CwdState = { kind: "known", path: "/outside" };
+  assertEquals(leaf("cd . && echo hi", "echo", false, dirty).kind, "ask");
+  assertEquals(leaf("cd /tmp && echo hi", "echo", false, dirty).kind, "ask");
   assertEquals(leaf("cd /tmp && echo hi", "echo", true).kind, "allow");
 });
 
-Deno.test("guardrail 1: a settings.allow upgrade never grants the exemption", () => {
-  // ls 的規則自身判 ask（無操作元時作用於 cwd）；即使 permissions.allow 命中也不得豁免
-  const rules = rulesOf({ allow: ["Bash(ls *)"] });
-  const invs = walk(parseCommand("cd /tmp && ls").script, ROOT === "" ? "/" : ROOT);
-  assertEquals(onlyWith("cd /tmp && ls", rules).kind, "ask");
-});
-
 Deno.test("guardrail 3: path operands are still resolved against the real cwd", () => {
-  assertEquals(decide("cd /tmp && cat a.txt").verdict, "ask");
+  assertEquals(decide("cd /tmp && head -100 a.txt").verdict, "ask");
 });
 
 Deno.test("guardrail 4: a non-static token blocks the exemption", () => {
@@ -2517,57 +2232,32 @@ Deno.test("guardrail: which is never cwd-independent (PATH may contain .)", () =
 Deno.test("the other central preflight rules still fire under the exemption", () => {
   assertEquals(decide("cd /tmp && echo hi > out.txt").verdict, "ask"); // 寫入重導向
   assertEquals(decide("cd /tmp && FOO=1 echo hi").verdict, "ask"); // 賦值前綴
-  assertEquals(decide("cd /tmp && echo hi < ../outside.txt").verdict, "ask"); // 範圍外 <
+  assertEquals(decide("cd /tmp && head -1 < ../outside.txt").verdict, "ask"); // 範圍外 <
 });
 
 Deno.test("commands that implicitly act on cwd still ask", () => {
-  assertEquals(decide("cd /tmp && ls").verdict, "ask");
-  assertEquals(decide("cd /tmp && tree").verdict, "ask");
-  assertEquals(decide("cd /tmp && file x").verdict, "ask");
-  assertEquals(decide("cd /tmp && date -r x").verdict, "ask");
-  assertEquals(decide("cd /tmp && rg pat").verdict, "ask");
-  assertEquals(decide("cd /tmp && git status").verdict, "ask");
-  assertEquals(decide("cd /tmp && deno test").verdict, "ask");
+  for (const c of ["ls", "tree", "file x", "date -r x", "rg pat", "git status", "deno test", "cat", "awk '{print}'", "yq '.'", "sort", "uniq", "xxd", "diff", "tr a b"]) {
+    assertEquals(decide(`cd /tmp && ${c}`).verdict, "ask", c);
+  }
 });
 
-Deno.test("find keeps its hard deny under the exemption path", () => {
-  assertEquals(decide("cd /tmp && find . -name x").verdict, "deny");
-  assertEquals(decide("cd /tmp && find -name x").verdict, "ask");
+Deno.test("find's hard deny needs a real root; /tmp is only an ask", () => {
+  // dangerousRoot 只對磁碟根 / 家目錄根 deny；/tmp 兩者都不是
+  assertEquals(decide("cd /tmp && find . -name x").verdict, "ask");
+  assertEquals(decide("cd /tmp && find / -name x").verdict, "deny");
+  assertEquals(decide("cd / && find . -name x").verdict, "deny");
 });
 ```
 
-Delete the unused `invs` line from the guardrail-1 test — `onlyWith` already builds what it needs.
+Add `import type { PermissionRules } from "../permissions/settings.ts";` if the file does not
+already have it (it imports the type for `rulesOf`, so it likely does).
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [ ] **Step 2: Run them to verify they fail**
 
 Run: `deno test --allow-env src/engine/classify_test.ts`
 Expected: FAIL.
 
-- [ ] **Step 3: Declare the predicates in `src/rules/types.ts`**
-
-```ts
-export interface CommandRule {
-  /** 此規則涵蓋的指令名（含別名）。 */
-  names: string[];
-  evaluate(ctx: RuleContext): RuleVerdict;
-  /**
-   * 此次呼叫的安全判定是否與 cwd 無關，需同時滿足：
-   *  (a) 不以 cwd 相對路徑讀取檔案；
-   *  (b) 不隱含以 cwd 為操作對象（如 ls / find 無操作元時作用於 cwd）；
-   *  (c) 安全判定所依據的資訊不取決於 shell 對 cwd 的 glob 展開結果。
-   * (c) 是「判定不依賴展開結果」，不是「不含 glob 元字元」。
-   * 未宣告 = 否（default-deny）。必須為純函式、不得有副作用。
-   */
-  cwdIndependent?(ctx: RuleContext): boolean;
-  /**
-   * 此次呼叫是否僅含「本工具的判定不讀其內容」的 endpoint / URL 操作元這一種非靜態 token
-   * （其餘 token 皆靜態）。只有 gh / curl 宣告；必須為純函式。
-   */
-  toleratesNonStaticOperand?(ctx: RuleContext): boolean;
-}
-```
-
-- [ ] **Step 4: Wire it in `src/engine/classify.ts`**
+- [ ] **Step 3: Wire it in `src/engine/classify.ts`**
 
 Change `centralPreflightAsk` to take `skipCwdCheck` and guard only rule 1:
 
@@ -2619,7 +2309,7 @@ export function classify(
   if (ruleVerdict?.kind === "deny") return ruleVerdict;
 
   // 護欄 4：argv 必須全為靜態 token。唯一例外是規則自身以 toleratesNonStaticOperand
-  // 認定的 endpoint / URL 操作元（本工具的判定不讀其內容）。
+  // 認定的操作元（本工具的判定完全不讀其內容）。
   const allArgvStatic = inv.argv.every((w) => staticValue(w) !== null);
   const cwdExempt = ruleVerdict?.kind === "allow" && // 護欄 1
     sessionCwdInScope && // 護欄 2（起點可信）
@@ -2637,7 +2327,7 @@ export function classify(
 Add to `classify.ts`'s imports: `import type { RuleContext } from "../rules/types.ts";` and
 `import { staticValue } from "./word.ts";`.
 
-- [ ] **Step 5: Compute `sessionCwdInScope` in `src/engine/evaluate.ts`**
+- [ ] **Step 4: Compute `sessionCwdInScope` in `src/engine/evaluate.ts`**
 
 ```ts
     const scope = buildScopeConfig(root, rules, home, trustedReadRoots);
@@ -2652,83 +2342,54 @@ Add to `classify.ts`'s imports: `import type { RuleContext } from "../rules/type
 
 Add: `import { buildScopeConfig, isReadScoped, normalizeAbsolute } from "./scope.ts";`
 
-- [ ] **Step 6: Run the tests to verify they pass**
-
-Run: `deno test --allow-env src/engine/classify_test.ts`
-Expected: PASS.
-
-- [ ] **Step 7: Run the full suite, type check and lint**
+- [ ] **Step 5: Run the tests, full suite, type check and lint**
 
 Run: `deno task check && deno task lint && deno task test`
 Expected: all green.
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
-git add src/rules/types.ts src/engine/classify.ts src/engine/evaluate.ts src/engine/classify_test.ts
+git add src/engine/classify.ts src/engine/evaluate.ts src/engine/classify_test.ts
 git commit -m "feat(engine): cwd-independent exemption for central preflight rule 1"
 ```
 
 ---
 
-### Task 13: end-to-end acceptance pairs for every declaring rule
+### Task 14: acceptance matrix + filesystem-state independence
 
 **Files:**
-- Test: `src/engine/classify_test.ts`
+- Test: `src/engine/classify_test.ts`, `src/rules/commands/gh_test.ts`
 
-Spec §7.1 requires a stdin-only **allow** and a path-operand **ask** for every conditionally
-declaring rule. Task 12 covered the guardrails; this task covers the matrix.
+- [ ] **Step 1: Write the acceptance matrix**
 
-- [ ] **Step 1: Write the tests**
+Append to `src/engine/classify_test.ts`:
 
 ```ts
-Deno.test("stdin-only filters are cwd-independent after chain cd", () => {
+Deno.test("all seven declaring commands are cwd-independent with no operands", () => {
   const cases = [
-    "cat", "head -100", "wc -l", "cut -c1", "tr a b", "nl", "fold -w 80",
-    "column -t", "sort", "uniq", "xxd", "tail -200", "yq '.'", "diff",
-    "grep -E 'Retry'", "sed -n '600,750p'", "awk '{print $1}'", "jq -r '.name'",
+    "head -100", "wc -l", "tail -200", "grep -E 'Retry'",
+    "sed -n '600,750p'", "jq -r '.name'",
+    "gh api repos/o/r/tags?per_page=50", "gh search code x --language go",
   ];
   for (const c of cases) {
     assertEquals(decide(`cd /tmp && ${c}`).verdict, "allow", c);
   }
 });
 
-Deno.test("the same commands with a path operand still ask", () => {
+Deno.test("the same seven with a path operand or path flag still ask", () => {
   const cases = [
-    "cat a.txt", "head -100 a.txt", "wc -l a.txt", "cut -c1 a.txt", "nl a.txt",
-    "fold -w 80 a.txt", "column -t a.txt", "sort a.txt", "uniq a.txt", "xxd a.txt",
-    "tail -200 a.txt", "yq '.' a.yaml", "diff a.txt b.txt", "grep pat a.txt",
-    "sed -n '1p' a.txt", "awk '{print}' a.txt", "jq -r '.name' a.json",
+    "head -100 a.txt", "wc -l a.txt", "tail -200 a.txt", "grep pat a.txt",
+    "sed -n '1p' a.txt", "jq -r '.name' a.json",
+    "wc --files0-from=list", "grep --exclude-from=f pat", "jq -f prog.jq",
+    "jq -L mods '.'", "sed -nfprog.sed p",
+    "gh pr diff", "gh repo view", "gh api 'repos/{owner}/{repo}/issues'",
+    "gh search code x --web", "gh api x --cache 1h", "gh api x --totally-unknown",
+    "head --totally-unknown", "grep --totally-unknown pat", "sed --totally-unknown 'p'",
   ];
   for (const c of cases) {
     assertEquals(decide(`cd /tmp && ${c}`).verdict, "ask", c);
   }
-});
-
-Deno.test("guardrail 5: a path-valued or unknown flag blocks the exemption", () => {
-  assertEquals(decide("cd /tmp && wc --files0-from=list").verdict, "ask");
-  assertEquals(decide("cd /tmp && sort --files0-from=list").verdict, "ask");
-  assertEquals(decide("cd /tmp && grep --exclude-from=f pat").verdict, "ask");
-  assertEquals(decide("cd /tmp && realpath --relative-to=d x").verdict, "ask");
-  assertEquals(decide("cd /tmp && diff -X ex.txt a.txt b.txt").verdict, "ask");
-  assertEquals(decide("cd /tmp && jq -f prog.jq").verdict, "ask");
-  assertEquals(decide("cd /tmp && wc --some-unknown-flag").verdict, "ask");
-  assertEquals(decide("cd /tmp && sed --some-unknown-flag 'p'").verdict, "ask");
-  assertEquals(decide("cd /tmp && awk --some-unknown-flag '{print}'").verdict, "ask");
-});
-
-Deno.test("gh api / search become cwd-independent after chain cd", () => {
-  assertEquals(decide("cd /tmp && gh api repos/o/r/tags?per_page=50").verdict, "allow");
-  assertEquals(decide("cd /tmp && gh search code x --language go").verdict, "allow");
-});
-
-Deno.test("repo-scoped gh subcommands and placeholders are never exempt", () => {
-  assertEquals(decide("cd /tmp && gh pr diff").verdict, "ask");
-  assertEquals(decide("cd /tmp && gh repo view").verdict, "ask");
-  assertEquals(decide("cd /tmp && gh issue list --repo o/r").verdict, "ask");
-  assertEquals(decide("cd /tmp && gh api 'repos/{owner}/{repo}/issues'").verdict, "ask");
-  assertEquals(decide("cd /tmp && gh search code x --web").verdict, "ask");
-  assertEquals(decide("cd /tmp && gh api x --cache 1h").verdict, "ask");
 });
 
 Deno.test("the baseline pipeline shapes now allow end to end", () => {
@@ -2743,40 +2404,14 @@ Deno.test("the baseline pipeline shapes now allow end to end", () => {
   assertEquals(decide("cd /tmp && gh api repos/o/r/x 2>&1 | wc -l").verdict, "allow");
   assertEquals(decide("cd /tmp && gh api repos/o/r/x 2>&1 | sed -n '600,750p'").verdict, "allow");
   assertEquals(decide("cd /tmp && gh api repos/o/r/tags?per_page=50 | head -100").verdict, "allow");
+  assertEquals(decide("cd /tmp && gh api repos/o/r/x 2>&1 | tail -200").verdict, "allow");
 });
 ```
 
-- [ ] **Step 2: Run them**
+- [ ] **Step 2: Write the filesystem-state independence fixture**
 
-Run: `deno test --allow-env src/engine/classify_test.ts`
-Expected: PASS. Any failure here is a real gap in Tasks 5–12 — fix the rule, never the assertion.
-
-- [ ] **Step 3: Run the full suite, type check and lint**
-
-Run: `deno task check && deno task lint && deno task test`
-Expected: all green.
-
-- [ ] **Step 4: Commit**
-
-```bash
-git add src/engine/classify_test.ts
-git commit -m "test(engine): full stdin-only allow / path-operand ask matrix for the exemption"
-```
-
----
-
-### Task 14: filesystem-state independence fixtures
-
-**Files:**
-- Test: `src/rules/commands/gh_test.ts`, `src/rules/commands/curl_test.ts`
-
-The verdict must depend only on the literal token, never on what exists in the cwd. The fixture
-must therefore build the rule context **with the temp directory as its cwd**, and compare the same
-context before and after creating a matching file.
-
-- [ ] **Step 1: Write the tests**
-
-Append to `src/rules/commands/gh_test.ts`:
+Append to `src/rules/commands/gh_test.ts`. The context must be built **with the temp directory as
+its cwd and root**, and compared before and after creating a matching file:
 
 ```ts
 /** 以指定目錄為 cwd/root 建立 RuleContext（fixture 用）。 */
@@ -2826,20 +2461,21 @@ Deno.test("multiple expanded endpoints are a gh usage error, never a write", () 
 });
 ```
 
-The curl invariance tests were already added in Task 11 Step 1.
+No curl fixture is needed — `curl` has no relaxed parsing, so its verdict is trivially independent
+of the filesystem.
 
-- [ ] **Step 2: Run them**
+- [ ] **Step 3: Run everything**
 
-Run: `deno task test`
-Expected: PASS. `deno.json`'s test task already grants
-`--allow-run --allow-env --allow-read --allow-write --allow-sys=uid`, so no config change is
-needed.
+Run: `deno task check && deno task lint && deno task test`
+Expected: all green. `deno.json`'s test task already grants
+`--allow-run --allow-env --allow-read --allow-write --allow-sys=uid`. Any failure in the matrix is
+a real gap in Tasks 5–13 — fix the rule, never the assertion.
 
-- [ ] **Step 3: Commit**
+- [ ] **Step 4: Commit**
 
 ```bash
-git add src/rules/commands/gh_test.ts
-git commit -m "test(rules): lock verdict independence from cwd filesystem state"
+git add src/engine/classify_test.ts src/rules/commands/gh_test.ts
+git commit -m "test: acceptance matrix for the seven declaring commands + fs-state independence"
 ```
 
 ---
@@ -2849,12 +2485,10 @@ git commit -m "test(rules): lock verdict independence from cwd filesystem state"
 **Files:**
 - Modify: `CLAUDE.md`
 
-Three places currently contradict the new behavior and must be updated together, or a future
-maintainer will "fix" the exemption back out.
+Three places currently contradict the new behavior and must change together, or a future
+maintainer will remove the exemption as a "regression".
 
-- [ ] **Step 1: Update the central preflight rule 1 description**
-
-In "四條中央前置規則（於 classify.ts…）", replace item 1:
+- [ ] **Step 1: Replace central preflight rule 1's description**
 
 ```markdown
 1. **cwd 範圍**：`cwd.kind === "known"` 但落在「專案 ∪ 使用者以 `Read()/Edit()/Write()` 放寬的外部
@@ -2863,16 +2497,17 @@ In "四條中央前置規則（於 classify.ts…）", replace item 1:
    (1) 指令規則自身回 `allow`（`permissions.allow` 升級的 ask 永不豁免）；
    (2) hook 傳入的 session cwd 本身在範圍內 **且** 當前 cwd 由鏈內 `cd` 產生（`origin === "chain-cd"`）；
    (3) 相對路徑仍以真實 cwd 解析；
-   (4) argv 全為靜態 token（唯一例外是 gh api endpoint / curl URL 操作元，由規則以
+   (4) argv 全為靜態 token（唯一例外是 `gh api` 的 endpoint 操作元，由規則以
        `toleratesNonStaticOperand` 認定）；
    (5) 每個旗標都命中該規則的已知旗標表。
    宣告方式為 `CommandRule.cwdIndependent`，未宣告 = 不豁免（default-deny）。
+   **目前宣告者只有七個指令**：`gh`（僅 `api` / `search`）、`head`、`wc`、`tail`、`grep`、`sed`、`jq`，
+   加上無操作元的 `echo` / `pwd` / `whoami`（`which` 明確排除：PATH 可含 `.`）。
 ```
 
-- [ ] **Step 2: Fix the contradicting statement about out-of-scope cwd being a regression**
+- [ ] **Step 2: Qualify the statement that an out-of-scope-cwd allow is a regression**
 
-The line stating that a binary returning `allow` for an out-of-scope cwd is a regression must be
-qualified. Replace that clause with:
+Replace that clause with:
 
 ```markdown
 若 binary 對帶**寫入重導向／賦值前綴／範圍外 `<`** 的指令回 `allow`，那**是 regression**——這三條
@@ -2881,9 +2516,7 @@ qualified. Replace that clause with:
 行為而非 regression；不符合任一護欄者仍必須 `ask`。
 ```
 
-- [ ] **Step 3: Fix the contradicting statement in 「新增 / 修改指令規則」**
-
-Replace the sentence saying rule behavior cannot affect any of the four preflight outcomes with:
+- [ ] **Step 3: Fix the contradicting sentence in 「新增 / 修改指令規則」**
 
 ```markdown
 **不要重複處理**中央前置規則已涵蓋的事（cwd 範圍、寫入重導向、賦值前綴、範圍外 `<`）。規則雖**先於**
@@ -2893,41 +2526,40 @@ Replace the sentence saying rule behavior cannot affect any of the four prefligh
 
 - [ ] **Step 4: Update the architecture bullets**
 
-`classify.ts` bullet — append:
+`classify.ts` — append:
 
 ```markdown
   另計算 cwd 豁免旗標（`cwdIndependent` / `toleratesNonStaticOperand` 兩個可選述詞 + 五道護欄），
   以 `skipCwdCheck` 傳給 `centralPreflightAsk`，**僅**跳過規則一。
 ```
 
-`scope.ts` bullet — append:
+`scope.ts` — append:
 
 ```markdown
   另提供 `buildScopeConfig`，供 `evaluate`（計算 `sessionCwdInScope`）與 `classify` 共用同一份範圍定義。
 ```
 
-`rules/` bullet — replace the file list line with:
+`rules/` — replace the file-list line with:
 
 ```markdown
 `rules/`：`types.ts`（`CommandRule`/`RuleContext`/`RuleVerdict` + `allow()`/`ask()`/`deny()`，
 另含 `cwdIndependent` / `toleratesNonStaticOperand` 兩個可選述詞）、
-`command_spec.ts`（**每個指令一份 `CommandSpec`**：每個旗標只描述一次——名稱、是否吃值、值是否為路徑；
-外加位置參數語義 `paths` / `none` / `pattern-then-paths`。`parseArgv` 對每個 `RuleContext` 只解析一次
-並快取，`evaluate` 與 `cwdIndependent` 因此讀到**同一份**結果，不會各自重掃而漂移）、
-`flags.ts`、`factory.ts`（`flagGatedReader`，改由 `CommandSpec` 驅動）、`allowlist.ts`、
-`commands/*.ts`（每類指令一檔；本次新增 `commands/jq.ts`，`jq` 已自 `fileReaderRule` 移出）。
+`command_spec.ts`（`CommandSpec`：每個旗標只描述一次——名稱、吃值方式
+（`none` / `required` / `attached-only`）、值是否為路徑；外加位置參數語義與 legacy 數字短旗標開關。
+`parseArgv` 對每個 `RuleContext` 只解析一次並快取，`evaluate` 與 `cwdIndependent` 因此讀到**同一份**
+結果。**只有 `grep`/`egrep`/`fgrep`、`head`、`wc`、`tail` 使用它**；其餘指令沿用 legacy 設定且不參與
+cwd 豁免，故無須建模其旗標文法）、`flags.ts`、`factory.ts`、`allowlist.ts`、`commands/*.ts`
+（本次新增 `commands/jq.ts`，`jq` 已自 `fileReaderRule` 移出）。
 ```
 
 - [ ] **Step 5: Add the `word.ts` note**
 
-Append to the `word.ts` section:
-
 ```markdown
 - **`nonPathStaticValue`**：只容忍「單一 `?` 查詢串」形態（恰一個未跳脫 `?`、不在索引 0、其後不含 `/`）
-  的未加引號 token，且**只可用於 `gh api` 的 endpoint 與 `curl` 的 URL 操作元**。旗標、旗標值、任何
-  路徑一律沿用 `staticValue`。安全性由「本工具的判定不讀該 token 內容」保證：`gh api` 的判定只看旗標，
-  `curl` 的 scheme/host 由「元字元必須落在終結 authority 的 `/` 之後」保證落在字面前綴內
-  （故 `https://host?q=1` 這種無路徑段的 URL 一律 ask——展開會改變主機）。
+  的未加引號 token，且**只可用於 `gh api` 的 endpoint 操作元**。安全性由「本工具的判定完全不讀該
+  token 內容」保證——`ghApiMutates` 只掃描旗標。旗標、旗標值、任何路徑、以及 **`curl` 的所有 token**
+  一律沿用 `staticValue`：`curl` 的判定會比對 preapproved 的 **path 前綴**（`matchesPreapproved`），
+  展開會改變判定，故 `curl` 不套用寬鬆取值。
 ```
 
 - [ ] **Step 6: Update the gh notes**
@@ -2936,9 +2568,9 @@ In 「安全誤放（auto-allow 不該 allow）」, replace the gh part of the g
 
 ```markdown
 - **gh 已改為旗標 allowlist**：未知旗標一律 ask（同時免疫 gh 版本漂移）。本機副作用旗標
-  `-w`/`--web`（開瀏覽器）與 `--cache`（寫本機快取）對所有子指令一律 ask。非 GET 方法的偵測
-  以**旗標感知解析**進行，群集寫法（`-iXPOST`）同樣會被攔下。`gh api` 的 endpoint 含
-  `{owner}`/`{repo}`/`{branch}` 時目標由 cwd 的 git repo 決定 → 不得享有 cwd 豁免（一般判定不變）。
+  `-w`/`--web`（開瀏覽器）與 `--cache`（寫本機快取）對所有子指令一律 ask。非 GET 方法以**旗標感知
+  解析**偵測，群集寫法（`-iXPOST`）同樣攔下。`gh api` 的 endpoint 含 `{owner}`/`{repo}`/`{branch}`
+  時目標由 cwd 的 git repo 決定 → 不得享有 cwd 豁免（一般判定不變）。
 ```
 
 - [ ] **Step 7: Verify and commit**
@@ -2955,8 +2587,7 @@ git commit -m "docs: sync CLAUDE.md with the cwd exemption, CommandSpec, gh allo
 
 ### Task 16: build + operational verification against the real baseline set
 
-**Files:**
-- No source changes. Produces `dist/permission-checker(.exe)` (gitignored).
+**Files:** no source changes. Produces `dist/permission-checker(.exe)` (gitignored).
 
 **The acceptance criterion is fixed: 63 allow / 4 ask over the 67-command baseline.** A shortfall
 is an unmet criterion to diagnose, not a number to rewrite. Do **not** edit the spec's target.
@@ -2968,7 +2599,6 @@ Expected: `dist/permission-checker.exe` written, exit 0.
 
 - [ ] **Step 2: Create an isolated settings environment**
 
-Spec §7.3 requires verifying builtin classification without any `permissions.allow` interference.
 The binary reads project `.claude/settings.json`, `.claude/settings.local.json`, and the user
 settings under `CLAUDE_CONFIG_DIR ?? <home>/.claude`. Isolate all three:
 
@@ -2979,11 +2609,10 @@ mkdir -p "$VERIFY_ROOT/.claude"
 printf '{}' > "$VERIFY_ROOT/.claude/settings.json"
 printf '{}' > "$VERIFY_ROOT/.claude/settings.local.json"
 printf '{}' > "$VERIFY_CFG/settings.json"
-echo "root=$VERIFY_ROOT cfg=$VERIFY_CFG"
 ```
 
-Every invocation below must pass **both** `CLAUDE_PROJECT_DIR="$VERIFY_ROOT"` and
-`CLAUDE_CONFIG_DIR="$VERIFY_CFG"`. Confirm the isolation works before trusting any result:
+Every invocation below passes **both** `CLAUDE_PROJECT_DIR="$VERIFY_ROOT"` and
+`CLAUDE_CONFIG_DIR="$VERIFY_CFG"`. Confirm the isolation before trusting any result:
 
 ```bash
 printf '%s' '{"tool_name":"Bash","tool_input":{"command":"rm -rf x"},"cwd":"'"$VERIFY_ROOT"'"}' \
@@ -2995,7 +2624,7 @@ Expected: `ask`. If this prints `allow`, the isolation failed — stop and fix i
 
 - [ ] **Step 3: Build the 67-command baseline fixture**
 
-The baseline is the Bash tool calls of one research subagent transcript. Extract them with:
+The baseline is the Bash tool calls of one research subagent transcript:
 
 ```bash
 TRANSCRIPT="<path to the subagent .jsonl>"
@@ -3026,11 +2655,11 @@ cut -f1 baseline_results.txt | sort | uniq -c
 
 Expected: **63 allow, 4 ask**. The four asks must be the two `for f in …; do gh api …${f}… ; done`
 loops (variable expansion), the one `xargs -I {} sh -c …` line, and the one heredoc-write line.
-Confirm by pairing `baseline.jsonl` with `baseline_results.txt` line by line.
+Pair `baseline.jsonl` with `baseline_results.txt` line by line to confirm.
 
 **If the count is short:** for each unexpected `ask`, read its reason, identify which guardrail or
-flag table rejected it, and fix the rule — most likely a missing safe flag in a `CommandSpec` or
-in gh's tables. Adding a genuinely safe, side-effect-free flag to a table is the correct fix.
+flag table rejected it, and fix the rule — most likely a missing safe flag in a `CommandSpec` or in
+gh's tables. Adding a genuinely safe, side-effect-free flag to a table is the correct fix.
 Relaxing a guardrail, or editing the spec's target, is not.
 
 - [ ] **Step 5: Verify the guardrails end-to-end**
@@ -3039,19 +2668,21 @@ Relaxing a guardrail, or editing the spec's target, is not.
 for c in "cd /d && ls" "cd /d && cat x.txt" "cd /d && echo *" "cd /d && grep *" \
          "cd /d && gh pr diff" "cd /d && gh api repos/o/r/x > out.txt" \
          "cd /d && gh search code x --web" "cd /d && wc --files0-from=list" \
-         "cd /d && which some-name" "cd /d && curl -s https://api.github.com?q=1" ; do
-  printf '%s -> ' "$c"
+         "cd /d && which some-name" "cd /d && curl -s https://api.github.com/x?q=1" \
+         "cd /d && sed -nfprog.sed p" "cd /d && jq -f prog.jq" ; do
+  printf '%-52s -> ' "$c"
   jq -nc --arg c "$c" --arg d "$VERIFY_ROOT" '{tool_name:"Bash",tool_input:{command:$c},cwd:$d}' \
     | CLAUDE_PROJECT_DIR="$VERIFY_ROOT" CLAUDE_CONFIG_DIR="$VERIFY_CFG" ./dist/permission-checker.exe \
     | jq -r '.hookSpecificOutput.permissionDecision'
 done
-printf 'find -> '
+printf '%-52s -> ' "cd /d && find . -name x"
 jq -nc --arg c "cd /d && find . -name x" --arg d "$VERIFY_ROOT" '{tool_name:"Bash",tool_input:{command:$c},cwd:$d}' \
   | CLAUDE_PROJECT_DIR="$VERIFY_ROOT" CLAUDE_CONFIG_DIR="$VERIFY_CFG" ./dist/permission-checker.exe \
   | jq -r '.hookSpecificOutput.permissionDecision'
 ```
 
-Expected: `ask` for all ten loop entries; `deny` for the `find` line. **No line may print `allow`.**
+Expected: `ask` for all twelve loop entries; `deny` for the `find` line (`/d` normalizes to the
+`D:` drive root on Windows). **No line may print `allow`.**
 
 - [ ] **Step 6: Clean up**
 
