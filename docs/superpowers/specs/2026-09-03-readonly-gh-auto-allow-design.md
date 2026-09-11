@@ -81,8 +81,9 @@ ask）因此對整條鏈生效。**這條規則本身是對的**，問題在於�
 ### 2.1 目標
 
 1. 「鏈內 `cd` 到專案外 + 純網路唯讀指令 + 純 stdin 過濾器」不再因 cwd 而 ask。
-2. `gh` / `curl` 的 endpoint / URL 為「單一 `?` 查詢串」形態（`…/x?k=v`）時不再被判為動態；
+2. **`gh api` 的 endpoint** 為「單一 `?` 查詢串」形態（`…/x?k=v`）時不再被判為動態；
    含 `*` / `[` / 多重元字元 / `?` 後含 `/` 者維持 ask（見 §4.2）。
+   **`curl` 不在此列**——其判定會比對 preapproved 的 path 前綴，故不滿足 verdict 不變量（見 §8.6）。
 3. `grep` 的 pattern 與 `jq` 的 filter 不再被當作路徑做範圍檢查。
 4. 基準集 67 條達成 63 allow / 4 ask（以 build 後 binary 實測驗證）。
 
@@ -182,11 +183,11 @@ nonPathLeadingPositional?: (argv: Word[]) => boolean;
 
 長短旗標皆需支援 `--opt=value` 與 `--opt value` 兩種寫法。
 
-### 4.2 元件 2：endpoint / URL **操作元**的靜態取值（`gh` / `curl`）
+### 4.2 元件 2：`gh api` **endpoint 操作元**的靜態取值
 
-本元件的適用面**限縮到單一操作元**：`gh api` 的 endpoint、`curl` 的 URL。同一條指令中的其他
-token（子指令、旗標、旗標值、`-H` header 值等）**一律沿用 `staticValue`**——含未加引號 `?` 者
-維持動態 → ask。
+本元件的適用面**限縮到單一操作元**：`gh api` 的 endpoint。同一條指令中的其他 token（子指令、
+旗標、旗標值、`-H` header 值等）**一律沿用 `staticValue`**——含未加引號 `?` 者維持動態 → ask。
+**`curl` 完全不套用本元件**（理由見 §8.6）：其 URL 一律沿用 `staticValue`，未加引號的 `?` 維持 ask。
 
 由此得到本元件的**強制不變量**（§4.2.5 為其論證，§7.1 為其測試）：
 
@@ -243,8 +244,7 @@ bash pathname expansion 有兩條本規格所依賴的性質：
   endpoint 的所有前段目錄**必然落在字面前綴內**；
 - 條件 2 保證前綴非空，故展開結果**不可能以 `-` 開頭**、不會憑空變成旗標。
 
-**各呼叫端仍須各自檢查元字元位置**（見 §4.2.2）作為 defence in depth——條件 3 已涵蓋絕大多數情形，
-但無路徑段的 URL（如 `https://ho?t`）不受條件 3 約束，需由 curl 的 authority 護欄擋下。
+`gh api` 的呼叫端仍須另外檢查元字元位置（見 §4.2.2）作為 defence in depth。
 
 #### 4.2.2 呼叫端的元字元位置護欄
 
@@ -257,19 +257,6 @@ export function firstGlobMetacharIndex(value: string): number;
 
 各呼叫端據此強制「安全決策資訊落在字面前綴內」：
 
-- **`curl.ts`**：對每個 URL 候選值，元字元**必須出現在「終結 authority 的那個 `/`」之後**。
-  具體：令 `slash` = `scheme://` 之後第一個 `/` 的索引。**若不存在該 `/` → `ask`**；
-  否則 `firstGlobMetacharIndex(u)` 必須**嚴格大於** `slash`，不然 `ask`。
-
-  **無路徑段的 URL 一律 ask**，即使 `?` 看起來只在查詢串：`https://host?q=1` 展開時，
-  bash 會把 `?` 當成 host 尾端的一個字元，得到 `https://hostXq=1`——**主機被改掉**，
-  scheme/host 不再落在字面前綴內，違反 §4.2.5 的 verdict 不變量。因此**不能**把 `?` / `#`
-  當作 authority 的終結符；只有真正的 `/` 才是。
-
-  `https://ho?t`、`http?://host/x`、`https://host?q=1` 三者皆 `ask`；
-  `https://host/p?q=1` 才 allow。
-
-  這保證 `resolveUrl` 檢查的 scheme 與 host **完全落在字面前綴內**，展開結果不可能換到別的主機。
 - **`gh.ts`**：對 `api` 的 endpoint 操作元，元字元**必須出現在第一個 `/` 之後**；否則 `ask`。
   這保證 endpoint 的第一段（`repos` / `search` / `orgs` …）為字面。
 
@@ -282,16 +269,12 @@ export function firstGlobMetacharIndex(value: string): number;
 - 在「單一 `?` 查詢串」形態下，展開需要 cwd 底下**恰好存在**檔名為 `<字面前綴><任一字元><字面後綴>`
   的檔案；每個展開結果與原 pattern **只差一個字元**，且該字元不可能是 `/`。
 - `gh api` 收到多個位置操作元時是**用法錯誤**（gh 自行報錯），不會變成別的請求或寫入操作。
-- `curl` 收到多個 URL 時，依 §4.2.1 性質 1、條件 3 與 §4.2.2 的 authority 護欄，這些 URL 的 scheme
-  與 host **與已通過網域檢查者相同**，故仍在允許網域內。
 - 上述皆須有對應測試（見 §7.1），且測試須包含「在 cwd 實際建立可匹配檔案」的 fixture，證明判定
   只依字面 token、不因檔案系統狀態而改變。
 
-#### 4.2.4 套用點（只針對操作元，不是整條 argv）
+#### 4.2.4 套用點（只針對 gh api 的 endpoint 操作元）
 
-兩條規則的取值流程都改為「**先全部 `staticValue`，只對操作元位置做一次補救**」：
-
-`gh.ts`：
+`gh.ts` 的取值流程改為「**先全部 `staticValue`，只對 endpoint 位置做一次補救**」：
 
 1. 對每個 argv token 取 `staticValue`，記下哪些回 `null`。
 2. 若**回 `null` 的 token 超過一個** → `ask`（不做補救）。
@@ -301,16 +284,8 @@ export function firstGlobMetacharIndex(value: string): number;
    位置不符（例如它其實是某旗標的值）→ `ask`。
 5. 對該 endpoint 值套用 §4.2.2 的 `gh` 護欄。
 
-`curl.ts`：
-
-1. 主迴圈維持 `staticValue`；**任何被當作旗標或旗標值消費的 token 為 `null` → 直接 `ask`**
-   （旗標與旗標值永不套用寬鬆取值）。
-2. 僅當某個 `null` token 落在**位置參數（URL 候選）**位置、且全 argv 只有這一個 `null`、
-   且 `nonPathStaticValue` 取得的值不以 `-` 開頭時，才採用該值。
-3. 對該 URL 值套用 §4.2.2 的 authority 護欄，再照常送進 `resolveUrl`。
-
-`curl` 對 `{}` `[]` 的既有攔截**不放寬**：那是 curl 自己的 URL 展開語法，由 `resolveUrl` 判為
-「形式不安全」而 ask。
+`curl.ts` **完全不改**：其 URL 與所有旗標值一律沿用 `staticValue`，未加引號的 `?` 維持
+「動態 → ask」（理由見 §8.6）。
 
 其餘所有取值點（路徑相關、旗標、旗標值）**一律沿用 `staticValue`**，不得替換。
 
@@ -321,9 +296,8 @@ export function firstGlobMetacharIndex(value: string): number;
 任何展開結果都以非 `-` 的字面前綴開頭（§4.2.1 性質 2 ＋ 容忍條件 2），故**不可能**變成旗標、
 不可能改變 `ghApiMutates` 的結果。判定依據的 byte 集合與 endpoint 不相交 → verdict 恆定。
 
-`curl`：本工具的判定依據是旗標 allowlist ＋ `resolveUrl` 的 scheme 與 host。旗標與旗標值不套用
-寬鬆取值（§4.2.4），scheme/host 由容忍條件 3（`?` 之後不含 `/`）與 §4.2.2 的 authority 護欄保證
-落在字面前綴內。多字展開產生的額外 URL 共用同一 scheme+host，通過同一次網域檢查 → verdict 恆定。
+`curl` 不套用寬鬆取值，故不需要不變量論證——其 URL 若含未加引號的元字元，`staticValue` 直接
+判為動態 → ask（見 §8.6）。
 
 **結論**：argv 確實可能因展開而不同，但**本工具的 allow/ask 判定對所有可能的展開結果完全相同**。
 殘餘差異退化為「對同一個已允許主機取得不同的資料」——屬研究結果正確性問題，不是權限判定問題
@@ -470,7 +444,7 @@ rule allow）完全不變。
 | 規則 | 宣告條件 | 理由 |
 | --- | --- | --- |
 | `ghRule` | **僅** `api` 與 `search`；`api` 的 endpoint **不含 `{owner}` / `{repo}` / `{branch}` 佔位符**；且所有旗標命中 gh 的已知旗標表（護欄 5） | 目標由 endpoint / query 明確給定，不看 cwd |
-| `curlRule` | 全部 allow 形式 | 只走網路；`-H @file` 由 `resolvePathValue` 以真實 cwd 檢查 |
+| `curlRule` | 全部 allow 形式（**不含**任何寬鬆取值，見 §4.2.4） | 只走網路；`-H @file` 由 `resolvePathValue` 以真實 cwd 檢查 |
 | `pureUtilRule` | `echo` / `pwd` / `whoami`（**排除 `which`**） | 不接受路徑操作元、不查檔案系統 |
 
 **`ghRule` 必須逐子指令宣告，不可整條規則宣告**：`READ_SUBS` 內的 `repo view`、`issue list` /
@@ -545,19 +519,26 @@ function classifyArgv(ctx: RuleContext, opts: FlagGatedReaderOptions): ArgvClass
 
 | 規則 | opt-in | 備註 |
 | --- | --- | --- |
-| `fileReaderRule` | 是 | `cwdDependentNames: ["ls"]`——`ls` 無操作元時列出 cwd |
-| `grepRule` | 是 | `rg` 恆為遞迴，計算式自然排除 |
-| `sortRule` / `uniqRule` / `xxdRule` / `yqRule` / `tailRule` / `diffRule` | 是 | 無操作元時皆讀 stdin |
-| `sedRule` / `awkRule` / `jqRule` | 是（手寫述詞） | 程式碼已與輸入路徑分離；條件為輸入路徑數為 0 |
+| `fileReaderRule` 的 `head` / `wc` | 是 | 僅這兩個成員；同規則其餘指令一律不宣告 |
+| `grepRule` 的 `grep` / `egrep` / `fgrep` | 是 | `rg` 恆為遞迴，計算式自然排除 |
+| `tailRule` | 是 | 無操作元時讀 stdin |
+| `sedRule` / `jqRule` | 是（手寫述詞） | 程式碼已與輸入路徑分離；條件為輸入路徑數為 0 |
 
-`uniqRule` / `xxdRule` 出自 `positional-output.ts` 的 `positionalOutputRule`，需在該 factory 內
-比照加上同一 opt-in 機制。
+**宣告範圍刻意壓到最小**：上表就是基準集 67 條實際用到的全部過濾器
+（`head` 31 次、`jq` 25 次、`grep` 22 次、`wc` 2 次、`tail` 1 次、`sed` 1 次，加上 `gh` 66 次）。
+每多宣告一個指令，就要精確建模它的旗標文法，而設計審查已在 `yq`（`-s` 會寫出分割檔）、
+`sort`（`--compress-program` 執行外部程式、`--random-source` 讀檔）、`uniq`（`--group` 為選填值）、
+`xxd`（`-ps` 是單一多字元旗標）上各找到一個建模錯誤。依「誤 ask 可接受、誤 allow 不可接受」，
+未列入者一律維持現行行為（不豁免），**不為了少問一次而擴大建模面**。
 
 **明確不宣告**：
 
 | 規則 | 理由 |
 | --- | --- |
 | `ls`（`fileReaderRule` 內排除） | 無操作元時列出 cwd |
+| `awkRule` | 未出現於基準集；`--source` / `-e` 的程式來源解析另有分歧，不值得為此建模 |
+| `yqRule` / `sortRule` / `uniqRule` / `xxdRule` / `diffRule` | 各有已知的寫檔 / 執行 / 選填值旗標坑（見上）；不宣告即無風險 |
+| `fileReaderRule` 的其餘成員（`cat`/`cut`/`tr`/`nl`/`fold`/`column`/`stat`/`cmp`/`comm`/`md5sum`/`sha256sum`/`hexdump`/`basename`/`dirname`/`realpath`/`readlink`） | 未出現於基準集的過濾位置；不宣告即不需建模其旗標文法 |
 | `findRule` | `find -name x`（無起始路徑）預設從 cwd 遞迴 |
 | `treeRule` | 無操作元時遞迴 cwd |
 | `rg`（`grepRule` 內由遞迴條件排除） | 恆為遞迴 |
@@ -657,18 +638,11 @@ denylist」「未知全域選項一律 ask」，`ghRule` 改為**旗標 allowlis
   **操作元限縮**：`gh api x -H Accept:a?b` → ask（旗標值不套用寬鬆取值）；
   `gh issue list --repo o/r?x` → ask（子指令非 `api`）；
   `gh api a?b c?d` → ask（`null` token 超過一個）。
-- `curl_test.ts`：允許網域 + `https://host/p?q=1`（未加引號）→ allow；`{}`/`[]` 仍 ask；
-  `https://host/a*b` → ask（含 `*`）；`https://ho?t` → ask（authority 護欄）；
-  `http?://host/x` → ask（`?` 之後含 `/`）；
-  **`https://host?q=1` → ask**（無路徑段：展開會改變 host，見 §4.2.2）；
-  **操作元限縮**：`curl -H Accept:a?b https://host/p` → ask（旗標值不套用寬鬆取值）；
-  `curl --max-time 1?0 https://host/p` → ask（同上）。
+- `curl_test.ts`：**未加引號**且含 `?` 的 URL 一律 ask（`curl -s https://host/p?q=1` → ask）——
+  curl 不套用寬鬆取值；**加引號**者行為完全不變（`curl -s 'https://host/p?q=1'` → 依網域判定）。
 - **verdict 不變量測試**（§4.2.5）：對同一 endpoint 逐一列出其所有「把 `?` 換成單一字元」的
   可能展開結果，斷言每一個都得到與原 token **相同的 verdict**；`curl` 同理，並額外斷言多個
   展開結果作為多 URL 傳入時 verdict 不變。
-- **curl verdict 不變量測試**（§4.2.5）：對 `https://host/p?q=1` 列出把 `?` 換成單一字元的
-  展開結果，斷言 verdict 相同；另斷言「多個展開結果同時作為多 URL 傳入」時 verdict 亦不變
-  （所有結果共用同一 scheme+host，故通過同一次網域檢查）。
 - **檔案系統狀態獨立性 fixture 測試**（§4.2.3）：在受測 cwd 底下實際建立可匹配
   `<字面前綴><任一字元><字面後綴>` 的檔案（例如針對 `repos/o/r/tags?per_page=50` 建立
   `repos/o/r/tagsXper_page=50`），斷言判定結果與「該檔案不存在」時**完全相同**，
@@ -690,7 +664,8 @@ denylist」「未知全域選項一律 ask」，`ghRule` 改為**旗標 allowlis
 | --- | --- | --- |
 | `cd /outside && ls` | ask | `ls` 不宣告 |
 | `cd /outside && cat x.txt` | ask | 相對路徑以真實 cwd 解析（護欄 3） |
-| `cd /outside && find . -name x` | deny | 遞迴根 deny 不受影響 |
+| `cd / && find . -name x` | deny | 遞迴根 deny 不受影響（起始路徑解析為磁碟根才 deny） |
+| `cd /outside && find . -name x` | ask | `/outside` 不是磁碟根/家目錄根，故是 ask 而非 deny |
 | `cd /outside && find -name x` | ask | `find` 不宣告 |
 | `cd /outside && gh api x > out.txt` | ask | 中央前置規則二 |
 | `FOO=1 gh api x`（cwd 於專案外，鏈內 cd） | ask | 中央前置規則三 |
@@ -716,7 +691,8 @@ denylist」「未知全域選項一律 ask」，`ghRule` 改為**旗標 allowlis
 | session cwd 在專案外 + `cd . && gh api x` | ask | 護欄 2：`sessionCwdInScope === false`，no-op cd 不能自我授權 |
 | session cwd 在專案外 + `cd /outside && gh api x?a=1` | ask | 同上 |
 | session cwd 在專案內 + `cd /outside && gh api x?a=1` | allow | 護欄 2 兩項條件皆成立 |
-| `curl -s 'https://allowed-host?q=1'`（無路徑） | allow | §4.2.2：authority 在 `?` 處結束 |
+| `curl -s https://allowed-host/p?q=1`（未加引號） | ask | curl 不套用寬鬆取值 |
+| `curl -s 'https://allowed-host/p?q=1'`（加引號） | allow | 加引號者行為完全不變 |
 | `cd /outside && wc --files0-from=list` | ask | 護欄 5：`--files0-from` 為路徑值旗標 |
 | `cd /outside && sort --files0-from=list` | ask | 同上 |
 | `cd /outside && grep --exclude-from=f pat` | ask | 同上 |
@@ -765,9 +741,10 @@ value-flag 吃掉的位置。本規格**不改**此掃描，因此 `rg '~' …` 
 - 每個展開結果與原 token **只差一個字元**，且該字元不可能是 `/`；
 - 因此 scheme、host、所有前段路徑皆維持已檢查的字面值，展開**不能**換主機、不能注入旗標、
   不能把 GET 變成寫入；
-- 更進一步，依 §4.2.5 的 verdict 不變量，本工具對所有可能展開結果的 allow/ask 判定**完全相同**。
+- 更進一步，依 §4.2.5 的 verdict 不變量，本工具對所有可能展開結果的 allow/ask 判定**完全相同**
+  （`gh api` 的判定只看旗標，與 endpoint 內容不相交）。
 
-換言之，最壞情況是「對同一個已允許主機取得一個字元不同的 URL 的資料」——是**研究結果正確性**
+換言之，最壞情況是「對 GitHub API 取得一個字元不同的 endpoint 的資料」——是**研究結果正確性**
 的問題，不是權限判定的問題。此殘餘面已由使用者在審查中明確接受（見 §9.1）。
 
 ### 8.5 未採納的審查建議（記錄理由）
@@ -795,6 +772,25 @@ value-flag 吃掉的位置。本規格**不改**此掃描，因此 `rg '~' …` 
    **本輪同時採納了該審查所暴露的真實問題**：`gh api` 的 `{owner}`/`{repo}`/`{branch}` 佔位符
    確實由 cwd 的 git repository 決定，已於 §4.3.4 明文排除。
 
+### 8.6 為何 `curl` 不套用寬鬆取值
+
+`curl` 的判定**不是只看 scheme 與 host**：`permissions/domain_scope.ts` 的 preapproved 清單
+中有 **38 條含 path 的條目**，`matchesPreapproved(host, pathname)` 會比對 `URL.pathname` 是否
+等於該前綴或在其下。因此對這些 host，判定**讀取了 path 內容**，而 path 正是 `?` 之後可能被
+展開改寫的部分：
+
+- `https://github.com/anthropics?q=1` → pathname `/anthropics`，可能命中 path 前綴 → `allowed`；
+- 展開成 `https://github.com/anthropicsXq=1` → pathname `/anthropicsXq=1` → `not-allowed`。
+
+verdict 因此**隨展開結果改變**，直接違反 §4.2.5 的不變量，也就是 §9.1 那條已接受限制的前提。
+
+要保住不變量有兩條路：(a) 讓 `resolveUrl` 回報「本次 allowed 是靠 hostname 還是靠 path 前綴」，
+只在前者套用寬鬆取值；(b) `curl` 完全不套用。**本規格採 (b)**——`curl` 帶未加引號 `?` 的用法在
+全 corpus 只有 10 次、在基準集 **0 次**（唯一那條 `curl` 本來就有加引號且無 `?`），對 63/67 的
+目標零影響；而 (a) 需要改動 `domain_scope` 的回傳型別並新增一條判斷路徑，成本與收益不成比例。
+
+`curl` 仍保留 cwd 豁免（§4.3.4）——那與寬鬆取值無關：加引號的 URL 本就是靜態 token。
+
 ## 9. Non-goals / Accepted limitations
 
 ### 9.1 「單一 `?` 查詢串」展開仍受 cwd 檔案系統影響（一個字元）
@@ -812,7 +808,9 @@ value-flag 吃掉的位置。本規格**不改**此掃描，因此 `rg '~' …` 
   research 取得的資料內容；且觸發條件是 cwd 底下恰好存在與 endpoint 僅差一個字元的檔案，
   實務上不會偶發。故取精確化而非取消。
 
-**範圍限定（stale-waiver guard）**：本項接受同時建立在三個前提上——(a) 僅容忍單一 `?` 且其後
-不含 `/`；(b) 寬鬆取值只套用於 endpoint / URL 操作元，旗標與旗標值一律不套用；(c) §4.2.5 的
-verdict 不變量成立且有測試守護。任一前提日後被放寬（例如開放 `*`、允許 `?` 後含 `/`、對旗標值
-套用寬鬆取值、或 verdict 開始依賴 endpoint 路徑），本項不再自動適用，須以新議題重新走審查流程。
+**範圍限定（stale-waiver guard）**：本項接受同時建立在四個前提上——(a) 僅容忍單一 `?` 且其後
+不含 `/`；(b) 寬鬆取值只套用於 **`gh api` 的 endpoint 操作元**，旗標、旗標值、以及 `curl` 的
+任何 token 一律不套用；(c) §4.2.5 的 verdict 不變量成立且有測試守護——其成立**依賴
+「`ghApiMutates` 只掃描旗標、完全不讀 endpoint 路徑」**；(d) `gh api` 的 HTTP 方法由旗標而非
+endpoint 決定。任一前提日後被放寬或不再成立（例如開放 `*`、允許 `?` 後含 `/`、對旗標值或 `curl`
+套用寬鬆取值、或判定開始讀取 endpoint 內容），本項不再自動適用，須以新議題重新走審查流程。
