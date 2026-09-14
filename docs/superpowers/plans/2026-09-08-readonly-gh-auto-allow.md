@@ -153,22 +153,40 @@ Deno.test("firstGlobMetacharIndex finds the first unescaped metachar", () => {
 });
 
 Deno.test("nonPathStaticValue tolerates a single-? query string", () => {
-  assertEquals(
-    nonPathStaticValue(wordOf("repos/o/r/tags?per_page=50")),
-    "repos/o/r/tags?per_page=50",
-  );
+  const r = nonPathStaticValue(wordOf("repos/o/r/tags?per_page=50"))!;
+  assertEquals(r.value, "repos/o/r/tags?per_page=50");
+  assertEquals(r.globIndex, "repos/o/r/tags".length);
+  assertEquals(r.raw, "repos/o/r/tags?per_page=50");
+});
+
+Deno.test("globIndex is measured on the raw string, so escapes survive", () => {
+  // `a\?b`：`\` 是被跳脫的反斜線，`?` 是活躍 glob（索引 3）
+  const active = nonPathStaticValue(wordOf("a" + "\\\\" + "?b"))!;
+  assertEquals(active.globIndex, 3);
+  assertEquals(active.value, "a" + "\\" + "?b"); // quote removal 後仍留一個反斜線
+  // 對 value 重跑 firstGlobMetacharIndex 會得到 -1 —— 正是不可這樣做的原因
+  assertEquals(firstGlobMetacharIndex(active.value), -1);
 });
 
 Deno.test("nonPathStaticValue passes already-static words straight through", () => {
-  assertEquals(nonPathStaticValue(wordOf("plain/endpoint")), "plain/endpoint");
-  assertEquals(nonPathStaticValue(wordOf("'a?b/c'")), "a?b/c");
-  assertEquals(nonPathStaticValue(wordOf('"a*b"')), "a*b");
-  // 無未跳脫元字元 → staticValue 已回字面值，不進寬鬆分支
-  assertEquals(nonPathStaticValue(wordOf("a\\b")), "ab");
+  // 本就靜態者 globIndex 為 -1：無活躍元字元，呼叫端不需做位置判定
+  const cases: Array<[string, string]> = [
+    ["plain/endpoint", "plain/endpoint"],
+    ["'a?b/c'", "a?b/c"],
+    ['"a*b"', "a*b"],
+    ["a\\b", "ab"], // 無未跳脫元字元 → staticValue 已回字面值
+  ];
+  for (const [src, expected] of cases) {
+    const r = nonPathStaticValue(wordOf(src))!;
+    assertEquals(r.value, expected, src);
+    assertEquals(r.globIndex, -1, src);
+  }
 });
 
 Deno.test("an unquoted backslash plus an active ? goes through quote removal", () => {
-  assertEquals(nonPathStaticValue(wordOf("a\\b?c")), "ab?c");
+  const r = nonPathStaticValue(wordOf("a\\b?c"))!;
+  assertEquals(r.value, "ab?c");
+  assertEquals(r.globIndex, 3); // 原字串 `a\b?c` 中 `?` 的索引
 });
 
 Deno.test("a word with parts is never relaxed (quote provenance is unrecoverable)", () => {
@@ -233,16 +251,31 @@ function isSingleQueryGlob(value: string): boolean {
  * 完全不讀 endpoint 路徑，故展開結果不影響判定。路徑、旗標、旗標值，以及 curl 的
  * 任何 token（其判定會比對 preapproved 的 path 前綴）一律不得使用本函式。
  */
-export function nonPathStaticValue(word: Word): string | null {
+export interface RelaxedOperand {
+  /** bash quote removal 後的值 —— 這是要拿去做語義判定（子指令、佔位符…）的字串。 */
+  value: string;
+  /**
+   * 被容忍的 `?` 在**原始未展開字串**中的索引；該 token 本就靜態（無活躍元字元）時為 -1。
+   * 呼叫端要判斷「元字元位置」時**必須**用這個索引搭配 `raw`，
+   * 不可對 `value` 重跑 `firstGlobMetacharIndex` —— quote removal 已抹除跳脫資訊，
+   * 重掃會把 `a\?b`（活躍 `?`）誤判成無元字元，也會把 `a\?b`（字面 `?`）誤判成活躍。
+   */
+  globIndex: number;
+  /** 原始字串（未做 quote removal），供呼叫端與 globIndex 搭配做位置判定。 */
+  raw: string;
+}
+
+export function nonPathStaticValue(word: Word): RelaxedOperand | null {
   const strict = staticValue(word);
-  if (strict !== null) return strict;
+  if (strict !== null) return { value: strict, globIndex: -1, raw: word.value };
   // 有 parts（含任何引號片段）→ 一律拒絕。word.value 是 quote-removed 的串接，
   // 引號內的反斜線與 shell 跳脫已無法區分，逐字掃描會誤判哪些元字元是活的。
   if (word.parts) return null;
-  // 無 parts = 整個 word 皆為未加引號字面值：firstGlobMetacharIndex 本身就處理跳脫，
-  // 故先在原字串上判形態，再回傳 bash quote removal 後的值。
-  if (!isSingleQueryGlob(word.value)) return null;
-  return removeBackslashEscapes(word.value);
+  // 無 parts = 整個 word 皆為未加引號字面值：firstGlobMetacharIndex 本身處理跳脫，
+  // 故在原字串上判形態並記下位置，再回傳 bash quote removal 後的值。
+  const raw = word.value;
+  if (!isSingleQueryGlob(raw)) return null;
+  return { value: removeBackslashEscapes(raw), globIndex: firstGlobMetacharIndex(raw), raw };
 }
 ```
 
@@ -535,12 +568,6 @@ Deno.test("diff -X / -S are scope-checked in both forms", () => {
   assertEquals(diffRule.evaluate(ctxOf("diff -qX../out.txt a.txt b.txt")).kind, "ask");
   assertEquals(diffRule.evaluate(ctxOf("diff -qS../out a.txt b.txt")).kind, "ask");
 });
-
-Deno.test("sort's program / random-source flags ask in both forms", () => {
-  assertEquals(v(sortRule, "sort", "sort --compress-program gzip f.txt"), "ask");
-  assertEquals(v(sortRule, "sort", "sort --compress-program=gzip f.txt"), "ask");
-  assertEquals(v(sortRule, "sort", "sort -R --random-source=../secret f.txt"), "ask");
-});
 ```
 
 Append to `src/rules/commands/simple-flag_test.ts` — its helper is `v(rule, name, src)`:
@@ -549,6 +576,12 @@ Append to `src/rules/commands/simple-flag_test.ts` — its helper is `v(rule, na
 Deno.test("sort --files0-from is scope-checked", () => {
   assertEquals(v(sortRule, "sort", "sort --files0-from=list.txt"), "allow");
   assertEquals(v(sortRule, "sort", "sort --files0-from=../out/list.txt"), "ask");
+});
+
+Deno.test("sort's program / random-source flags ask in both forms", () => {
+  assertEquals(v(sortRule, "sort", "sort --compress-program gzip f.txt"), "ask");
+  assertEquals(v(sortRule, "sort", "sort --compress-program=gzip f.txt"), "ask");
+  assertEquals(v(sortRule, "sort", "sort -R --random-source=../secret f.txt"), "ask");
 });
 ```
 
@@ -561,9 +594,10 @@ Expected: FAIL — the out-of-project variants currently allow, because the valu
 
 ```ts
 export const fileReaderRule: CommandRule = flagGatedReader({
+  // "jq" 仍在此列；Task 8 才在註冊 jqRule 的同一個 commit 中移除
   names: [
     "cat", "head", "wc", "ls", "stat", "cut", "tr", "column",
-    "cmp", "comm", "md5sum", "sha256sum", "hexdump", "nl", "fold",
+    "cmp", "comm", "md5sum", "sha256sum", "hexdump", "jq", "nl", "fold",
     "basename", "dirname", "realpath", "readlink",
   ],
   // 這些旗標的值是會被讀取的路徑，過去被當一般 flag 跳過而未檢查：
@@ -1592,7 +1626,7 @@ Both edits land in this task's single commit, so `jq` is never without a rule.
 In `src/rules/commands/coreutils.ts`:
 
 ```ts
-// before
+// before（Task 5 保留 "jq"，此處才移除）
   names: [
     "cat", "head", "wc", "ls", "stat", "cut", "tr", "column",
     "cmp", "comm", "md5sum", "sha256sum", "hexdump", "jq", "nl", "fold",
@@ -2191,6 +2225,13 @@ Deno.test("flags before the subcommand are still checked", () => {
   assertEquals(v("gh x api repos/o/r"), "ask");
 });
 
+Deno.test("glob position is judged on the raw token, not the quote-removed value", () => {
+  // `a\?b`：quote removal 後是 `a\?b`，重掃會找不到元字元；必須用原始位置判定
+  assertEquals(v("gh api a" + "\\\\" + "?b"), "ask");
+  // 反向：`rep\?os/...` 的 `?` 是被跳脫的字面值，不是活躍 glob → 不應被位置護欄誤殺
+  assertEquals(v("gh api rep" + "\\" + "?os/o/r/x"), "allow");
+});
+
 Deno.test("a rescued endpoint may not contain braces", () => {
   // 未加引號的 `?` 可展開成 `{` / `}`，形成 cwd 佔位符
   assertEquals(v("gh api repos/o/r/x?owner}"), "ask");
@@ -2217,7 +2258,7 @@ Expected: FAIL.
 ```ts
 import type { CommandRule, RuleContext, RuleVerdict } from "../types.ts";
 import { allow, ask } from "../types.ts";
-import { firstGlobMetacharIndex, nonPathStaticValue, staticValue } from "../../engine/word.ts";
+import { nonPathStaticValue, staticValue } from "../../engine/word.ts";
 
 /** 各 gh 指令的唯讀子指令。`gh repo clone` / `gh release download` 會寫本地檔 → 不在此列。 */
 const READ_SUBS: Record<string, Set<string>> = {
@@ -2384,23 +2425,26 @@ function doParseGh(ctx: RuleContext): GhParse {
       return reject("gh：動態 token 不在 endpoint 位置");
     }
     const relaxed = nonPathStaticValue(argv[idx]);
-    if (relaxed === null || relaxed.startsWith("-")) {
+    if (relaxed === null || relaxed.value.startsWith("-")) {
       return reject("gh：含動態 token，無法靜態判定");
     }
-    // endpoint 的萬用字元必須落在第一個 `/` 之後，確保第一段（repos / orgs / …）為字面
-    const g = firstGlobMetacharIndex(relaxed);
-    const slash = relaxed.indexOf("/");
-    if (g !== -1 && (slash === -1 || g <= slash)) {
-      return reject(`gh api：endpoint 的萬用字元位置不安全（${relaxed}）`);
-    }
-    // `?` 可以展開成 `{` 或 `}`：`repos/o/r/x?owner}` 若 cwd 下有檔案 `repos/o/r/x{owner}`，
-    // 展開後 endpoint 就含 {owner}，而含佔位符者不得享有 cwd 豁免 —— 豁免判定會因此
-    // 隨檔案系統改變。故被救回的 endpoint 一律不得含 `{` 或 `}`。
-    if (relaxed.includes("{") || relaxed.includes("}")) {
-      return reject("gh api：endpoint 含 { 或 }，展開後可能形成 cwd 佔位符");
+    // endpoint 的萬用字元必須落在第一個 `/` 之後，確保第一段（repos / orgs / …）為字面。
+    // 位置判定**必須**用 relaxed.globIndex 與 relaxed.raw：對 relaxed.value 重跑
+    // firstGlobMetacharIndex 會因 quote removal 抹除跳脫資訊而誤判。
+    if (relaxed.globIndex !== -1) {
+      const slash = relaxed.raw.indexOf("/");
+      if (slash === -1 || relaxed.globIndex <= slash) {
+        return reject(`gh api：endpoint 的萬用字元位置不安全（${relaxed.value}）`);
+      }
+      // `?` 可以展開成 `{` 或 `}`：`repos/o/r/x?owner}` 若 cwd 下有檔案
+      // `repos/o/r/x{owner}`，展開後 endpoint 就含 {owner}，而含佔位符者不得享有 cwd
+      // 豁免 —— 豁免判定會因此隨檔案系統改變。故被救回的 endpoint 不得含 `{` 或 `}`。
+      if (relaxed.value.includes("{") || relaxed.value.includes("}")) {
+        return reject("gh api：endpoint 含 { 或 }，展開後可能形成 cwd 佔位符");
+      }
     }
     relaxedIdx = idx;
-    operands.push(relaxed);
+    operands.push(relaxed.value);
   }
   if (nullCount === 1 && relaxedIdx === -1) {
     return reject("gh：含動態 token，無法靜態判定");
