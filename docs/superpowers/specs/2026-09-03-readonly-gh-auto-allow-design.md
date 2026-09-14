@@ -201,7 +201,7 @@ nonPathLeadingPositional?: (argv: Word[]) => boolean;
 10. **filter 內容掃描**：filter 字串（或 `-f` 載入的 program，其內容本工具讀不到）含
     `include` / `import` 關鍵字 → ask。這兩個構造會以 cwd（或 `search` 指定目錄）為基準
     載入 `.jq` 模組檔，屬對 cwd 的檔案讀取，本工具無法靜態確認其目標落在專案內。
-    偵測採保守詞法比對（`include` / `import`），寧可誤 ask。
+    偵測採保守詞法比對（`\binclude\b` / `\bimport\b`），寧可誤 ask。
 
 長短旗標皆需支援 `--opt=value` 與 `--opt value` 兩種寫法。
 
