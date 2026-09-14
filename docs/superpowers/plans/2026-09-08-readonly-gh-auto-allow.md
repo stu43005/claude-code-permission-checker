@@ -3203,6 +3203,10 @@ Deno.test("every single-character expansion of the endpoint yields the same verd
   assertEquals(v(`gh api "repos/o/r/tags'per_page=50"`), base, "single quote");
 });
 
+**This test goes in `src/engine/classify_test.ts`**, not `gh_test.ts` — it needs `evaluate`,
+`ROOT` and `START`, which only that file has:
+
+```ts
 Deno.test("expansion invariance holds through the cwd exemption, not just evaluate", () => {
   // 原 token 與其任一展開結果，在「鏈內 cd 到專案外」的完整判定下必須一致
   const base = evaluate("cd /tmp && gh api repos/o/r/tags?per_page=50", ROOT, START).verdict;
@@ -3218,6 +3222,11 @@ Deno.test("expansion invariance holds through the cwd exemption, not just evalua
   assertEquals(evaluate("cd /tmp && gh api repos/o/r/x?owner}", ROOT, START).verdict, "ask");
   assertEquals(evaluate("cd /tmp && gh api 'repos/o/r/x{owner}'", ROOT, START).verdict, "ask");
 });
+```
+
+The remaining tests in this step stay in `gh_test.ts`, which already has `ctxOf` and `v`:
+
+```ts
 
 Deno.test("multiple expanded endpoints are a gh usage error, never a write", () => {
   // 兩個位置操作元：gh 自己會報錯；本工具的判定仍是 allow（GET、無寫入旗標）
@@ -3378,7 +3387,20 @@ rule deny，以及規則宣告 `cwdIndependent` 且五道護欄全部成立時�
     對旗標路徑值做範圍檢查、所有位置參數一律 `resolvePath`。
 ```
 
-3. The line saying dynamic tokens are **unconditionally** treated as undecidable — add the one
+3. The 「吃路徑值的 flag 要 scope-check 其值」 bullet still cites `grep -f` as a `pathValueFlags`
+   case, but grep now goes through `CommandSpec`, where that option is ignored. Replace it:
+
+```markdown
+- **吃路徑值的 flag 要 scope-check 其值**：其值是會被讀取的路徑，必須做範圍檢查
+  （`RuleContext.resolvePathValue`），不能只當 flag 跳過。**宣告位置依該規則走哪條路徑而不同**：
+  - 走 `CommandSpec` 者（`grep`/`egrep`/`fgrep`、`head`、`wc`、`tail`）寫在 `FlagSpec` 上、
+    設 `valueIsPath: true`（例：`grep -f <patternfile>`、`grep --exclude-from=<file>`、
+    `wc --files0-from=<file>`）。加到 `pathValueFlags` **不會有任何作用**。
+  - 走 legacy 路徑者（`diff`、`realpath` 等）仍用 `factory.ts` 的 `pathValueFlags`
+    （例：`diff --from-file=<file>`、`realpath --relative-to=<dir>`）。
+```
+
+4. The line saying dynamic tokens are **unconditionally** treated as undecidable — add the one
    exception:
 
 ```markdown
@@ -3403,8 +3425,13 @@ git commit -m "docs: sync CLAUDE.md with the cwd exemption, CommandSpec, gh allo
 
 **Files:** no source changes. Produces `dist/permission-checker(.exe)` (gitignored).
 
-**The acceptance criterion is fixed: 63 allow / 4 ask over the 67-command baseline.** A shortfall
+**The acceptance criterion is fixed: 62 allow / 5 ask over the 67-command baseline.** A shortfall
 is an unmet criterion to diagnose, not a number to rewrite. Do **not** edit the spec's target.
+
+The fifth ask is expected and must stay an ask: the baseline's `gh search code … --match-all …`
+uses a flag that **does not exist in gh** (`gh search code --match-all foo` → `unknown flag:
+--match-all`), so the flag allowlist rejects it. Do not add `--match-all` to any safe flag set to
+make the number come out — the command is broken as written.
 
 - [ ] **Step 1: Build**
 
@@ -3513,8 +3540,9 @@ done
 jq -r '.decision' baseline_results.jsonl | sort | uniq -c
 ```
 
-Expected: **63 allow, 4 ask**. The four asks must be the two `for f in …; do gh api …${f}… ; done`
-loops (variable expansion), the one `xargs -I {} sh -c …` line, and the one heredoc-write line.
+Expected: **62 allow, 5 ask**. The five asks must be: the two `for f in …; do gh api …${f}… ; done`
+loops (variable expansion), the one `xargs -I {} sh -c …` line, the one heredoc-write line, and the
+one `gh search code … --match-all …` line (nonexistent gh flag).
 每筆 `baseline_results.jsonl` 記錄都自帶 `cmd`，可直接 `jq` 檢視，不需要與原檔配對。
 
 **If the count is short:** for each unexpected `ask`, read its reason, identify which guardrail or
@@ -3546,8 +3574,9 @@ jq -nc --arg c "cd /d && find . -name x" --arg d "$VERIFY_ROOT_W" '{tool_name:"B
   | jq -r '.hookSpecificOutput.permissionDecision'
 ```
 
-Expected: `ask` for all twelve loop entries; `deny` for the `find` line (`/d` normalizes to the
-`D:` drive root on Windows). **No line may print `allow`.**
+Expected: `ask` for **every** loop entry, and `deny` — not `ask` — for the `find` line (`/d`
+normalizes to the `D:` drive root on Windows). Check both directions: an `allow` anywhere is a
+guardrail failure, and a `find` line that prints `ask` is a hard-deny regression.
 
 - [ ] **Step 6: Record the results, then clean up**
 

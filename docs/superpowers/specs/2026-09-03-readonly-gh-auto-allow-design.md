@@ -23,10 +23,14 @@ sleep 輪詢、名稱重定義）。
 | --- | --- |
 | 原樣 67 條 | **67 ask**，理由全部是「工作目錄超出允許範圍：`D:/`」 |
 | 剝掉 `cd /d && ` 前綴後 | 61 ask（60 條為「gh：含動態 token」）、6 allow |
-| 再把 `gh api` 的 endpoint 加上引號 | **63 allow**、4 ask |
+| 再把 `gh api` 的 endpoint 加上引號 | **63 allow**、4 ask（此列為**改動前**的模擬值，見 §2.1.4） |
 
-剩下的 4 條 ask 是本來就該問的：2 條 `for f in …; do gh api …/${f}.go?ref=… ; done`（變數展開）、
-1 條 `xargs -I {} sh -c …`、1 條 heredoc 寫檔。
+上表最後一列的 4 條 ask 是本來就該問的：2 條 `for f in …; do gh api …/${f}.go?ref=… ; done`
+（變數展開）、1 條 `xargs -I {} sh -c …`、1 條 heredoc 寫檔。
+
+**本規格實作後會多出第 5 條 ask**：`gh search code … --match-all …`。`--match-all` 不是 gh 的
+旗標（`gh search code --match-all foo` → `unknown flag`），故 §4.5 的旗標 allowlist 對它 ask。
+驗收目標因此是 **62 allow / 5 ask**（見 §2.1.4）。
 
 代表性指令形態（下列字面即為基準集內容，供實作與測試直接取用）：
 
@@ -85,7 +89,13 @@ ask）因此對整條鏈生效。**這條規則本身是對的**，問題在於�
    含 `*` / `[` / 多重元字元 / `?` 後含 `/` 者維持 ask（見 §4.2）。
    **`curl` 不在此列**——其判定會比對 preapproved 的 path 前綴，故不滿足 verdict 不變量（見 §8.6）。
 3. `grep` 的 pattern 與 `jq` 的 filter 不再被當作路徑做範圍檢查。
-4. 基準集 67 條達成 63 allow / 4 ask（以 build 後 binary 實測驗證）。
+4. 基準集 67 條達成 **62 allow / 5 ask**（以 build 後 binary 實測驗證）。
+
+   §1.1 的初版模擬得出 63 / 4，那是在 `gh` 尚未改為旗標 allowlist（§4.5）之前量的。基準集第 5 條
+   用了 `gh search code … --match-all …`，而 **`--match-all` 根本不是 gh 的旗標**——實測
+   `gh search code --match-all foo` 直接回 `unknown flag: --match-all`（transcript 裡的 agent 寫錯
+   了，該指令本來就跑不起來）。旗標 allowlist 對它回 ask 是正確行為，**不得為了湊數把它加進安全
+   旗標集**。故第 5 個 ask 是預期結果。
 
 ### 2.2 非目標
 
@@ -110,7 +120,7 @@ rules/commands/grep.ts <- *3 pattern 不做路徑檢查
 rules/commands/jq.ts   <- *3 新檔：filter 不做路徑檢查
 ```
 
-三個元件互相獨立可實作，但**只有三者齊備**基準集才會從 67 ask 變成 63 allow。
+三個元件互相獨立可實作，但**只有三者齊備**基準集才會從 67 ask 變成 62 allow / 5 ask。
 
 ## 4. 詳細設計
 
@@ -734,7 +744,8 @@ denylist」「未知全域選項一律 ask」，`ghRule` 改為**旗標 allowlis
 
 `deno task build` 後，把 §1.1 基準集的 67 條指令逐一以 hook JSON 餵給
 `dist/permission-checker.exe`（`CLAUDE_PROJECT_DIR` 設為該 session 專案根），斷言
-**63 allow / 4 ask**，且 4 條 ask 分別對應變數展開 ×2、`xargs` ×1、heredoc 寫檔 ×1。
+**62 allow / 5 ask**，且 5 條 ask 分別對應：變數展開的 `for` 迴圈 ×2、`xargs -I {} sh -c` ×1、
+heredoc 寫檔 ×1、`gh search code … --match-all …` ×1（`--match-all` 不是 gh 旗標，見 §2.1.4）。
 
 驗證需在**不含**相關 `permissions.allow` 規則的環境進行，以免升級層遮蔽 builtin 分類
 （見 `CLAUDE.md` 的 operational verification 注意事項）。
