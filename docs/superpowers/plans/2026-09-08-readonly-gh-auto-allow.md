@@ -2789,8 +2789,19 @@ Deno.test("the other central preflight rules still fire under the exemption", ()
   assertEquals(decide("cd /tmp && head -1 < ../outside.txt").verdict, "ask"); // 範圍外 <
 });
 
-Deno.test("commands that implicitly act on cwd still ask", () => {
-  for (const c of ["ls", "tree", "file x", "date -r x", "rg pat", "git status", "deno test", "cat", "awk '{print}'", "yq '.'", "sort", "uniq", "xxd", "diff", "tr a b"]) {
+Deno.test("every non-declaring command still asks after a chain cd", () => {
+  const cases = [
+    // 隱含以 cwd 為操作對象
+    "ls", "tree", "find . -name x", "rg pat", "git status", "deno test",
+    // fileReaderRule 的其餘成員：與 head/wc 共用規則，必須確認沒有被順帶豁免
+    "cat", "cut -c1", "tr a b", "nl", "fold -w 80", "column -t",
+    "stat x", "cmp a b", "comm a b", "md5sum", "hexdump", "basename x", "dirname x",
+    "realpath x", "readlink x",
+    // 其他未宣告的規則
+    "awk '{print}'", "yq '.'", "sort", "uniq", "xxd", "diff a b", "file x", "date -r x",
+    "which some-name",
+  ];
+  for (const c of cases) {
     assertEquals(decide(`cd /tmp && ${c}`).verdict, "ask", c);
   }
 });
@@ -2933,21 +2944,26 @@ Deno.test("every declaring command takes the exemption in its read-only form", (
 });
 
 Deno.test("curl takes the exemption for a quoted allowed URL", () => {
-  // 需要 settings 放行該網域；以 rulesOf 的 WebFetch allow 提供
-  const rules = rulesOf({ allow: [] });
-  // 若 classify_test.ts 的 rulesOf 尚不支援 WebFetch，改用 preapproved 網域（如 api.github.com）
+  // classify_test.ts 既有的 webFetchRulesOf 提供 WebFetch 網域規則；
+  // api.example.com 是該檔既有測試使用的網域（api.github.com 不在 preapproved 清單內）
+  const rules = webFetchRulesOf({ allow: ["WebFetch(domain:api.example.com)"] });
   assertEquals(
-    evaluate("cd /tmp && curl -s 'https://api.github.com/repos/o/r'", ROOT, START, rules).verdict,
+    evaluate("cd /tmp && curl -s 'https://api.example.com/repos/o/r'", ROOT, START, rules).verdict,
     "allow",
   );
   // 未加引號的 `?` → curl 不套用寬鬆取值 → ask
   assertEquals(
-    evaluate("cd /tmp && curl -s https://api.github.com/repos/o/r?x=1", ROOT, START, rules).verdict,
+    evaluate("cd /tmp && curl -s https://api.example.com/repos/o/r?x=1", ROOT, START, rules).verdict,
     "ask",
   );
   // 範圍外的 -H @file 以真實 cwd 檢查 → ask
   assertEquals(
-    evaluate("cd /tmp && curl -s -H @../h.txt 'https://api.github.com/x'", ROOT, START, rules).verdict,
+    evaluate("cd /tmp && curl -s -H @../h.txt 'https://api.example.com/x'", ROOT, START, rules).verdict,
+    "ask",
+  );
+  // 網域未放行 → ask（確認上面的 allow 真的來自網域規則，不是碰巧）
+  assertEquals(
+    evaluate("cd /tmp && curl -s 'https://not-allowed.test/x'", ROOT, START, rules).verdict,
     "ask",
   );
 });
@@ -3178,9 +3194,14 @@ rule deny，以及規則宣告 `cwdIndependent` 且五道護欄全部成立時�
 2. The `flagGatedReader` description saying **every positional** gets `resolvePath` — qualify it:
 
 ```markdown
-- **旗標型**：用 `factory.ts` 的 `flagGatedReader`——`askFlags` 命中即 ask、`pathValueFlags` 對旗標的
-  路徑值做範圍檢查；位置參數依該指令的 `CommandSpec.positionals` 決定是否為路徑
-  （`grep` 的第一個位置參數在未給 `-e`/`-f` 時是 PATTERN，不做範圍檢查）。
+- **旗標型**：用 `factory.ts` 的 `flagGatedReader`。`askFlags` 兩條路徑都先套用；其餘分成兩種：
+  - **有提供 `spec`（CommandSpec）者**：argv 分類**完全由 spec 決定**，`valueFlags` /
+    `pathValueFlags` 一律不參與。旗標的路徑值靠 `FlagSpec.valueIsPath` 宣告；位置參數是不是路徑
+    靠 `CommandSpec.positionals`（`grep` 未給 `-e`/`-f` 時第一個位置參數是 PATTERN，不做範圍檢查）。
+    **替這類規則新增吃路徑的旗標時，要加在 `FlagSpec` 上並設 `valueIsPath: true`**——加到
+    `pathValueFlags` 不會有任何作用。
+  - **未提供 `spec` 的 legacy 規則**：維持既有行為——`valueFlags` 跳過吃值旗標、`pathValueFlags`
+    對旗標路徑值做範圍檢查、所有位置參數一律 `resolvePath`。
 ```
 
 3. The line saying dynamic tokens are **unconditionally** treated as undecidable — add the one
@@ -3267,8 +3288,10 @@ rather than a hardcoded path — it is the one whose Bash calls are 67 `cd /d &&
 CANDIDATES="$(grep -rl 'gh api repos/GoogleContainerTools' \
   "$(cygpath -u "$USERPROFILE")/.claude/projects" --include='*.jsonl' 2>/dev/null)"
 for f in $CANDIDATES; do
-  cnt="$(jq -r 'select(.message.content) | .message.content[]?
-                | select(.type=="tool_use" and .name=="Bash") | .input.command' "$f" 2>/dev/null | wc -l)"
+  # 必須數「tool_use 物件個數」而不是行數：基準集裡的 heredoc 指令本身跨多行，
+  # 用 `jq -r .input.command | wc -l` 會數成 108，永遠對不上 67。
+  cnt="$(jq -s '[.[] | select(.message.content) | .message.content[]?
+                | select(.type=="tool_use" and .name=="Bash")] | length' "$f" 2>/dev/null)"
   printf '%s\t%s\n' "$cnt" "$f"
 done
 ```
@@ -3281,7 +3304,7 @@ jq -c --arg d "$VERIFY_ROOT_W" 'select(.message.content) | .message.content[]?
        | select(.type=="tool_use" and .name=="Bash")
        | {tool_name:"Bash", tool_input:{command:.input.command}, cwd:$d}' \
   "$TRANSCRIPT" > baseline.jsonl
-wc -l baseline.jsonl   # 期望 67
+wc -l baseline.jsonl   # 期望 67（`jq -c` 每筆一行，指令內的換行已被 JSON 跳脫）
 ```
 
 If no candidate has 67 lines, **stop and ask the user for the transcript path**. Do not substitute
@@ -3298,21 +3321,27 @@ that command and say so in the report.
 - [ ] **Step 4: Replay and tally**
 
 ```bash
-: > baseline_results.txt
+: > baseline_results.jsonl
 n=$(wc -l < baseline.jsonl); i=1
 while [ "$i" -le "$n" ]; do
-  sed -n "${i}p" baseline.jsonl \
-    | CLAUDE_PROJECT_DIR="$VERIFY_ROOT_W" CLAUDE_CONFIG_DIR="$VERIFY_CFG_W" ./dist/permission-checker.exe \
-    | jq -r '.hookSpecificOutput.permissionDecision + "\t" + (.hookSpecificOutput.permissionDecisionReason // "")' \
-    >> baseline_results.txt
+  payload="$(sed -n "${i}p" baseline.jsonl)"
+  out="$(printf '%s' "$payload" \
+    | CLAUDE_PROJECT_DIR="$VERIFY_ROOT_W" CLAUDE_CONFIG_DIR="$VERIFY_CFG_W" ./dist/permission-checker.exe)"
+  # 指令與結果寫進同一個 JSON 物件。基準集的指令含換行，任何以物理行配對（paste / 行號）
+  # 的做法都會錯位。
+  jq -nc --argjson p "$payload" --argjson o "$out" --argjson i "$i" \
+    '{i: $i, cmd: $p.tool_input.command,
+      decision: $o.hookSpecificOutput.permissionDecision,
+      reason: ($o.hookSpecificOutput.permissionDecisionReason // "")}' \
+    >> baseline_results.jsonl
   i=$((i+1))
 done
-cut -f1 baseline_results.txt | sort | uniq -c
+jq -r '.decision' baseline_results.jsonl | sort | uniq -c
 ```
 
 Expected: **63 allow, 4 ask**. The four asks must be the two `for f in …; do gh api …${f}… ; done`
 loops (variable expansion), the one `xargs -I {} sh -c …` line, and the one heredoc-write line.
-Pair `baseline.jsonl` with `baseline_results.txt` line by line to confirm.
+每筆 `baseline_results.jsonl` 記錄都自帶 `cmd`，可直接 `jq` 檢視，不需要與原檔配對。
 
 **If the count is short:** for each unexpected `ask`, read its reason, identify which guardrail or
 flag table rejected it, and fix the rule — most likely a missing safe flag in a `CommandSpec` or in
@@ -3351,15 +3380,17 @@ Expected: `ask` for all twelve loop entries; `deny` for the `find` line (`/d` no
 Capture what Step 7 needs **before** deleting anything:
 
 ```bash
-cut -f1 baseline_results.txt | sort | uniq -c > baseline_tally.txt
-paste -d'	' <(jq -r '.tool_input.command' baseline.jsonl) baseline_results.txt   | awk -F'	' '$2=="ask"' > baseline_asks.txt
+jq -r '.decision' baseline_results.jsonl | sort | uniq -c > baseline_tally.txt
+jq -r 'select(.decision=="ask") | "#\(.i)	\(.reason)
+\(.cmd)
+---"'   baseline_results.jsonl > baseline_asks.txt
 cat baseline_tally.txt baseline_asks.txt
 ```
 
 Then clean up:
 
 ```bash
-rm -rf "$VERIFY_ROOT" "$VERIFY_CFG" baseline.jsonl baseline_results.txt
+rm -rf "$VERIFY_ROOT" "$VERIFY_CFG" baseline.jsonl baseline_results.jsonl
 ```
 
 Keep `baseline_tally.txt` and `baseline_asks.txt` until the report is written, then delete them too.
