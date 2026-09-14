@@ -1671,7 +1671,7 @@ function doScan(ctx: RuleContext): JqScan {
  * 採保守詞法比對，寧可誤 ask。
  */
 function filterReadsModules(filter: string): boolean {
-  return /(include|import)/.test(filter);
+  return /\b(include|import)\b/.test(filter);
 }
 
 export const jqRule: CommandRule = {
@@ -1764,7 +1764,7 @@ git commit -m "feat(rules): extract jq into its own rule; -f is boolean, -L take
 ### Task 9: `head` / `wc` / `tail` specs + `pureUtilRule` declaration
 
 **Files:**
-- Modify: `src/rules/commands/coreutils.ts`, `src/rules/commands/tail.ts`
+- Modify: `src/rules/factory.ts`（新增 `cwdIndependentExtraGuard` 選項）、`src/rules/commands/coreutils.ts`、`src/rules/commands/tail.ts`
 - Test: `src/rules/commands/coreutils_test.ts`, `src/rules/commands/tail_test.ts`
 
 Only `head`, `wc`, and `tail` get a `CommandSpec` — every other `fileReaderRule` member keeps the
@@ -1983,7 +1983,7 @@ Expected: all green.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add src/rules/commands/coreutils.ts src/rules/commands/tail.ts src/rules/commands/coreutils_test.ts src/rules/commands/tail_test.ts
+git add src/rules/factory.ts src/rules/commands/coreutils.ts src/rules/commands/tail.ts src/rules/commands/coreutils_test.ts src/rules/commands/tail_test.ts
 git commit -m "feat(rules): CommandSpec for head/wc/tail; declare pureUtilRule cwd-independence"
 ```
 
@@ -2002,7 +2002,14 @@ git commit -m "feat(rules): CommandSpec for head/wc/tail; declare pureUtilRule c
 
 - [ ] **Step 1: Write the failing tests**
 
-Append to `src/rules/commands/sed_test.ts` (export its `ctxOf` if it is not already exported):
+`sed_test.ts` has `ctxOf(src)` but no one-line verdict helper. Add one next to it (and export
+`ctxOf` if it is not already exported):
+
+```ts
+const v = (src: string) => sedRule.evaluate(ctxOf(src)).kind;
+```
+
+Then append:
 
 ```ts
 Deno.test("unknown sed flags ask", () => {
@@ -2015,6 +2022,11 @@ Deno.test("sed -f is caught in every form", () => {
   assertEquals(v("sed -fprog.sed a.txt"), "ask");
   assertEquals(v("sed -nfprog.sed a.txt"), "ask"); // 群集 + 黏寫
   assertEquals(v("sed --file=prog.sed a.txt"), "ask");
+});
+
+Deno.test("multiple -e expressions are all scanned for side effects", () => {
+  assertEquals(v("sed -e 'p' -e 'w out.txt' f.txt"), "ask"); // 第二段寫檔
+  assertEquals(v("sed -e 'p' -e '1d' f.txt"), "allow");
 });
 
 Deno.test("a separate-value flag does not swallow the program", () => {
@@ -2153,8 +2165,7 @@ function doScanSed(ctx: RuleContext): SedScan {
   let program: string | null;
   let inputs: Word[];
   if (explicitExpr) {
-    program = exprs.join("
-");
+    program = exprs.join("\n");
     inputs = positional;
   } else if (positional.length === 0) {
     program = null;
@@ -2168,19 +2179,13 @@ function doScanSed(ctx: RuleContext): SedScan {
 }
 
 /**
- * sed 程式中下列構造代表寫檔 / 執行：獨立的 w / W / e / r / R 指令，
- * 或 s///… 旗標含 w 或 e。採保守正則偵測（既有邏輯，原樣保留）。
+ * sed 程式中下列構造代表寫檔 / 執行：獨立的 w / W / e / r / R 指令，或 s///… 旗標含 w 或 e。
+ *
+ * **這個函式請逐字從現有的 `src/rules/commands/sed.ts` 原樣保留、不要重新輸入**——其中的
+ * 反向參照與單字邊界跳脫一旦在複製過程被轉義處理就會靜默失效，寫檔偵測會整組失去作用。
+ * 本次改動不碰它的內容，只是它現在由 scanSed 的結果餵入。
  */
-function programHasSideEffect(program: string): boolean {
-  if (/s([^\sa-zA-Z0-9])(?:\.|[^\])*?(?:\.|[^\])*?[a-z0-9]*[we]/.test(program)) {
-    return true;
-  }
-  if (/(^|[;
-{])\s*[0-9$/]*\s*[wWeRr]/.test(program)) return true;
-  if (/(^|[;
-{])\s*[wWeRr]\s/.test(program)) return true;
-  return false;
-}
+// function programHasSideEffect(program: string): boolean { …原樣保留既有實作… }
 
 export const sedRule: CommandRule = {
   names: ["sed"],
@@ -2306,11 +2311,17 @@ Deno.test("placeholder endpoints keep their ordinary verdict but lose the exempt
 Deno.test("flags before the subcommand are still checked", () => {
   assertEquals(v("gh -XPOST api repos/o/r"), "ask");
   assertEquals(v("gh -X POST api repos/o/r"), "ask");
+  assertEquals(v("gh --method=PATCH api repos/o/r"), "ask");
+  assertEquals(v("gh --method PATCH api repos/o/r"), "ask");
   assertEquals(v("gh --cache=1h api repos/o/r"), "ask");
   assertEquals(v("gh --web repo view"), "ask");
   assertEquals(v("gh --totally-unknown api repos/o/r"), "ask");
-  // 合法的前置旗標仍放行
+  // 合法的前置旗標仍放行——包含「分開寫的值」形式，其值不可被誤認為子指令
   assertEquals(v("gh -X GET api repos/o/r"), "allow");
+  assertEquals(v("gh -XGET api repos/o/r"), "allow");
+  assertEquals(v("gh --method GET api repos/o/r"), "allow");
+  assertEquals(v("gh --method=GET api repos/o/r"), "allow");
+  assertEquals(v("gh -H 'Accept: x' api repos/o/r"), "allow");
   // 子指令前出現位置參數 → 保守否決
   assertEquals(v("gh x api repos/o/r"), "ask");
 });
@@ -2439,8 +2450,34 @@ function doParseGh(ctx: RuleContext): GhParse {
   const nullCount = toks.filter((t) => t === null).length;
   if (nullCount > 1) return reject("gh：含一個以上動態 token，無法靜態判定");
 
-  const cmdIdx = toks.findIndex((t) => t !== null && !t.startsWith("-"));
-  if (cmdIdx === -1) return reject("gh：未指定指令或指令為動態");
+  // 子指令 = 第一個「不是旗標、也不是前置旗標的值」的 token。
+  // 不能單純找第一個非 `-` 開頭者：`gh -X GET api …` 的 `GET` 是 -X 的值，不是子指令。
+  // 前置旗標的 arity 不可能依賴尚未確定的子指令，故此處以**所有子指令共用的**吃值旗標集合
+  // 保守消化；任一子指令專屬的吃值旗標寫在子指令之前時，其值會被當成子指令而落入
+  // 「未列入唯讀 allowlist」→ ask（安全方向）。
+  const LEADING_ONE_VALUE = new Set([
+    ...COMMON_ONE_VALUE, "-X", "--method", "-H", "--header", "--hostname",
+    "-p", "--preview", "--cache", "--input", "-f", "--raw-field", "-F", "--field",
+  ]);
+  let cmdIdx = -1;
+  for (let i = 0; i < toks.length; i++) {
+    const t = toks[i];
+    if (t === null) break; // 動態 token 在子指令前 → 無法判定
+    if (t === "--") { cmdIdx = i + 1 < toks.length ? i + 1 : -1; break; }
+    if (!t.startsWith("-") || t === "-") { cmdIdx = i; break; }
+    const eq = t.indexOf("=");
+    const name = eq === -1 ? t : t.slice(0, eq);
+    // 長旗標吃值且未用 `=` 黏寫 → 下一 token 是值，跳過
+    if (t.startsWith("--") && LEADING_ONE_VALUE.has(name) && eq === -1) { i++; continue; }
+    // 短旗標群集：最後一個字母若吃值且同 token 無剩餘字元 → 下一 token 是值
+    if (!t.startsWith("--")) {
+      const last = `-${t[t.length - 1]}`;
+      if (LEADING_ONE_VALUE.has(last)) { i++; continue; }
+    }
+  }
+  if (cmdIdx === -1 || toks[cmdIdx] === null) {
+    return reject("gh：未指定指令或指令為動態");
+  }
   const command = toks[cmdIdx]!;
   const tables = tablesFor(command);
 
