@@ -2155,6 +2155,16 @@ Deno.test("sed cwdIndependent requires zero input paths and known flags", () => 
   assertEquals(sedRule.cwdIndependent!(ctxOf("sed -i 's/a/b/'")), false);
 });
 
+Deno.test("a substitution cannot smuggle a second command past the allowlist", () => {
+  // 正則版會因回溯跨越未跳脫的 `/` 而把整段當成一個 s///；逐字掃描不會。
+  assertEquals(sedRule.cwdIndependent!(ctxOf("sed 's/a/b/;1,2w out.txt'")), false);
+  assertEquals(sedRule.cwdIndependent!(ctxOf(`sed 's/a/b/;/x/r secret.txt'`)), false);
+  assertEquals(sedRule.cwdIndependent!(ctxOf("sed 's/a/b/;s/c/d/'")), false); // 兩條替換也不在白名單
+  // 合法的單一替換仍豁免，含非 `/` 分隔符與跳脫的分隔符
+  assertEquals(sedRule.cwdIndependent!(ctxOf("sed 's|a|b|g'")), true);
+  assertEquals(sedRule.cwdIndependent!(ctxOf(`sed 's/a\/b/c/'`)), true);
+});
+
 Deno.test("addressed read / write commands never get the exemption", () => {
   // 既有的 programHasSideEffect 是 denylist，漏判這兩種帶位址的形式；
   // 豁免改用 allowlist，故它們一定不豁免（evaluate 的既有判定不在本次變更範圍）。
@@ -2322,12 +2332,35 @@ function doScanSed(ctx: RuleContext): SedScan {
  *  2. 單一 `s///` 替換，旗標僅限 `g` / `i` / `I` / `p` / 數字——不含會寫檔或執行的 `w` / `e`。
  */
 function programSafeForExemption(program: string): boolean {
-  const RANGE_PRINT = /^\s*(?:\d+(?:,\d+)?\s*[pd]\s*;?\s*)+$/;
-  // 分隔符以 ([^\sa-zA-Z0-9]) 捕獲，再以 \1 反向參照；轉義序列以 \\. 略過
-  const PURE_SUBST =
-    /^\s*s([^\sa-zA-Z0-9])(?:\\.|[^\\])*?\1(?:\\.|[^\\])*?\1[giIp0-9]*\s*;?\s*$/;
-  return RANGE_PRINT.test(program) || PURE_SUBST.test(program);
+  const p = program.trim();
+  // 形態 1：行號 / 範圍 + p 或 d，可用 `;` 串接。字元集僅數字、逗號、p/d、`;` 與空白，
+  // 不可能夾帶檔名或其他指令。
+  if (/^(?:\d+(?:,\d+)?\s*[pd]\s*;?\s*)+$/.test(p)) return true;
+  return isPureSubstitution(p);
 }
+
+/**
+ * 形態 2：**單一** s/// 替換，旗標僅限 g / i / I / p / 數字。
+ *
+ * 以逐字掃描而非正則實作：正則的 `(?:\\.|[^\\])*?` 允許在回溯時跨越未跳脫的
+ * 分隔符，於是 `s/a/b/;1,2w out.txt` 這種「替換後面再接一條寫檔指令」會被整段當成一個替換而
+ * 誤放行。改為數出**未跳脫分隔符的實際位置**，要求恰好三個、且第三個之後只剩允許的旗標字元，
+ * 就不可能夾帶第二條指令。
+ */
+function isPureSubstitution(p: string): boolean {
+  if (p.length < 4 || p[0] !== "s") return false;
+  const delim = p[1];
+  // 分隔符不可是空白、英數或反斜線（sed 本身也不接受）
+  if (/[\sa-zA-Z0-9\\]/.test(delim)) return false;
+  const positions: number[] = [];
+  for (let i = 1; i < p.length; i++) {
+    if (p[i] === "\\") { i++; continue; } // 跳過被跳脫的字元
+    if (p[i] === delim) positions.push(i);
+  }
+  if (positions.length !== 3) return false;
+  return /^[giIp0-9]*$/.test(p.slice(positions[2] + 1));
+}
+
 
 export const sedRule: CommandRule = {
   names: ["sed"],
@@ -2915,6 +2948,26 @@ Deno.test("guardrail 2 blocks the leaf itself, not just the chain", () => {
   assertEquals(leaf("cd /tmp && echo hi", "echo", true).kind, "allow");
 });
 
+Deno.test("evaluate derives session trust from the initial cwd, not a caller flag", () => {
+  const dirty: CwdState = { kind: "known", path: "/outside" };
+  // evaluate 自己算出 sessionCwdInScope=false，整條鏈必須 ask
+  assertEquals(decide("cd . && echo hi", dirty).verdict, "ask");
+  assertEquals(decide("cd /tmp && echo hi", dirty).verdict, "ask");
+  // gh 的寬鬆 endpoint 述詞會成功，但起點不可信仍不得豁免
+  assertEquals(decide("cd /tmp && gh api repos/o/r/tags?per_page=50", dirty).verdict, "ask");
+  // 逐葉斷言：確認擋下的是 gh 葉指令本身，而不是被前面的 cd 葉指令遮蔽
+  assertEquals(
+    leaf("cd /tmp && gh api repos/o/r/tags?per_page=50", "gh", false, dirty).kind,
+    "ask",
+  );
+  assertEquals(leaf("cd . && gh api repos/o/r/tags?per_page=50", "gh", false, dirty).kind, "ask");
+  // 對照：起點可信時同一個 gh 葉指令才豁免
+  assertEquals(
+    leaf("cd /tmp && gh api repos/o/r/tags?per_page=50", "gh", true).kind,
+    "allow",
+  );
+});
+
 Deno.test("guardrail 3: path operands are still resolved against the real cwd", () => {
   assertEquals(decide("cd /tmp && head -100 a.txt").verdict, "ask");
 });
@@ -3189,10 +3242,14 @@ Deno.test("gh api verdict does not depend on cwd filesystem contents", async () 
 Deno.test("every single-character expansion of the endpoint yields the same verdict", () => {
   const base = v("gh api repos/o/r/tags?per_page=50");
   assertEquals(base, "allow");
-  // `?` 在 bash 中可展開成「除 `/` 外的任一字元」。取代表性字元類各一：
-  // 英數、連字號與底線（常見檔名字元）、點、空白、shell 元字元、引號、非 ASCII。
-  // `{` / `}` 另由「不得含大括號」的護欄處理，不在此列。
-  const chars = ["X", "x", "9", "-", "_", ".", " ", "&", ";", "|", "$", "*", "'", '"', "中"];
+  // `?` 在 bash 中可展開成「除 `/` 外的任一字元」。逐一列舉不可行，故取**每個字元類**
+  // 的代表：英數、連字號與底線（常見檔名字元）、點、空白、shell 元字元、引號、非 ASCII，
+  // 外加大括號。
+  //
+  // 大括號**必須**納入且必然安全：佔位符是完整的 `{owner}` / `{repo}` / `{branch}`，
+  // 需要左右各一個大括號；而被救回的 endpoint 原本就不得含任何大括號（護欄會先 ask），
+  // 單一 `?` 的展開至多只能新增**一個**大括號字元，湊不出佔位符。
+  const chars = ["X", "x", "9", "-", "_", ".", " ", "&", ";", "|", "$", "*", "'", '"', "中", "{", "}"];
   for (const ch of chars) {
     // 以單引號包住整個 endpoint，確保測試餵進去的是「展開後的字面值」本身，
     // 不會又被 parser 當成新的 glob 或 shell 結構。
@@ -3211,7 +3268,7 @@ Deno.test("expansion invariance holds through the cwd exemption, not just evalua
   // 原 token 與其任一展開結果，在「鏈內 cd 到專案外」的完整判定下必須一致
   const base = evaluate("cd /tmp && gh api repos/o/r/tags?per_page=50", ROOT, START).verdict;
   assertEquals(base, "allow");
-  for (const ch of ["X", "-", "_", "."]) {
+  for (const ch of ["X", "-", "_", ".", "{", "}", "$", ";", " "]) {
     assertEquals(
       evaluate(`cd /tmp && gh api 'repos/o/r/tags${ch}per_page=50'`, ROOT, START).verdict,
       base,
@@ -3600,6 +3657,12 @@ Keep `baseline_tally.txt` and `baseline_asks.txt` until the report is written, t
 
 - [ ] **Step 7: Report**
 
-Report the measured tally and the reason string for each of the four expected asks. If any
-guardrail line printed `allow`, or the tally is not 63/4, the task is **not** complete — diagnose
-and fix the rule, then re-run from Step 1.
+Report the measured tally and the reason string for each of the **five** expected asks. The task is
+**not** complete unless **all** of the following hold — diagnose and fix the rule, then re-run from
+Step 1 if any fails:
+
+- the tally is exactly **62 allow / 5 ask**;
+- the five asks are the two `for` loops, the `xargs … sh -c` line, the heredoc-write line, and the
+  `gh search code … --match-all …` line;
+- every Step 5 guardrail line printed `ask` — **no** `allow` anywhere;
+- the Step 5 `find` line printed **`deny`**, not `ask` (an `ask` there is a hard-deny regression).
