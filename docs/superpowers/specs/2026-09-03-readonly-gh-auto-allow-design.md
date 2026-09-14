@@ -219,11 +219,11 @@ export function nonPathStaticValue(word: Word): string | null;
 
 判定規則：
 
-- **有 `parts`**：任一 top-level part 為 `DYNAMIC_PART_TYPES`（`SimpleExpansion` /
-  `ParameterExpansion` / `CommandExpansion` / `ArithmeticExpansion` / `ProcessSubstitution` /
-  `BraceExpansion` / `ExtendedGlob`）→ `null`；`DoubleQuoted` / `LocaleString` 依既有
-  `nestedPartIsDynamic` 檢查內層；`Literal` 只在**含反斜線**時算動態。通過後仍須通過下述
-  「單一 `?` 查詢串」檢查（引號內的 glob 字元本就不展開，故必然通過，檢查成本為零）。
+- **有 `parts`**（word 含任何引號片段）：**一律回 `null`**。理由：`word.value` 是 quote-removed
+  的串接結果，引號內的反斜線與 shell 跳脫**無法區分**——`'a'*b?c` 的反斜線來自引號內，
+  但逐字掃描會把它當成跳脫符而略過後面那個**活躍的** `*`，誤判成「單一 `?` 查詢串」。
+  要正確處理必須保留每個字元的引號來源（unbash 的 `parts` 不提供此粒度）。
+  代價只是 `gh api "repos/o"/r/x?q=1` 這類混合引號寫法多問一次，屬可接受的誤 ask。
 - **無 `parts`**（未加引號字面值）：仍套用既有的 bash quote removal（`removeBackslashEscapes`），
   再套用「單一 `?` 查詢串」檢查。
 
@@ -446,6 +446,10 @@ rule allow）完全不變。
    | `grep` | `--exclude-from=FILE` |
    | `diff` | `-X` / `--exclude-from=FILE`、`-S` / `--starting-file=FILE` |
    | `realpath` | `--relative-to=DIR`、`--relative-base=DIR` |
+
+   另外兩個在同一次稽核中發現、但**不是路徑值而是更嚴重**的 `sort` 旗標，一併列入該規則的
+   `askFlags`（它們的存在正是 `sort` 不宣告 cwd 豁免的理由之一，但即使不豁免也不該放行）：
+   `--compress-program=PROG`（**執行外部程式**）、`--random-source=FILE`（**讀檔**）。
 
    若只靠「補齊 `pathValueFlags`」，任何**日後新增或本次仍漏掉**的路徑值旗標都會直接變成
    誤放行。改成旗標表 allowlist 後，未知旗標的後果只是「不豁免 → 維持現行 ask」——

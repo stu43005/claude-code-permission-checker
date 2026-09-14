@@ -49,7 +49,7 @@
 
 | File | Responsibility |
 | --- | --- |
-| `src/rules/command_spec.ts` | `CommandSpec` (each flag declared once) + `parseArgv`, memoized per `RuleContext`. Four commands use it: `grep`/`egrep`/`fgrep`, `head`, `wc`, `tail` |
+| `src/rules/command_spec.ts` | `CommandSpec` (each flag declared once) + `parseArgv`, memoized per `RuleContext`. Four commands use it: `grep`/`egrep`/`fgrep`, `head`, `wc`, `tail`. **`rg` deliberately does not** — it never opts into the exemption, so its flag grammar is left untouched on the legacy path |
 | `src/rules/command_spec_test.ts` | Parser tests |
 | `src/rules/commands/jq.ts` | `jq` rule: filter is not a path; `-f` is boolean; `-L` takes an attached value |
 | `src/rules/commands/jq_test.ts` | Tests for the above |
@@ -59,7 +59,8 @@
 `src/rules/commands/{grep,coreutils,simple-flag,tail,sed,gh,curl}.ts`, `src/rules/allowlist.ts`,
 `src/engine/{cwd,walk,classify}_test.ts`, `CLAUDE.md`.
 
-**Deliberately untouched:** `src/rules/commands/{awk,positional-output,find,deno,git}.ts`.
+**Deliberately untouched:** `src/rules/commands/{awk,positional-output,find,deno,git}.ts`, and
+`rg`'s flag handling inside `grep.ts`.
 `awk`, `uniq`, `xxd`, `yq`, `sort`'s exemption, `diff`, `tree`, `file`, `date` — none of them opt
 in, so none of their flag grammars need modelling. `curl` is touched only to add its predicate
 (Task 12); its value parsing is deliberately left alone.
@@ -1086,7 +1087,7 @@ git commit -m "feat(rules): add CommandSpec + memoized single-parse parseArgv"
 ### Task 7: `grep` — PATTERN is not a path, on top of `CommandSpec`
 
 **Files:**
-- Modify: `src/rules/factory.ts`, `src/rules/commands/grep.ts`
+- Modify: `src/rules/factory.ts`, `src/rules/commands/grep.ts`, `src/rules/allowlist.ts`
 - Test: `src/rules/commands/grep_test.ts`
 
 `flagGatedReader` gains **optional** `spec` support: a rule that supplies `spec` gets
@@ -1166,6 +1167,12 @@ Deno.test("value-bearing recursive forms are detected", () => {
 Deno.test("an unknown cluster letter does not lose a recursion flag", () => {
   // -T 未列入旗標表，但 -r 仍須被偵測到，否則既有硬 deny 會降級成 ask
   assertEquals(grepRule.evaluate(ctxOf("grep", "grep -Tr x /")).kind, "deny");
+});
+
+Deno.test("a recursion flag consumed as a flag value still counts (union with raw scan)", () => {
+  // `-r` 在此是 `-e` 的 pattern 值，旗標感知解析不會把它記進 seenFlags；
+  // 既有實作靠 raw 掃描判定為遞迴並 deny `/`，此行為必須保留
+  assertEquals(grepRule.evaluate(ctxOf("grep", "grep -e -r /")).kind, "deny");
 });
 
 Deno.test("the pattern flag is detected from the same parse, not a separate scan", () => {
@@ -1311,47 +1318,92 @@ function positionalsFor(seen: SeenFlags): "paths" | "pattern-then-paths" {
  *  - `rg` 恆為遞迴。
  * 無操作元時 grep 在遞迴模式下會搜尋 cwd，故此判定同時用於危險根 deny 與 cwd 豁免排除。
  */
-function recursiveFor(name: string, seen: SeenFlags): boolean {
+function recursiveFor(name: string, seen: SeenFlags, argv: Word[]): boolean {
   if (name === "rg") return true;
   for (const f of ["-r", "-R", "--recursive", "--dereference-recursive"]) {
     if (seen.has(f)) return true;
   }
   // -d / --directories 以**最後一次**出現為準（`grep -d skip -d recurse` 會遞迴）
-  return (seen.get("-d") ?? []).at(-1) === "recurse" ||
-    (seen.get("--directories") ?? []).at(-1) === "recurse";
+  if ((seen.get("-d") ?? []).at(-1) === "recurse") return true;
+  if ((seen.get("--directories") ?? []).at(-1) === "recurse") return true;
+  // 保留既有的 raw-token 掃描作為**聯集**，不可省略。
+  // 旗標感知解析會把某些 token 當成前一個旗標的值而不計入 seenFlags —— 例如
+  // `grep -e -r /` 的 `-r` 是 `-e` 的 pattern 值。既有實作以 raw 掃描判定為遞迴、
+  // 進而對 `/` 回硬 deny；若只依 seenFlags，該硬 deny 會降級成 ask。
+  // 兩者取聯集 → 只會多判遞迴（更嚴），不會少判。
+  return hasAnyFlag(argv, [
+    exact("-r", "-R", "--recursive", "--dereference-recursive"),
+    shortClusterHasR,
+  ]);
 }
 
 const SPEC: CommandSpec = {
   flags,
   positionals: positionalsFor,
-  recursive: recursiveFor,
+  recursive: (name, seen) => recursiveFor(name, seen, currentArgv),
 };
+```
+
+`CommandSpec.recursive` only receives `(name, seenFlags)`, so pass argv through the spec factory
+instead of a module-level variable:
+
+```ts
+function specFor(_name: string, argv: Word[]): CommandSpec {
+  return {
+    flags,
+    positionals: positionalsFor,
+    recursive: (name, seen) => recursiveFor(name, seen, argv),
+  };
+}
 
 export const grepRule: CommandRule = flagGatedReader({
-  names: ["grep", "egrep", "fgrep", "rg"],
-  spec: () => SPEC,
+  names: ["grep", "egrep", "fgrep"],
+  spec: specFor,
   cwdIndependentWhenNoPaths: true,
-  // rg 恆為遞迴（recursiveFor 已排除）；列出僅為明示意圖
-  cwdDependentNames: ["rg"],
 });
 ```
 
-> **`rg` shares the GNU grep table.** `rg` never opts into the exemption (always recursive), but it
-> does go through the same `evaluate`. `rg`-specific flags absent from the table now `ask` instead
-> of being skipped — a tightening in the safe direction, consistent with "unknown flags ask".
-> `rg`'s common read-only flags (`-n`, `-i`, `-l`, `-A`/`-B`/`-C`, `-e`, `-f`, `--json`) are already
-> in the table or are known-value flags; anything else costs one extra prompt.
+> **`rg` keeps the legacy path.** It is intentionally absent from `names` above; register it
+> separately with the existing `flagGatedReader` options so its flag handling is unchanged:
+>
+> ```ts
+> export const rgRule: CommandRule = flagGatedReader({
+>   names: ["rg"],
+>   valueFlags: VALUE_FLAGS,          // 既有常數，原樣保留
+>   pathValueFlags: ["-f", "--file"], // 既有設定，原樣保留
+>   recursive: () => true,
+> });
+> ```
+>
+> Register `rgRule` in `allowlist.ts` next to `grepRule`. `rg` never opts into the exemption
+> (always recursive), and this keeps the change from touching ripgrep's flag grammar at all —
+> modelling it was never required, since it is not one of the declaring commands.
 
 - [ ] **Step 5: Run the tests, full suite, type check and lint**
 
 Run: `deno task check && deno task lint && deno task test`
 Expected: all green.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 6: Register `rgRule` in `src/rules/allowlist.ts`**
+
+```ts
+import { grepRule, rgRule } from "./commands/grep.ts";
+
+const RULES: CommandRule[] = [
+  // …
+  grepRule,
+  rgRule,
+  // …
+];
+```
+
+`allowlist.ts` throws on duplicate names, so a clean load proves `rg` left `grepRule.names`.
+
+- [ ] **Step 7: Commit**
 
 ```bash
-git add src/rules/factory.ts src/rules/commands/grep.ts src/rules/commands/grep_test.ts
-git commit -m "fix(rules): grep PATTERN is not a path; --color takes no separate value"
+git add src/rules/factory.ts src/rules/commands/grep.ts src/rules/commands/grep_test.ts src/rules/allowlist.ts
+git commit -m "fix(rules): grep PATTERN is not a path; --color takes no separate value; rg keeps legacy handling"
 ```
 
 ---
@@ -1409,14 +1461,17 @@ Deno.test("jq input files are scope-checked", () => {
 });
 
 Deno.test("-f makes the FIRST POSITIONAL the program file, wherever -f appears", () => {
-  assertEquals(v("jq -f prog.jq data.json"), "allow");
-  assertEquals(v("jq -f ../outside.jq data.json"), "ask");
-  // 旗標寫在位置參數之後也一樣：第一個位置參數才是 program 檔
-  assertEquals(v("jq ../outside.jq -f data.json"), "ask");
-  assertEquals(v("jq prog.jq --from-file data.json"), "allow");
-  // -fn 是 -f -n：program 檔仍是第一個位置參數
-  assertEquals(v("jq -fn ../outside.jq"), "ask");
-  assertEquals(v("jq -fn prog.jq"), "allow");
+  // -f 一律 ask：program 檔的內容本工具讀不到，無法確認它不含 include / import。
+  // 這些案例驗證的是「哪個 token 被當成 program 檔」——理由字串會指出是路徑超範圍
+  // 還是內容不可檢查。
+  assertEquals(v("jq -f ../outside.jq data.json"), "ask"); // 路徑超範圍
+  assertEquals(v("jq ../outside.jq -f data.json"), "ask"); // 第一個位置參數才是 program 檔
+  assertEquals(v("jq -fn ../outside.jq"), "ask"); // -fn 是 -f -n
+  // 路徑落在專案內，但內容不可檢查 → 仍 ask（fail-closed）
+  assertEquals(v("jq -f prog.jq data.json"), "ask");
+  assertEquals(v("jq prog.jq --from-file data.json"), "ask");
+  assertEquals(v("jq -fn prog.jq"), "ask");
+  assertEquals(jqRule.cwdIndependent!(ctxOf("jq -f prog.jq")), false);
 });
 
 Deno.test("-L accepts an attached value", () => {
@@ -1528,6 +1583,8 @@ interface JqScan {
   paths: Word[];
   /** filter 字串（未由 -f 提供時）；無法靜態取得或由 -f 提供時為 null。 */
   filter: string | null;
+  /** program 是否由 -f / --from-file 從檔案載入（其內容本工具讀不到）。 */
+  programFromFile: boolean;
   /** 吃路徑值的旗標帶的值（字串）。 */
   pathValues: string[];
   /** 是否用過任何吃路徑的旗標，或 -f（program 檔本身就是路徑）。 */
@@ -1660,7 +1717,7 @@ function doScan(ctx: RuleContext): JqScan {
   const inputEnd = argsModeFrom >= 0 ? Math.max(argsModeFrom, inputStart) : positional.length;
   for (let k = inputStart; k < inputEnd; k++) paths.push(positional[k]);
 
-  return { paths, filter, pathValues, pathFlagUsed, unknownFlag, dynamic };
+  return { paths, filter, programFromFile: fromFile, pathValues, pathFlagUsed, unknownFlag, dynamic };
 }
 
 /**
@@ -1683,6 +1740,11 @@ export const jqRule: CommandRule = {
     if (r.filter !== null && filterReadsModules(r.filter)) {
       return ask("jq：filter 含 include / import，會以 cwd 為基準載入 .jq 模組檔");
     }
+    // -f 由檔案載入 program，本工具讀不到其內容，無法確認它不含 include / import。
+    // 該檔案本身已做範圍檢查，但它 include 進來的模組可能落在專案外 → fail-closed。
+    if (r.programFromFile) {
+      return ask("jq：-f 的 program 檔內容無法檢查是否含 include / import");
+    }
     for (const v of r.pathValues) {
       if (ctx.resolvePathValue(v) !== "in-project") {
         return ask(`jq：旗標的路徑值超出專案範圍或無法解析（${v}）`);
@@ -1701,7 +1763,7 @@ export const jqRule: CommandRule = {
    */
   cwdIndependent(ctx: RuleContext): boolean {
     const r = scan(ctx);
-    if (r.dynamic || r.unknownFlag !== null) return false;
+    if (r.dynamic || r.unknownFlag !== null || r.programFromFile) return false;
     if (r.filter !== null && filterReadsModules(r.filter)) return false;
     return r.paths.length === 0 && !r.pathFlagUsed;
   },
@@ -1952,28 +2014,40 @@ export const tailRule: CommandRule = flagGatedReader({
   askFlags: followFlags,
   askReason: () => "tail：-f / --follow 會持續跟隨（無界等待 / 輪詢）",
   cwdIndependentWhenNoPaths: true,
-  // 述詞的額外前置條件：命中 follow 旗標即不豁免
-  cwdIndependentExtraGuard: (ctx) => !hasAnyFlag(ctx.argv, followFlags),
+  // 述詞的額外前置條件：從**同一份解析結果**讀 follow 旗標，不另外掃 argv
+  cwdIndependentExtraGuard: (p) =>
+    !["-f", "-F", "--follow", "--retry"].some((f) => p.seenFlags.has(f)),
 });
 ```
 
-`flagGatedReader` therefore needs one more optional option:
+`flagGatedReader` therefore needs one more optional option. Note its parameter is the **parse
+result**, not the context — that is what keeps evaluation and the predicate on one parse:
 
 ```ts
-  /** 述詞的額外前置條件；回 false 即不豁免。供有 askFlags 的規則補上同一條件。 */
-  cwdIndependentExtraGuard?: (ctx: RuleContext) => boolean;
+  /**
+   * 述詞的額外前置條件；回 false 即不豁免。供有 askFlags 的規則補上同一條件。
+   * 參數是 parseArgv 的結果（與 evaluate 同一份快取），**不是** RuleContext —— 傳 ctx 會
+   * 誘使實作重掃 argv，正是單一解析契約要避免的。
+   */
+  cwdIndependentExtraGuard?: (parse: ArgvParse) => boolean;
 ```
 
-wired into the predicate as the first check:
+wired into the predicate after the parse is obtained:
 
 ```ts
       ? (ctx: RuleContext) => {
-        if (opts.cwdIndependentExtraGuard && !opts.cwdIndependentExtraGuard(ctx)) return false;
         if ((opts.cwdDependentNames ?? []).includes(ctx.name)) return false;
-        // …其餘不變…
+        const spec = opts.spec?.(ctx.name, ctx.argv);
+        if (!spec) return false;
+        const p = parseArgv(ctx, spec); // 與 evaluate 同一份快取結果
+        if (opts.cwdIndependentExtraGuard && !opts.cwdIndependentExtraGuard(p)) return false;
+        return !p.isRecursive && !p.dynamic && p.unknownFlag === null &&
+          p.pathOperands.length === 0 && p.pathValues.length === 0;
+      }
 ```
 
-Add `hasAnyFlag` to `tail.ts`'s `../flags.ts` import.
+Import `ArgvParse` alongside `CommandSpec` in `factory.ts`. `tail.ts` does **not** need
+`hasAnyFlag` for the guard.
 
 - [ ] **Step 5: Run the tests, full suite, type check and lint**
 
@@ -3023,6 +3097,8 @@ function ctxIn(dir: string, src: string): RuleContext {
 }
 
 Deno.test("gh api verdict does not depend on cwd filesystem contents", async () => {
+  // cwd 與專案根刻意設成同一個暫存目錄：本測試要隔離的唯一變因是「檔案存不存在」，
+  // 路徑範圍不是受測對象（範圍行為由 classify_test.ts 的整合測試涵蓋）。
   const dir = (await Deno.makeTempDir()).replace(/\\/g, "/");
   const src = "gh api repos/o/r/tags?per_page=50";
   try {
@@ -3041,9 +3117,34 @@ Deno.test("gh api verdict does not depend on cwd filesystem contents", async () 
 Deno.test("every single-character expansion of the endpoint yields the same verdict", () => {
   const base = v("gh api repos/o/r/tags?per_page=50");
   assertEquals(base, "allow");
-  for (const ch of ["X", "-", ".", "1", "_"]) {
-    assertEquals(v(`gh api repos/o/r/tags${ch}per_page=50`), base, ch);
+  // `?` 在 bash 中可展開成「除 `/` 外的任一字元」。取代表性字元類各一：
+  // 英數、連字號與底線（常見檔名字元）、點、空白、shell 元字元、引號、非 ASCII。
+  // `{` / `}` 另由「不得含大括號」的護欄處理，不在此列。
+  const chars = ["X", "x", "9", "-", "_", ".", " ", "&", ";", "|", "$", "*", "'", '"', "中"];
+  for (const ch of chars) {
+    // 以單引號包住整個 endpoint，確保測試餵進去的是「展開後的字面值」本身，
+    // 不會又被 parser 當成新的 glob 或 shell 結構。
+    const src = `gh api 'repos/o/r/tags${ch === "'" ? "" : ch}per_page=50'`;
+    if (ch === "'") continue; // 單引號本身以雙引號包覆另測
+    assertEquals(v(src), base, ch);
   }
+  assertEquals(v(`gh api "repos/o/r/tags'per_page=50"`), base, "single quote");
+});
+
+Deno.test("expansion invariance holds through the cwd exemption, not just evaluate", () => {
+  // 原 token 與其任一展開結果，在「鏈內 cd 到專案外」的完整判定下必須一致
+  const base = evaluate("cd /tmp && gh api repos/o/r/tags?per_page=50", ROOT, START).verdict;
+  assertEquals(base, "allow");
+  for (const ch of ["X", "-", "_", "."]) {
+    assertEquals(
+      evaluate(`cd /tmp && gh api 'repos/o/r/tags${ch}per_page=50'`, ROOT, START).verdict,
+      base,
+      ch,
+    );
+  }
+  // 大括號是唯一例外，且兩側都必須 ask —— 原 token 因護欄 ask、展開結果因佔位符不豁免
+  assertEquals(evaluate("cd /tmp && gh api repos/o/r/x?owner}", ROOT, START).verdict, "ask");
+  assertEquals(evaluate("cd /tmp && gh api 'repos/o/r/x{owner}'", ROOT, START).verdict, "ask");
 });
 
 Deno.test("multiple expanded endpoints are a gh usage error, never a write", () => {
