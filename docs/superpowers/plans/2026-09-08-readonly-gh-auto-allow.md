@@ -1496,9 +1496,8 @@ Deno.test("jq input files are scope-checked", () => {
 });
 
 Deno.test("-f makes the FIRST POSITIONAL the program file, wherever -f appears", () => {
-  // -f 一律 ask：program 檔的內容本工具讀不到，無法確認它不含 include / import。
-  // 這些案例驗證的是「哪個 token 被當成 program 檔」——理由字串會指出是路徑超範圍
-  // 還是內容不可檢查。
+  // -f 一律 ask（實作在路徑檢查之前就因「內容不可檢查」返回），故這些案例只斷言 verdict。
+  // 「哪個 token 被當成 program 檔」改由下方的 cwdIndependent 與 scan 層級測試涵蓋。
   assertEquals(v("jq -f ../outside.jq data.json"), "ask"); // 路徑超範圍
   assertEquals(v("jq ../outside.jq -f data.json"), "ask"); // 第一個位置參數才是 program 檔
   assertEquals(v("jq -fn ../outside.jq"), "ask"); // -fn 是 -f -n
@@ -1542,9 +1541,10 @@ Deno.test("--args affects only subsequent positionals", () => {
 });
 
 Deno.test("--args cannot hide the -f program file", () => {
-  // jq 仍把第一個位置參數當 program 檔讀取，即使 --args 先出現
+  // jq 仍把第一個位置參數當 program 檔讀取，即使 --args 先出現。
+  // 兩者都 ask：路徑超範圍者因範圍檢查、路徑合法者因 program 內容不可檢查。
   assertEquals(v("jq --args -f ../outside.jq"), "ask");
-  assertEquals(v("jq --args -f prog.jq"), "allow");
+  assertEquals(v("jq --args -f prog.jq"), "ask");
   assertEquals(jqRule.cwdIndependent!(ctxOf("jq --args -f prog.jq")), false);
 });
 
@@ -2147,10 +2147,22 @@ Deno.test("a separate-value flag does not swallow the program", () => {
 
 Deno.test("sed cwdIndependent requires zero input paths and known flags", () => {
   assertEquals(sedRule.cwdIndependent!(ctxOf("sed -n '1,5p'")), true);
+  assertEquals(sedRule.cwdIndependent!(ctxOf("sed -n '600,750p'")), true); // 基準集用法
+  assertEquals(sedRule.cwdIndependent!(ctxOf("sed 's/a/b/g'")), true);
   assertEquals(sedRule.cwdIndependent!(ctxOf("sed -n '1,5p' a.txt")), false);
   assertEquals(sedRule.cwdIndependent!(ctxOf("sed --totally-unknown 'p'")), false);
   assertEquals(sedRule.cwdIndependent!(ctxOf("sed -nfprog.sed p")), false);
   assertEquals(sedRule.cwdIndependent!(ctxOf("sed -i 's/a/b/'")), false);
+});
+
+Deno.test("addressed read / write commands never get the exemption", () => {
+  // 既有的 programHasSideEffect 是 denylist，漏判這兩種帶位址的形式；
+  // 豁免改用 allowlist，故它們一定不豁免（evaluate 的既有判定不在本次變更範圍）。
+  assertEquals(sedRule.cwdIndependent!(ctxOf(`sed '/x/r secret.txt'`)), false);
+  assertEquals(sedRule.cwdIndependent!(ctxOf("sed '1,2w out.txt'")), false);
+  assertEquals(sedRule.cwdIndependent!(ctxOf(`sed '/x/e cmd'`)), false);
+  // s/// 帶 w 旗標同樣不在白名單內
+  assertEquals(sedRule.cwdIndependent!(ctxOf("sed 's/a/b/w out.txt'")), false);
 });
 ```
 
@@ -2296,6 +2308,27 @@ function doScanSed(ctx: RuleContext): SedScan {
  */
 // function programHasSideEffect(program: string): boolean { …原樣保留既有實作… }
 
+/**
+ * cwd 豁免專用的**保守**程式驗證器：只認兩種確定不碰檔案系統的形態。
+ *
+ * 為什麼不沿用 `programHasSideEffect`：它是 denylist，會漏掉帶位址的形式——
+ * `/x/r secret.txt`（讀檔）與 `1,2w out.txt`（寫檔）都不會被它命中，因為其位址字元類
+ * 只涵蓋 `[0-9$/]`，遇到 `x` 或 `,` 就中止比對。evaluate 沿用它（維持既有行為、不在本次
+ * 變更範圍），但**豁免不能建立在 denylist 上**：一旦跳過 cwd 檢查，漏判就等於放行
+ * 專案外的讀寫。此處改用 allowlist，形態不符即不豁免（evaluate 的判定不受影響）。
+ *
+ * 認可的兩種形態（可用 `;` 串接、可有前後空白）：
+ *  1. 行號 / 範圍 + `p` 或 `d`（如 `600,750p`、`1d`、`3,5p;9p`）——純選取輸出；
+ *  2. 單一 `s///` 替換，旗標僅限 `g` / `i` / `I` / `p` / 數字——不含會寫檔或執行的 `w` / `e`。
+ */
+function programSafeForExemption(program: string): boolean {
+  const RANGE_PRINT = /^\s*(?:\d+(?:,\d+)?\s*[pd]\s*;?\s*)+$/;
+  // 分隔符以 ([^\sa-zA-Z0-9]) 捕獲，再以 \1 反向參照；轉義序列以 \\. 略過
+  const PURE_SUBST =
+    /^\s*s([^\sa-zA-Z0-9])(?:\\.|[^\\])*?\1(?:\\.|[^\\])*?\1[giIp0-9]*\s*;?\s*$/;
+  return RANGE_PRINT.test(program) || PURE_SUBST.test(program);
+}
+
 export const sedRule: CommandRule = {
   names: ["sed"],
   evaluate(ctx: RuleContext): RuleVerdict {
@@ -2314,11 +2347,15 @@ export const sedRule: CommandRule = {
     }
     return allow();
   },
-  /** 程式碼已與輸入路徑分離；無輸入路徑、旗標全已知且無 -i/-f 時與 cwd 無關。 */
+  /**
+   * 程式碼已與輸入路徑分離；無輸入路徑、旗標全已知、無 -i/-f，
+   * **且程式形態落在極保守的白名單內**時，與 cwd 無關。
+   */
   cwdIndependent(ctx: RuleContext): boolean {
     const r = scanSed(ctx);
     if (r.unsafe || r.unknownFlag !== null || r.dynamic) return false;
     if (r.program === null || programHasSideEffect(r.program)) return false;
+    if (!programSafeForExemption(r.program)) return false;
     return r.inputs.length === 0;
   },
 };

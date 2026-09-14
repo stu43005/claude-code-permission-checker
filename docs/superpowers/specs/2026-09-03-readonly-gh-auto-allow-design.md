@@ -548,7 +548,7 @@ function classifyArgv(ctx: RuleContext, opts: FlagGatedReaderOptions): ArgvClass
 | `fileReaderRule` 的 `head` / `wc` | 是 | 僅這兩個成員；同規則其餘指令一律不宣告 |
 | `grepRule` 的 `grep` / `egrep` / `fgrep` | 是 | `rg` 恆為遞迴，計算式自然排除 |
 | `tailRule` | 是 | 無操作元時讀 stdin |
-| `sedRule` | 是（手寫述詞） | 程式碼已與輸入路徑分離；條件為輸入路徑數為 0 |
+| `sedRule` | 是（手寫述詞） | 條件為輸入路徑數為 0 **且程式形態落在豁免專用的 allowlist 內**（見 §8.7） |
 | `jqRule` | 是（手寫述詞） | 同上，**且 filter 不含 `include` / `import`**（兩者會以 cwd 為基準載入 `.jq` 模組） |
 
 **宣告範圍刻意壓到最小**：上表就是基準集 67 條實際用到的全部過濾器
@@ -821,6 +821,23 @@ verdict 因此**隨展開結果改變**，直接違反 §4.2.6 的不變量，�
 目標零影響；而 (a) 需要改動 `domain_scope` 的回傳型別並新增一條判斷路徑，成本與收益不成比例。
 
 `curl` 仍保留 cwd 豁免（§4.3.4）——那與寬鬆取值無關：加引號的 URL 本就是靜態 token。
+
+### 8.7 `sed` 的副作用掃描是 denylist，故豁免另設 allowlist
+
+既有的 `programHasSideEffect` 以正則列舉「危險構造」，屬 denylist，且**確實有漏**：其位址字元類
+只涵蓋 `[0-9$/]`，因此
+
+- `/x/r secret.txt`（讀檔）：`[0-9$/]*` 吃掉開頭的 `/` 後，下一個字元是 `x`，比對即中止；
+- `1,2w out.txt`（寫檔）：`[0-9$/]*` 吃掉 `1` 後遇到 `,`，同樣中止。
+
+兩者都不會被判為有副作用。這是**既有**弱點，本規格依 §2.2 不修 `evaluate` 的既有行為
+（維持現狀、不擴大變更面）。但**豁免不能建立在 denylist 上**：一旦跳過 cwd 檢查，漏判就等於
+放行專案外的讀寫。
+
+因此 `sedRule.cwdIndependent` 另設**豁免專用的 allowlist**（`programSafeForExemption`），只認兩種
+確定不碰檔案系統的形態：(a) 行號 / 範圍 + `p` 或 `d`（可用 `;` 串接）；(b) 單一 `s///` 替換且旗標
+僅限 `g` / `i` / `I` / `p` / 數字。其餘一律不豁免，`evaluate` 的判定不受影響。基準集使用的
+`sed -n '600,750p'` 落在 (a)。
 
 ## 9. Non-goals / Accepted limitations
 
