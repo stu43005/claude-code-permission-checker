@@ -548,6 +548,11 @@ Append to `src/rules/commands/coreutils_test.ts` — its helper is `ctxOf(src, c
 command string:
 
 ```ts
+Deno.test("realpath flags are scope-checked in the separate-value form too", () => {
+  assertEquals(fileReaderRule.evaluate(ctxOf("realpath --relative-to ../out a.txt")).kind, "ask");
+  assertEquals(fileReaderRule.evaluate(ctxOf("realpath --relative-base ../out a.txt")).kind, "ask");
+});
+
 Deno.test("wc --files0-from is scope-checked in both forms", () => {
   assertEquals(fileReaderRule.evaluate(ctxOf("wc --files0-from=list.txt")).kind, "allow");
   assertEquals(fileReaderRule.evaluate(ctxOf("wc --files0-from=../out/list.txt")).kind, "ask");
@@ -595,7 +600,6 @@ Expected: FAIL — the out-of-project variants currently allow, because the valu
 
 ```ts
 export const fileReaderRule: CommandRule = flagGatedReader({
-  // "jq" 仍在此列；Task 8 才在註冊 jqRule 的同一個 commit 中移除
   names: [
     "cat", "head", "wc", "ls", "stat", "cut", "tr", "column",
     "cmp", "comm", "md5sum", "sha256sum", "hexdump", "jq", "nl", "fold",
@@ -1110,6 +1114,32 @@ Deno.test("grep 非遞迴碰根 -> 非 deny", () => {
 });
 ```
 
+**Migrate the existing `rg` assertions to `rgRule`.** `grepRule.names` no longer contains `"rg"`,
+so any assertion of the form `grepRule.evaluate(ctxOf("rg", …))` now tests the wrong rule, and an
+alias assertion listing `"rg"` under `grepRule.names` fails. In `grep_test.ts`:
+
+```ts
+import { grepRule, rgRule } from "./grep.ts";
+
+// 既有 "grep 非遞迴碰根 -> 非 deny" 中的 rg 斷言
+assertEquals(rgRule.evaluate(ctxOf("rg", "rg foo ./src")).kind, "allow");
+
+// 既有遞迴 deny 測試中的 rg 斷言
+assertEquals(rgRule.evaluate(ctxOf("rg", "rg x ~")).kind, "deny");
+```
+
+`grep_test.ts:39` asserts `grepRule.names.includes("rg") === true`. Replace that line:
+
+```ts
+// before
+  assertEquals(grepRule.names.includes("rg"), true);
+// after
+  assertEquals(grepRule.names.includes("rg"), false);
+  assertEquals(rgRule.names.includes("rg"), true);
+```
+
+Line 38's `grepRule.names.includes("egrep")` assertion stays as it is.
+
 Then append:
 
 ```ts
@@ -1270,8 +1300,24 @@ Both the recursion decision and the pattern-position decision are derived from t
 
 ```ts
 import type { CommandRule } from "../types.ts";
+import type { Word } from "../../deps.ts";
 import type { CommandSpec, FlagSpec, SeenFlags } from "../command_spec.ts";
 import { flagGatedReader } from "../factory.ts";
+import { exact, type FlagMatcher, hasAnyFlag } from "../flags.ts";
+
+/** 既有常數，原樣保留：短旗標群集含 r/R（如 -rn、-Rl）代表遞迴。 */
+const shortClusterHasR: FlagMatcher = (t) =>
+  /^-[A-Za-z]+$/.test(t) && !t.includes("=") && /[rR]/.test(t.slice(1));
+
+/** 既有常數，原樣保留：rgRule 仍使用。 */
+const VALUE_FLAGS = [
+  exact(
+    "-e", "--regexp", "-f", "--file", "-m", "--max-count",
+    "-A", "--after-context", "-B", "--before-context", "-C", "--context",
+    "-d", "--directories", "--color", "--colour",
+    "-r", "--replace", "-g", "--glob", "-t", "--type", "-T", "--type-not", "-M",
+  ),
+];
 
 /**
  * GNU grep 3.0 的旗標。`--color` / `--colour` 的值是選填且只接受黏寫（`--color=auto`），
@@ -1337,17 +1383,6 @@ function recursiveFor(name: string, seen: SeenFlags, argv: Word[]): boolean {
   ]);
 }
 
-const SPEC: CommandSpec = {
-  flags,
-  positionals: positionalsFor,
-  recursive: (name, seen) => recursiveFor(name, seen, currentArgv),
-};
-```
-
-`CommandSpec.recursive` only receives `(name, seenFlags)`, so pass argv through the spec factory
-instead of a module-level variable:
-
-```ts
 function specFor(_name: string, argv: Word[]): CommandSpec {
   return {
     flags,
@@ -3249,12 +3284,13 @@ Replace that clause with:
 （`none` / `required` / `attached-only`）、值是否為路徑；位置參數語義與遞迴判定皆可依**同一次解析**
 的 `seenFlags` 動態決定。`parseArgv` 對每個 `RuleContext` 只解析一次並快取，`evaluate` 與
 `cwdIndependent` 因此讀到**同一份**結果）、`flags.ts`、`factory.ts`、`allowlist.ts`、`commands/*.ts`
-（本次新增 `commands/jq.ts`，`jq` 已自 `fileReaderRule` 移出）。
+（本次新增 `commands/jq.ts`，`jq` 已自 `fileReaderRule` 移出；`rg` 已自 `grepRule.names` 移出、
+成為 `grep.ts` 內獨立的 `rgRule`）。
 
-**解析器歸屬與豁免資格是兩件事**：走 `CommandSpec` 的是 `grep`/`egrep`/`fgrep`/`rg`、`head`、`wc`、
+**解析器歸屬與豁免資格是兩件事**：走 `CommandSpec` 的只有 `grep`/`egrep`/`fgrep`、`head`、`wc`、
 `tail`；`gh`、`jq`、`sed` 各有自己的**單一 memoized 掃描**（同樣保證 evaluate 與述詞讀同一份結果）；
-`curl` 沿用既有解析。豁免資格則由 `cwdIndependent` 宣告，兩者不重疊：`rg` 走 `CommandSpec` 但不豁免，
-`curl` 不走 `CommandSpec` 但會豁免。
+`curl` 與 `rg` 沿用既有 legacy 解析。豁免資格則由 `cwdIndependent` 宣告，兩者不重疊：
+`curl` 不走 `CommandSpec` 但會豁免，`rg` 既不走 `CommandSpec` 也不豁免（恆為遞迴）。
 ```
 
 - [ ] **Step 5: Add the `word.ts` note**
