@@ -789,12 +789,35 @@ Deno.test("a missing required value is reported, not silently accepted", () => {
   assertEquals(parseArgv(ctxOf("demo", "demo -w"), DEMO).unknownFlag, "-w");
 });
 
-Deno.test("seenFlags records names and values from the same parse", () => {
+Deno.test("seenFlags records every occurrence, in order", () => {
   const r = parseArgv(ctxOf("demo", "demo -b -w 80 --color=auto"), DEMO);
-  assertEquals(r.seenFlags.get("-b"), null);
-  assertEquals(r.seenFlags.get("-w"), "80");
-  assertEquals(r.seenFlags.get("--color"), "auto");
+  assertEquals(r.seenFlags.get("-b"), [null]);
+  assertEquals(r.seenFlags.get("-w"), ["80"]);
+  assertEquals(r.seenFlags.get("--color"), ["auto"]);
   assertEquals(r.seenFlags.has("--width"), false);
+  // 重複出現時全部保留，順序即命令列順序
+  const rep2 = parseArgv(ctxOf("demo", "demo -w 1 -w 2"), DEMO);
+  assertEquals(rep2.seenFlags.get("-w"), ["1", "2"]);
+});
+
+Deno.test("an unknown cluster letter does not hide the rest of the cluster", () => {
+  const SPEC: CommandSpec = {
+    flags: [{ name: "-r", value: "none" }],
+    positionals: "paths",
+  };
+  const r = parseArgv(ctxOf("demo", "demo -Tr x"), SPEC);
+  assertEquals(r.unknownFlag, "-T");       // 仍回報未知旗標
+  assertEquals(r.seenFlags.has("-r"), true); // 但 -r 仍被記下，遞迴偵測不會漏
+});
+
+Deno.test("the LAST occurrence wins where the command says so", () => {
+  const SPEC: CommandSpec = {
+    flags: [{ name: "-d", value: "required" }],
+    positionals: "paths",
+    recursive: (_n, seen) => (seen.get("-d") ?? []).at(-1) === "recurse",
+  };
+  assertEquals(parseArgv(ctxOf("demo", "demo -d skip -d recurse x"), SPEC).isRecursive, true);
+  assertEquals(parseArgv(ctxOf("demo", "demo -d recurse -d skip x"), SPEC).isRecursive, false);
 });
 
 Deno.test("positionals can be derived from seenFlags in the same parse", () => {
@@ -822,11 +845,14 @@ Deno.test("recursive is derived from seenFlags, including value-bearing forms", 
     flags: [{ name: "-d", value: "required" }, { name: "--directories", value: "required" }],
     positionals: "paths",
     recursive: (_n, seen) =>
-      seen.get("-d") === "recurse" || seen.get("--directories") === "recurse",
+      (seen.get("-d") ?? []).at(-1) === "recurse" ||
+      (seen.get("--directories") ?? []).at(-1) === "recurse",
   };
   assertEquals(parseArgv(ctxOf("demo", "demo -d recurse"), SPEC).isRecursive, true);
   assertEquals(parseArgv(ctxOf("demo", "demo --directories=recurse"), SPEC).isRecursive, true);
   assertEquals(parseArgv(ctxOf("demo", "demo -d skip"), SPEC).isRecursive, false);
+  // 重複出現：以最後一次為準
+  assertEquals(parseArgv(ctxOf("demo", "demo -d skip -d recurse"), SPEC).isRecursive, true);
 });
 
 Deno.test("parseArgv memoizes per RuleContext so both consumers share one result", () => {
@@ -872,6 +898,13 @@ export interface FlagSpec {
  */
 export type PositionalKind = "paths" | "pattern-then-paths";
 
+/**
+ * 旗標名 → 其**所有**出現的值（無值旗標記 null）。
+ * 保留全部出現而非只留第一個，因為部分指令以**最後一次**為準
+ * （`grep -d skip -d recurse` 實際生效的是 recurse）。
+ */
+export type SeenFlags = Map<string, (string | null)[]>;
+
 export interface CommandSpec {
   flags: FlagSpec[];
   /**
@@ -879,7 +912,7 @@ export interface CommandSpec {
    * （grep：給了 -e / -f 時第一個位置參數從 PATTERN 變回 FILE）。
    * 傳入的 seenFlags 來自同一次解析，故不會與旗標分類漂移。
    */
-  positionals: PositionalKind | ((seenFlags: Map<string, string | null>) => PositionalKind);
+  positionals: PositionalKind | ((seenFlags: SeenFlags) => PositionalKind);
   /**
    * 是否支援 legacy 數字短旗標（head -100 / tail -200）。
    * 僅在明確開啟時接受，且**整個 token** 必須是 `-` 加數字；`-100x` 視為未知旗標。
@@ -890,7 +923,7 @@ export interface CommandSpec {
    * 傳入同一次解析的 seenFlags，故 `--directories=recurse`、`-d recurse` 等
    * 「靠旗標值才成立」的遞迴形式也能正確判定。
    */
-  recursive?: (name: string, seenFlags: Map<string, string | null>) => boolean;
+  recursive?: (name: string, seenFlags: SeenFlags) => boolean;
 }
 
 export interface ArgvParse {
@@ -906,8 +939,8 @@ export interface ArgvParse {
   dynamic: boolean;
   /** 此次呼叫是否遞迴遍歷（由 spec 的 recursive 依「已解析的旗標與值」判定）。 */
   isRecursive: boolean;
-  /** 已解析到的旗標：name → 值（無值旗標為 null）。供規則做語義判斷。 */
-  seenFlags: Map<string, string | null>;
+  /** 已解析到的旗標：name → 其所有出現的值（無值旗標為 null）。供規則做語義判斷。 */
+  seenFlags: SeenFlags;
 }
 
 /**
@@ -929,10 +962,16 @@ function doParse(ctx: RuleContext, spec: CommandSpec): ArgvParse {
   const argv = ctx.argv;
   const positional: Word[] = [];
   const pathValues: string[] = [];
-  /** 已解析到的旗標；同一旗標重複出現時保留**第一次**的值。 */
-  const seenFlags = new Map<string, string | null>();
+  /**
+   * 已解析到的旗標 → 其**所有**出現的值（無值旗標記一個 null）。
+   * 必須保留全部而非只留第一個：`grep -d skip -d recurse` 中生效的是**後者**，
+   * 只留第一個會漏判遞迴、進而錯誤豁免。
+   */
+  const seenFlags = new Map<string, (string | null)[]>();
   const see = (name: string, value: string | null) => {
-    if (!seenFlags.has(name)) seenFlags.set(name, value);
+    const arr = seenFlags.get(name);
+    if (arr) arr.push(value);
+    else seenFlags.set(name, [value]);
   };
   let unknownFlag: string | null = null;
   let dynamic = false;
@@ -977,7 +1016,14 @@ function doParse(ctx: RuleContext, spec: CommandSpec): ArgvParse {
     for (let k = 1; k < t.length; k++) {
       const short = `-${t[k]}`;
       const f = find(short);
-      if (!f) { unknownFlag ??= short; ate = true; break; }
+      if (!f) {
+        unknownFlag ??= short;
+        // 未知字母不中止遞迴偵測：把群集剩餘的每個字母都記進 seenFlags，
+        // 否則 `grep -Tr x /`（-T 未列入）會漏掉 -r，使既有的硬 deny 降級成 ask。
+        for (let m = k; m < t.length; m++) see(`-${t[m]}`, null);
+        ate = true;
+        break;
+      }
       if (f.value === "none") {
         // `-b=1` 這種形式不合法，保守視為未知
         if (t[k + 1] === "=") { unknownFlag ??= short; ate = true; break; }
@@ -1112,6 +1158,14 @@ Deno.test("value-bearing recursive forms are detected", () => {
   // --directories=recurse / -d recurse 讓 grep 在無操作元時搜尋 cwd
   assertEquals(grepRule.evaluate(ctxOf("grep", "grep --directories=recurse x /")).kind, "deny");
   assertEquals(grepRule.evaluate(ctxOf("grep", "grep -d recurse x ~")).kind, "deny");
+  // 重複出現以最後一次為準
+  assertEquals(grepRule.evaluate(ctxOf("grep", "grep -d skip -d recurse x /")).kind, "deny");
+  assertEquals(grepRule.evaluate(ctxOf("grep", "grep -d recurse -d skip x /")).kind, "ask");
+});
+
+Deno.test("an unknown cluster letter does not lose a recursion flag", () => {
+  // -T 未列入旗標表，但 -r 仍須被偵測到，否則既有硬 deny 會降級成 ask
+  assertEquals(grepRule.evaluate(ctxOf("grep", "grep -Tr x /")).kind, "deny");
 });
 
 Deno.test("the pattern flag is detected from the same parse, not a separate scan", () => {
@@ -1209,7 +1263,7 @@ Both the recursion decision and the pattern-position decision are derived from t
 
 ```ts
 import type { CommandRule } from "../types.ts";
-import type { CommandSpec, FlagSpec } from "../command_spec.ts";
+import type { CommandSpec, FlagSpec, SeenFlags } from "../command_spec.ts";
 import { flagGatedReader } from "../factory.ts";
 
 /**
@@ -1243,7 +1297,7 @@ const flags: FlagSpec[] = [
 ];
 
 /** 由 -e / --regexp / -f / --file 是否出現決定第一個位置參數是 PATTERN 還是 FILE。 */
-function positionalsFor(seen: Map<string, string | null>): "paths" | "pattern-then-paths" {
+function positionalsFor(seen: SeenFlags): "paths" | "pattern-then-paths" {
   const byFlag = seen.has("-e") || seen.has("--regexp") ||
     seen.has("-f") || seen.has("--file");
   return byFlag ? "paths" : "pattern-then-paths";
@@ -1257,12 +1311,14 @@ function positionalsFor(seen: Map<string, string | null>): "paths" | "pattern-th
  *  - `rg` 恆為遞迴。
  * 無操作元時 grep 在遞迴模式下會搜尋 cwd，故此判定同時用於危險根 deny 與 cwd 豁免排除。
  */
-function recursiveFor(name: string, seen: Map<string, string | null>): boolean {
+function recursiveFor(name: string, seen: SeenFlags): boolean {
   if (name === "rg") return true;
   for (const f of ["-r", "-R", "--recursive", "--dereference-recursive"]) {
     if (seen.has(f)) return true;
   }
-  return seen.get("-d") === "recurse" || seen.get("--directories") === "recurse";
+  // -d / --directories 以**最後一次**出現為準（`grep -d skip -d recurse` 會遞迴）
+  return (seen.get("-d") ?? []).at(-1) === "recurse" ||
+    (seen.get("--directories") ?? []).at(-1) === "recurse";
 }
 
 const SPEC: CommandSpec = {
@@ -1412,6 +1468,15 @@ Deno.test("-- terminates option parsing", () => {
   assertEquals(v("jq -- . ../outside.json"), "ask");
 });
 
+Deno.test("a filter that loads modules reads files relative to cwd", () => {
+  // 實測：jq -n 'include "secret" {search:"."}; s' 會讀出 ./secret.jq 的內容
+  assertEquals(v(`jq -n 'include "m" {search:"."}; s'`), "ask");
+  assertEquals(v(`jq -n 'import "m" as $x {search:"."}; $x::s'`), "ask");
+  assertEquals(jqRule.cwdIndependent!(ctxOf(`jq -n 'include "m" {search:"."}; s'`)), false);
+  // 一般 filter 不受影響
+  assertEquals(v("jq -r '.name'"), "allow");
+});
+
 Deno.test("jq cwdIndependent requires zero inputs and no path flag", () => {
   assertEquals(jqRule.cwdIndependent!(ctxOf("jq -r '.name'")), true);
   assertEquals(jqRule.cwdIndependent!(ctxOf("jq -r '.name' a.json")), false);
@@ -1461,6 +1526,8 @@ const TWO_SECOND_PATH = new Set(["--slurpfile", "--rawfile"]);
 interface JqScan {
   /** 需做範圍檢查的路徑：program 檔（-f 時的第一個位置參數）＋ 輸入檔。 */
   paths: Word[];
+  /** filter 字串（未由 -f 提供時）；無法靜態取得或由 -f 提供時為 null。 */
+  filter: string | null;
   /** 吃路徑值的旗標帶的值（字串）。 */
   pathValues: string[];
   /** 是否用過任何吃路徑的旗標，或 -f（program 檔本身就是路徑）。 */
@@ -1579,6 +1646,9 @@ function doScan(ctx: RuleContext): JqScan {
   //
   // 關鍵：program 檔的判定**不受 argsMode 影響**。`jq --args -f prog.jq` 中 --args 先出現，
   // 但 jq 仍把第一個位置參數當 program 檔讀取，故它必須無條件納入路徑檢查。
+  // filter 僅在「未給 -f」時才是第一個位置參數的內容
+  const filter = !fromFile && positional.length > 0 ? staticValue(positional[0]) : null;
+
   const paths: Word[] = [];
   if (fromFile) {
     if (positional.length > 0) { paths.push(positional[0]); pathFlagUsed = true; }
@@ -1590,7 +1660,18 @@ function doScan(ctx: RuleContext): JqScan {
   const inputEnd = argsModeFrom >= 0 ? Math.max(argsModeFrom, inputStart) : positional.length;
   for (let k = inputStart; k < inputEnd; k++) paths.push(positional[k]);
 
-  return { paths, pathValues, pathFlagUsed, unknownFlag, dynamic };
+  return { paths, filter, pathValues, pathFlagUsed, unknownFlag, dynamic };
+}
+
+/**
+ * filter 是否含會讀檔的模組構造。
+ * `include "m" {search:"."};` 與 `import "m" as $x {search:"."};` 會以 cwd（或 search
+ * 指定的目錄）為基準載入 `m.jq` —— 實測 `jq -n 'include "secret" {search:"."}; s'`
+ * 確實讀到並輸出了 ./secret.jq 的內容。本工具無法靜態確認其目標落在專案內，故一律 ask。
+ * 採保守詞法比對，寧可誤 ask。
+ */
+function filterReadsModules(filter: string): boolean {
+  return /(include|import)/.test(filter);
 }
 
 export const jqRule: CommandRule = {
@@ -1599,6 +1680,9 @@ export const jqRule: CommandRule = {
     const r = scan(ctx);
     if (r.dynamic) return ask("jq：含動態 token，無法靜態判定");
     if (r.unknownFlag !== null) return ask(`jq：未列入安全集合的旗標 ${r.unknownFlag}`);
+    if (r.filter !== null && filterReadsModules(r.filter)) {
+      return ask("jq：filter 含 include / import，會以 cwd 為基準載入 .jq 模組檔");
+    }
     for (const v of r.pathValues) {
       if (ctx.resolvePathValue(v) !== "in-project") {
         return ask(`jq：旗標的路徑值超出專案範圍或無法解析（${v}）`);
@@ -1611,22 +1695,28 @@ export const jqRule: CommandRule = {
     }
     return allow();
   },
-  /** filter 不是路徑；無任何路徑（含 program 檔）且未用到吃路徑的旗標時與 cwd 無關。 */
+  /**
+   * filter 不是路徑；無任何路徑（含 program 檔）、未用到吃路徑的旗標、
+   * 且 filter 不含會讀檔的 include / import 時，與 cwd 無關。
+   */
   cwdIndependent(ctx: RuleContext): boolean {
     const r = scan(ctx);
-    return !r.dynamic && r.unknownFlag === null && r.paths.length === 0 && !r.pathFlagUsed;
+    if (r.dynamic || r.unknownFlag !== null) return false;
+    if (r.filter !== null && filterReadsModules(r.filter)) return false;
+    return r.paths.length === 0 && !r.pathFlagUsed;
   },
 };
 ```
 
 - [ ] **Step 4: Remove `jq` from `fileReaderRule` and register the new rule**
 
-Both edits land in this task's single commit, so `jq` is never without a rule.
+Both edits land in this task's single commit, so `jq` is never without a rule. The earlier task
+that touched `fileReaderRule` deliberately left `"jq"` in place for exactly this reason.
 
 In `src/rules/commands/coreutils.ts`:
 
 ```ts
-// before（Task 5 保留 "jq"，此處才移除）
+// before
   names: [
     "cat", "head", "wc", "ls", "stat", "cut", "tr", "column",
     "cmp", "comm", "md5sum", "sha256sum", "hexdump", "jq", "nl", "fold",

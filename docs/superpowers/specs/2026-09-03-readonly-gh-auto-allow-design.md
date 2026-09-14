@@ -138,8 +138,14 @@ rules/commands/jq.ts   <- *3 新檔：filter 不做路徑檢查
 - 吃兩個值：`--arg name value`、`--argjson name value`（皆非路徑）；
   `--slurpfile name file`、`--rawfile name file`（**第二個值是路徑**）。
 - `--` 終止選項解析。
-- jq 的 filter 語言**沒有**寫檔或執行外部程式的構造（無 `system()`、無輸出重導向），故
-  **不需要**像 `sed` / `awk` 那樣掃描程式碼找副作用。
+- **`-f` / `--from-file` 是布林旗標**（`jq --help` 的分類易誤導，已實測確認）：它不吃檔名，
+  而是把**第一個位置參數**的語義從 filter 改成 **program 檔路徑**，且與旗標位置無關
+  （`jq prog.jq -f data.json` 一樣生效）。`-L` 則吃值且接受黏寫（`-Lmods`）。
+- jq 的 filter 語言沒有**寫檔**或執行外部程式的構造（無 `system()`、無輸出重導向），
+  但**可以讀檔**：`include "m" {search:"."}` / `import "m" as $x {search:"."}` 會從
+  cwd（或 `search` 指定的目錄）載入 `m.jq`。實測
+  `jq -n 'include "secret" {search:"."}; s'` 確實讀到並輸出了 `./secret.jq` 的內容。
+  **因此 filter 必須掃描**：出現 `include` / `import` 關鍵字即 ask（見 §4.1.3）。
 
 #### 4.1.2 `grep` 改動
 
@@ -176,10 +182,16 @@ nonPathLeadingPositional?: (argv: Word[]) => boolean;
 6. `--args` / `--jsonargs` → 記錄旗標；其後的位置參數視為字串，**不做路徑檢查**。
 7. 未列入 allowlist 的旗標 → `ask`。
 8. 位置參數處理：
-   - 若 filter 未由 `-f` 提供 → 第一個位置參數是 filter，**不做路徑檢查**。
-   - 其餘位置參數：若出現過 `--args`/`--jsonargs` → 視為字串、不檢查；否則視為輸入檔 →
+   - 未給 `-f` → 第一個位置參數是 filter，**不做路徑檢查**（但須掃描，見 10）；
+   - 給了 `-f` → 第一個位置參數是 **program 檔路徑**，做 `resolvePath`，且**不受
+     `--args` 影響**（jq 仍會讀它）。
+   - 其餘位置參數：`--args`/`--jsonargs` **之後**者視為字串、不檢查；否則視為輸入檔 →
      `resolvePath`，非 `in-project` → ask。
 9. 任一 token 動態 → ask。
+10. **filter 內容掃描**：filter 字串（或 `-f` 載入的 program，其內容本工具讀不到）含
+    `include` / `import` 關鍵字 → ask。這兩個構造會以 cwd（或 `search` 指定目錄）為基準
+    載入 `.jq` 模組檔，屬對 cwd 的檔案讀取，本工具無法靜態確認其目標落在專案內。
+    偵測採保守詞法比對（`include` / `import`），寧可誤 ask。
 
 長短旗標皆需支援 `--opt=value` 與 `--opt value` 兩種寫法。
 
@@ -532,7 +544,8 @@ function classifyArgv(ctx: RuleContext, opts: FlagGatedReaderOptions): ArgvClass
 | `fileReaderRule` 的 `head` / `wc` | 是 | 僅這兩個成員；同規則其餘指令一律不宣告 |
 | `grepRule` 的 `grep` / `egrep` / `fgrep` | 是 | `rg` 恆為遞迴，計算式自然排除 |
 | `tailRule` | 是 | 無操作元時讀 stdin |
-| `sedRule` / `jqRule` | 是（手寫述詞） | 程式碼已與輸入路徑分離；條件為輸入路徑數為 0 |
+| `sedRule` | 是（手寫述詞） | 程式碼已與輸入路徑分離；條件為輸入路徑數為 0 |
+| `jqRule` | 是（手寫述詞） | 同上，**且 filter 不含 `include` / `import`**（兩者會以 cwd 為基準載入 `.jq` 模組） |
 
 **宣告範圍刻意壓到最小**：上表就是基準集 67 條實際用到的全部過濾器
 （`head` 31 次、`jq` 25 次、`grep` 22 次、`wc` 2 次、`tail` 1 次、`sed` 1 次，加上 `gh` 66 次）。
