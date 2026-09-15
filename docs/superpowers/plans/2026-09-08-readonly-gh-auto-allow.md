@@ -528,7 +528,7 @@ git commit -m "refactor(engine): extract buildScopeConfig shared by evaluate and
 ### Task 5: close the existing unchecked path-value gaps
 
 **Files:**
-- Modify: `src/rules/commands/coreutils.ts` (`fileReaderRule`, `diffRule`), `src/rules/commands/simple-flag.ts` (`sortRule`)
+- Modify: `src/rules/factory.ts`（遞迴根 deny 提前）、`src/rules/commands/coreutils.ts`（`fileReaderRule`、`diffRule`）、`src/rules/commands/simple-flag.ts`（`sortRule`）
 - Test: `src/rules/commands/coreutils_test.ts`, `src/rules/commands/simple-flag_test.ts`
 
 These flags read a file but their values were never scope-checked. This is a standalone security
@@ -596,7 +596,48 @@ Deno.test("sort's program / random-source flags ask in both forms", () => {
 Run: `deno test --allow-env src/rules/commands/coreutils_test.ts src/rules/commands/simple-flag_test.ts`
 Expected: FAIL — the out-of-project variants currently allow, because the values are skipped.
 
-- [ ] **Step 3: Add the flags to `fileReaderRule` in `src/rules/commands/coreutils.ts`**
+- [ ] **Step 3: Move the recursive-root deny ahead of the path-value check in `src/rules/factory.ts`**
+
+`flagGatedReader`'s legacy path currently runs `checkPathValueFlags` **before** the dangerous-root
+scan. Adding path-valued flags to `fileReaderRule` therefore downgrades an existing hard deny:
+`ls -R -I --relative-to=../out /` would return `ask` (the out-of-scope `--relative-to` value) instead
+of `deny` (recursing from the filesystem root). Reorder so the deny always wins:
+
+```ts
+    evaluate(ctx: RuleContext): RuleVerdict {
+      if (askFlags.length && hasAnyFlag(ctx.argv, askFlags)) {
+        return ask(opts.askReason?.(ctx.name) ?? `${ctx.name}：偵測到寫入 / 副作用參數`);
+      }
+      // 遞迴根 deny 必須先於任何路徑 ask，否則新增路徑值檢查會把既有硬 deny 降級成 ask。
+      // 危險根可能藏在被 value-flag 吃掉的 token 位置，故掃描全部 argv。
+      if (opts.recursive?.(ctx.name, ctx.argv) ?? false) {
+        for (const w of ctx.argv) {
+          if (ctx.isDangerousRoot(w)) {
+            return deny(recursiveRootDenyReason(ctx.name, w.value));
+          }
+        }
+      }
+      const pathFlagVerdict = checkPathValueFlags(ctx, opts.pathValueFlags ?? []);
+      if (pathFlagVerdict) return pathFlagVerdict;
+      // …其餘既有邏輯不變（位置參數的 resolvePath 等）；原本在此處的遞迴 deny 區塊刪除…
+    },
+```
+
+Task 7 keeps this ordering when it adds the spec-backed branch — `evaluateWithSpec` already runs
+the deny scan first.
+
+Add this regression test to `src/rules/commands/coreutils_test.ts`:
+
+```ts
+Deno.test("a recursive root deny outranks a path-value ask", () => {
+  assertEquals(
+    fileReaderRule.evaluate(ctxOf("ls -R -I x --relative-to=../out /")).kind,
+    "deny",
+  );
+});
+```
+
+- [ ] **Step 4: Add the flags to `fileReaderRule` in `src/rules/commands/coreutils.ts`**
 
 ```ts
 export const fileReaderRule: CommandRule = flagGatedReader({
@@ -618,7 +659,7 @@ export const fileReaderRule: CommandRule = flagGatedReader({
 > **`jq` stays in this `names` list.** Task 8 removes it in the same commit that registers
 > `jqRule`, so `jq` is never left without a rule.
 
-- [ ] **Step 4: Add the flags to `diffRule`**
+- [ ] **Step 5: Add the flags to `diffRule`**
 
 ```ts
 /**
@@ -641,7 +682,7 @@ export const diffRule: CommandRule = flagGatedReader({
 
 Add `FlagMatcher` to `coreutils.ts`'s `../flags.ts` import.
 
-- [ ] **Step 5: Add the flag to `sortRule` in `src/rules/commands/simple-flag.ts`**
+- [ ] **Step 6: Add the flag to `sortRule` in `src/rules/commands/simple-flag.ts`**
 
 ```ts
 export const sortRule: CommandRule = flagGatedReader({
@@ -663,15 +704,15 @@ export const sortRule: CommandRule = flagGatedReader({
 > `--compress-program` executes an external program and `--random-source` reads a file, so both
 > join `askFlags` rather than being modelled as safe value flags.
 
-- [ ] **Step 6: Run the tests, full suite, type check and lint**
+- [ ] **Step 7: Run the tests, full suite, type check and lint**
 
 Run: `deno task check && deno task lint && deno task test`
 Expected: all green.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
-git add src/rules/commands/coreutils.ts src/rules/commands/simple-flag.ts src/rules/commands/coreutils_test.ts src/rules/commands/simple-flag_test.ts
+git add src/rules/factory.ts src/rules/commands/coreutils.ts src/rules/commands/simple-flag.ts src/rules/commands/coreutils_test.ts src/rules/commands/simple-flag_test.ts
 git commit -m "fix(rules): scope-check --files0-from, --relative-to/-base, diff -X/-S; ask on sort's program/random-source flags"
 ```
 
@@ -1126,7 +1167,12 @@ assertEquals(rgRule.evaluate(ctxOf("rg", "rg foo ./src")).kind, "allow");
 
 // 既有遞迴 deny 測試中的 rg 斷言
 assertEquals(rgRule.evaluate(ctxOf("rg", "rg x ~")).kind, "deny");
+
+// grep_test.ts:34 的 "rg -A value skipped, in-project allows" 斷言
+assertEquals(rgRule.evaluate(ctxOf("rg", "rg -A 3 pattern src")).kind, "allow");
 ```
+
+If the exact command at line 34 differs, keep it verbatim and only swap `grepRule` for `rgRule`.
 
 `grep_test.ts:39` asserts `grepRule.names.includes("rg") === true`. Replace that line:
 
@@ -1414,12 +1460,10 @@ export const grepRule: CommandRule = flagGatedReader({
 > (always recursive), and this keeps the change from touching ripgrep's flag grammar at all —
 > modelling it was never required, since it is not one of the declaring commands.
 
-- [ ] **Step 5: Run the tests, full suite, type check and lint**
+- [ ] **Step 5: Register `rgRule` in `src/rules/allowlist.ts`**
 
-Run: `deno task check && deno task lint && deno task test`
-Expected: all green.
-
-- [ ] **Step 6: Register `rgRule` in `src/rules/allowlist.ts`**
+This must happen **before** the full-suite run: Step 4 removed `"rg"` from `grepRule.names`, and
+`allowlist_test.ts` requires `lookupRule("rg")` to resolve.
 
 ```ts
 import { grepRule, rgRule } from "./commands/grep.ts";
@@ -1433,6 +1477,11 @@ const RULES: CommandRule[] = [
 ```
 
 `allowlist.ts` throws on duplicate names, so a clean load proves `rg` left `grepRule.names`.
+
+- [ ] **Step 6: Run the tests, full suite, type check and lint**
+
+Run: `deno task check && deno task lint && deno task test`
+Expected: all green.
 
 - [ ] **Step 7: Commit**
 
@@ -1833,10 +1882,11 @@ In `src/rules/allowlist.ts`:
 // add next to the other command imports
 import { jqRule } from "./commands/jq.ts";
 
-// add to the RULES array, after grepRule
+// add to the RULES array, after grepRule / rgRule —— 不可刪掉前一個 task 才加的 rgRule
 const RULES: CommandRule[] = [
   // …
   grepRule,
+  rgRule,
   jqRule,
   gitRule,
   // …
@@ -2162,7 +2212,8 @@ Deno.test("a substitution cannot smuggle a second command past the allowlist", (
   assertEquals(sedRule.cwdIndependent!(ctxOf("sed 's/a/b/;s/c/d/'")), false); // 兩條替換也不在白名單
   // 合法的單一替換仍豁免，含非 `/` 分隔符與跳脫的分隔符
   assertEquals(sedRule.cwdIndependent!(ctxOf("sed 's|a|b|g'")), true);
-  assertEquals(sedRule.cwdIndependent!(ctxOf(`sed 's/a\/b/c/'`)), true);
+  // String.raw 才能讓反斜線原樣送進 shell 字串；模板字面值的 `\/` 會退化成 `/`
+  assertEquals(sedRule.cwdIndependent!(ctxOf(String.raw`sed 's/a\/b/c/'`)), true);
 });
 
 Deno.test("addressed read / write commands never get the exemption", () => {
