@@ -1532,6 +1532,11 @@ export function ctxOf(src: string): RuleContext {
 }
 
 const v = (src: string) => jqRule.evaluate(ctxOf(src)).kind;
+/** 取 ask 的理由字串，用來驗證「哪個 token 被當成什麼」。 */
+const why = (src: string) => {
+  const r = jqRule.evaluate(ctxOf(src));
+  return r.kind === "ask" ? r.reason : "";
+};
 
 Deno.test("jq filter is not treated as a path", () => {
   assertEquals(v("jq -r '.[] | select(.type==\"file\") | .name'"), "allow");
@@ -1545,16 +1550,26 @@ Deno.test("jq input files are scope-checked", () => {
 });
 
 Deno.test("-f makes the FIRST POSITIONAL the program file, wherever -f appears", () => {
-  // -f 一律 ask（實作在路徑檢查之前就因「內容不可檢查」返回），故這些案例只斷言 verdict。
-  // 「哪個 token 被當成 program 檔」改由下方的 cwdIndependent 與 scan 層級測試涵蓋。
-  assertEquals(v("jq -f ../outside.jq data.json"), "ask"); // 路徑超範圍
-  assertEquals(v("jq ../outside.jq -f data.json"), "ask"); // 第一個位置參數才是 program 檔
-  assertEquals(v("jq -fn ../outside.jq"), "ask"); // -fn 是 -f -n
-  // 路徑落在專案內，但內容不可檢查 → 仍 ask（fail-closed）
+  // 路徑檢查先行，故理由字串能證明「哪個 token 被當成 program 檔」。
+  // 專案外的 program 檔 → 理由是路徑超範圍，且必須指名該 token
+  assertEquals(v("jq -f ../outside.jq data.json"), "ask");
+  assertEquals(why("jq -f ../outside.jq data.json").includes("../outside.jq"), true);
+  // 旗標寫在位置參數之後也一樣：第一個位置參數才是 program 檔
+  assertEquals(why("jq ../outside.jq -f data.json").includes("../outside.jq"), true);
+  // -fn 是 -f -n：program 檔仍是第一個位置參數
+  assertEquals(why("jq -fn ../outside.jq").includes("../outside.jq"), true);
+
+  // 路徑落在專案內 → 通過路徑檢查，改因「內容不可檢查」而 ask（fail-closed）
   assertEquals(v("jq -f prog.jq data.json"), "ask");
+  assertEquals(why("jq -f prog.jq data.json").includes("內容無法檢查"), true);
   assertEquals(v("jq prog.jq --from-file data.json"), "ask");
   assertEquals(v("jq -fn prog.jq"), "ask");
   assertEquals(jqRule.cwdIndependent!(ctxOf("jq -f prog.jq")), false);
+});
+
+Deno.test("with -f, the remaining positionals are still checked as input files", () => {
+  // data.json 之後的 ../outside.json 是輸入檔，其路徑必須先於 -f 的 fail-closed ask 被回報
+  assertEquals(why("jq -f prog.jq ../outside.json").includes("../outside.json"), true);
 });
 
 Deno.test("-L accepts an attached value", () => {
@@ -1591,8 +1606,8 @@ Deno.test("--args affects only subsequent positionals", () => {
 
 Deno.test("--args cannot hide the -f program file", () => {
   // jq 仍把第一個位置參數當 program 檔讀取，即使 --args 先出現。
-  // 兩者都 ask：路徑超範圍者因範圍檢查、路徑合法者因 program 內容不可檢查。
-  assertEquals(v("jq --args -f ../outside.jq"), "ask");
+  // 理由字串證明它確實被當成路徑檢查，而不是被當成資料字串跳過。
+  assertEquals(why("jq --args -f ../outside.jq").includes("../outside.jq"), true);
   assertEquals(v("jq --args -f prog.jq"), "ask");
   assertEquals(jqRule.cwdIndependent!(ctxOf("jq --args -f prog.jq")), false);
 });
@@ -1824,11 +1839,8 @@ export const jqRule: CommandRule = {
     if (r.filter !== null && filterReadsModules(r.filter)) {
       return ask("jq：filter 含 include / import，會以 cwd 為基準載入 .jq 模組檔");
     }
-    // -f 由檔案載入 program，本工具讀不到其內容，無法確認它不含 include / import。
-    // 該檔案本身已做範圍檢查，但它 include 進來的模組可能落在專案外 → fail-closed。
-    if (r.programFromFile) {
-      return ask("jq：-f 的 program 檔內容無法檢查是否含 include / import");
-    }
+    // 路徑檢查先行，使理由字串能區分「路徑超範圍」與「路徑合法但內容不可檢查」，
+    // 也讓「哪個位置參數被當成 program 檔」可由理由驗證。
     for (const v of r.pathValues) {
       if (ctx.resolvePathValue(v) !== "in-project") {
         return ask(`jq：旗標的路徑值超出專案範圍或無法解析（${v}）`);
@@ -1838,6 +1850,11 @@ export const jqRule: CommandRule = {
       if (ctx.resolvePath(p) !== "in-project") {
         return ask(`jq：路徑超出專案範圍或無法解析（${p.value}）`);
       }
+    }
+    // -f 由檔案載入 program，本工具讀不到其內容，無法執行上面的 include / import 掃描。
+    // 落在專案內的 prog.jq 仍可 include 專案外的模組 → fail-closed。
+    if (r.programFromFile) {
+      return ask("jq：-f 的 program 檔內容無法檢查是否含 include / import");
     }
     return allow();
   },

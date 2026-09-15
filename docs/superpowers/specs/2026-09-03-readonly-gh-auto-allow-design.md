@@ -198,10 +198,20 @@ nonPathLeadingPositional?: (argv: Word[]) => boolean;
    - 其餘位置參數：`--args`/`--jsonargs` **之後**者視為字串、不檢查；否則視為輸入檔 →
      `resolvePath`，非 `in-project` → ask。
 9. 任一 token 動態 → ask。
-10. **filter 內容掃描**：filter 字串（或 `-f` 載入的 program，其內容本工具讀不到）含
-    `include` / `import` 關鍵字 → ask。這兩個構造會以 cwd（或 `search` 指定目錄）為基準
-    載入 `.jq` 模組檔，屬對 cwd 的檔案讀取，本工具無法靜態確認其目標落在專案內。
-    偵測採保守詞法比對（`\binclude\b` / `\bimport\b`），寧可誤 ask。
+10. **inline filter 內容掃描**：filter 字串含 `include` / `import` 關鍵字 → ask。這兩個構造會以
+    cwd（或 `search` 指定目錄）為基準載入 `.jq` 模組檔，屬對 cwd 的檔案讀取，本工具無法靜態
+    確認其目標落在專案內。偵測採保守詞法比對（`\binclude\b` / `\bimport\b`），寧可誤 ask。
+11. **`-f` / `--from-file` 一律 ask（fail-closed，明確的收緊決策）**：此時 program 來自檔案，
+    其**內容本工具讀不到**，第 10 條的 `include` / `import` 掃描無從執行。若只做路徑檢查就放行，
+    一個落在專案內的 `prog.jq` 仍可 `include` 專案外的模組——正是第 10 條要擋的行為。
+    故 `-f` 出現即 ask。
+
+    **判定順序**：路徑檢查（第 4、5、8 條）**先於**本條執行，理由字串因此能區分「program 檔
+    路徑超出專案範圍」與「路徑合法但內容不可檢查」。這讓「哪個位置參數被當成 program 檔」
+    可由理由字串驗證，而不是被一個籠統的 ask 吞掉。
+
+    本條比「只做路徑檢查」嚴格，屬刻意收緊：`jq -f prog.jq data.json` 即使完全落在專案內
+    也會 ask。代價極小（corpus 中無此用法），換得第 10 條不被繞過。
 
 長短旗標皆需支援 `--opt=value` 與 `--opt value` 兩種寫法。
 
