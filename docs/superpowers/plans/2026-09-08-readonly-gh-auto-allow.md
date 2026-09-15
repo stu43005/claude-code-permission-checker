@@ -3310,6 +3310,7 @@ Deno.test("every single-character expansion of the endpoint yields the same verd
   }
   assertEquals(v(`gh api "repos/o/r/tags'per_page=50"`), base, "single quote");
 });
+```
 
 **This test goes in `src/engine/classify_test.ts`**, not `gh_test.ts` — it needs `evaluate`,
 `ROOT` and `START`, which only that file has:
