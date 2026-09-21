@@ -570,18 +570,21 @@ Deno.test("diff -X / -S are scope-checked in both forms", () => {
   assertEquals(diffRule.evaluate(ctxOf("diff -X ../out.txt a.txt b.txt")).kind, "ask");
   assertEquals(diffRule.evaluate(ctxOf("diff -X../out.txt a.txt b.txt")).kind, "ask");
   assertEquals(diffRule.evaluate(ctxOf("diff --starting-file=../out a.txt b.txt")).kind, "ask");
-  // 群集寫法無法可靠取值 → 保守 ask
+  // 群集寫法無法可靠取值 → 保守 ask（含數字短選項的群集）
   assertEquals(diffRule.evaluate(ctxOf("diff -qX../out.txt a.txt b.txt")).kind, "ask");
   assertEquals(diffRule.evaluate(ctxOf("diff -qS../out a.txt b.txt")).kind, "ask");
+  assertEquals(diffRule.evaluate(ctxOf("diff -u0X../out.txt a.txt b.txt")).kind, "ask");
+  assertEquals(diffRule.evaluate(ctxOf("diff -S ../out a.txt b.txt")).kind, "ask");
 });
 ```
 
 Append to `src/rules/commands/simple-flag_test.ts` — its helper is `v(rule, name, src)`:
 
 ```ts
-Deno.test("sort --files0-from is scope-checked", () => {
+Deno.test("sort --files0-from is scope-checked in both forms", () => {
   assertEquals(v(sortRule, "sort", "sort --files0-from=list.txt"), "allow");
   assertEquals(v(sortRule, "sort", "sort --files0-from=../out/list.txt"), "ask");
+  assertEquals(v(sortRule, "sort", "sort --files0-from ../out/list.txt"), "ask");
 });
 
 Deno.test("sort's program / random-source flags ask in both forms", () => {
@@ -603,14 +606,18 @@ scan. Adding path-valued flags to `fileReaderRule` therefore downgrades an exist
 `ls -R -I --relative-to=../out /` would return `ask` (the out-of-scope `--relative-to` value) instead
 of `deny` (recursing from the filesystem root). Reorder so the deny always wins:
 
+The complete replacement for `flagGatedReader`'s `evaluate` — the only change is that the
+recursive-deny block moved above `checkPathValueFlags`:
+
 ```ts
     evaluate(ctx: RuleContext): RuleVerdict {
       if (askFlags.length && hasAnyFlag(ctx.argv, askFlags)) {
         return ask(opts.askReason?.(ctx.name) ?? `${ctx.name}：偵測到寫入 / 副作用參數`);
       }
       // 遞迴根 deny 必須先於任何路徑 ask，否則新增路徑值檢查會把既有硬 deny 降級成 ask。
-      // 危險根可能藏在被 value-flag 吃掉的 token 位置，故掃描全部 argv。
-      if (opts.recursive?.(ctx.name, ctx.argv) ?? false) {
+      // 危險根可能藏在被 value-flag 吃掉的 token 位置，故掃描全部 argv、不限 positionals。
+      const isRecursive = opts.recursive?.(ctx.name, ctx.argv) ?? false;
+      if (isRecursive) {
         for (const w of ctx.argv) {
           if (ctx.isDangerousRoot(w)) {
             return deny(recursiveRootDenyReason(ctx.name, w.value));
@@ -619,9 +626,18 @@ of `deny` (recursing from the filesystem root). Reorder so the deny always wins:
       }
       const pathFlagVerdict = checkPathValueFlags(ctx, opts.pathValueFlags ?? []);
       if (pathFlagVerdict) return pathFlagVerdict;
-      // …其餘既有邏輯不變（位置參數的 resolvePath 等）；原本在此處的遞迴 deny 區塊刪除…
+      for (const arg of positionals(ctx.argv, opts.valueFlags ?? [])) {
+        const scope = ctx.resolvePath(arg);
+        if (scope !== "in-project") {
+          return ask(`${ctx.name}：路徑超出專案範圍或無法靜態解析（${arg.value}）`);
+        }
+      }
+      return allow();
     },
 ```
+
+Task 7 later inserts the spec-backed branch between the `askFlags` check and this body; the
+ordering shown here is what it preserves.
 
 Task 7 keeps this ordering when it adds the spec-backed branch — `evaluateWithSpec` already runs
 the deny scan first.
@@ -668,8 +684,10 @@ export const fileReaderRule: CommandRule = flagGatedReader({
  * 群集寫法（`-qX../out.txt`）不在其中，值會被整個跳過而未檢查。
  * 群集形式罕見且難以在此 factory 內正確拆解，故直接列入 askFlags 保守處理。
  */
+// GNU diff 也接受數字短選項（`-u0`、`-U3` 的簡寫形式），故群集字元類必須含數字：
+// `-u0X../out.txt` 若只比對 [A-Za-z]{2,} 會整個漏掉，其 -X 的值便不會被檢查。
 const diffClusterHasPathFlag: FlagMatcher = (t) =>
-  /^-[A-Za-z]{2,}/.test(t) && !t.startsWith("--") && /[XS]/.test(t.slice(1));
+  !t.startsWith("--") && /^-[A-Za-z0-9]{2,}/.test(t) && /[XS]/.test(t.slice(1));
 
 export const diffRule: CommandRule = flagGatedReader({
   names: ["diff"],
