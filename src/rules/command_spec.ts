@@ -159,7 +159,12 @@ function doParse(ctx: RuleContext, spec: CommandSpec): ArgvParse {
         see(short, null);
         continue;
       }
-      if (f.value === "attached-only") { see(short, null); continue; }
+      if (f.value === "attached-only") {
+        // 與長旗標分支同一契約：值只接受黏在 `=` 之後；裸寫不吃值、繼續掃群集。
+        if (t[k + 1] === "=") { see(short, t.slice(k + 2)); ate = true; break; }
+        see(short, null);
+        continue;
+      }
       const rest = t.slice(k + 1);
       let value: string | null = rest;
       if (rest === "") {

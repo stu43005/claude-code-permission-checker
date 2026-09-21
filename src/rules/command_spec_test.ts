@@ -165,3 +165,25 @@ Deno.test("parseArgv memoizes per RuleContext so both consumers share one result
   const ctx = ctxOf("demo", "demo -w 80 a.txt");
   assertEquals(parseArgv(ctx, DEMO) === parseArgv(ctx, DEMO), true);
 });
+
+Deno.test("a short attached-only flag takes its =value and stops the cluster", () => {
+  const SPEC: CommandSpec = {
+    flags: [{ name: "-b", value: "none" }, { name: "-c", value: "attached-only" }],
+    positionals: "paths",
+  };
+  // 黏寫 =value：取值、不再掃描該 token 剩餘字元
+  const glued = parseArgv(ctxOf("demo", "demo -c=auto a.txt"), SPEC);
+  assertEquals(glued.unknownFlag, null);
+  assertEquals(glued.seenFlags.get("-c"), ["auto"]);
+  assertEquals(glued.pathOperands.map((w) => w.value), ["a.txt"]);
+  // 群集中段亦同
+  const cluster = parseArgv(ctxOf("demo", "demo -bc=auto a.txt"), SPEC);
+  assertEquals(cluster.unknownFlag, null);
+  assertEquals(cluster.seenFlags.get("-b"), [null]);
+  assertEquals(cluster.seenFlags.get("-c"), ["auto"]);
+  // 裸寫：不吃下一個 token，行為不變
+  const bare = parseArgv(ctxOf("demo", "demo -c pat a.txt"), SPEC);
+  assertEquals(bare.unknownFlag, null);
+  assertEquals(bare.seenFlags.get("-c"), [null]);
+  assertEquals(bare.pathOperands.map((w) => w.value), ["pat", "a.txt"]);
+});
