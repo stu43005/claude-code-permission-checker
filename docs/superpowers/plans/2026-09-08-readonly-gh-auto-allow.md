@@ -1913,11 +1913,13 @@ In `src/rules/commands/coreutils.ts`:
 
 In `src/rules/allowlist.ts`:
 
+Keep the existing `rgRule` entry — the array below shows it so it is not dropped by accident.
+
 ```ts
 // add next to the other command imports
 import { jqRule } from "./commands/jq.ts";
 
-// add to the RULES array, after grepRule / rgRule —— 不可刪掉前一個 task 才加的 rgRule
+// add to the RULES array, after grepRule / rgRule
 const RULES: CommandRule[] = [
   // …
   grepRule,
