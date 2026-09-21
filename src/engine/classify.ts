@@ -2,7 +2,7 @@ import type { CommandInvocation } from "../types.ts";
 import type { RuleVerdict } from "../rules/types.ts";
 import { allow, ask } from "../rules/types.ts";
 import { lookupRule } from "../rules/allowlist.ts";
-import { dangerousRoot, isReadScoped, normalizeAbsolute, resolvePath, resolvePathValue, type ScopeConfig } from "./scope.ts";
+import { buildScopeConfig, dangerousRoot, isReadScoped, normalizeAbsolute, resolvePath, resolvePathValue, type ScopeConfig } from "./scope.ts";
 import { hasWriteRedirect } from "./redirect.ts";
 import { settingsAllows } from "../permissions/matcher.ts";
 import { EMPTY_RULES, type PermissionRules } from "../permissions/settings.ts";
@@ -59,14 +59,7 @@ export function classify(
   home: string | null = null,
   trustedReadRoots: string[] = [],
 ): RuleVerdict {
-  const scope: ScopeConfig = {
-    root,
-    home,
-    allow: rules.readScope.allow,
-    deny: rules.readScope.deny,
-    ask: rules.readScope.ask,
-    trusted: trustedReadRoots,
-  };
+  const scope: ScopeConfig = buildScopeConfig(root, rules, home, trustedReadRoots);
 
   // 步驟 1：動態指令名
   if (inv.name === null) return ask("動態指令名，無法判定");

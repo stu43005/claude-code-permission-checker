@@ -2,6 +2,7 @@ import type { Word, WordPart } from "../deps.ts";
 import { staticValue } from "./word.ts";
 import type { CwdState } from "../types.ts";
 import type { ReadScope } from "../permissions/path_scope.ts";
+import type { PermissionRules } from "../permissions/settings.ts";
 
 export type PathScope = "in-project" | "out-of-project" | "dynamic";
 
@@ -159,6 +160,27 @@ export interface ScopeConfig {
   ask: ReadScope;
   /** hook 自身推導的「當前 session」可信唯讀目錄根（與使用者規則分離；allow 同級）。 */
   trusted: string[];
+}
+
+/**
+ * 由 root / rules / home / trusted 建構 ScopeConfig。
+ * evaluate（計算 session cwd 是否在範圍內）與 classify（逐葉路徑判定）皆呼叫此函式，
+ * 確保兩處使用完全相同的範圍定義，不會分歧。
+ */
+export function buildScopeConfig(
+  root: string,
+  rules: PermissionRules,
+  home: string | null,
+  trustedReadRoots: string[],
+): ScopeConfig {
+  return {
+    root,
+    home,
+    allow: rules.readScope.allow,
+    deny: rules.readScope.deny,
+    ask: rules.readScope.ask,
+    trusted: trustedReadRoots,
+  };
 }
 
 /** 由裸 root 字串組成「無外部放寬」的 ScopeConfig；供既有測試與不需外部範圍的呼叫端使用（向後相容）。 */

@@ -1,8 +1,10 @@
 import { assertEquals } from "@std/assert";
 import { parse } from "../deps.ts";
 import type { Command } from "../deps.ts";
-import { canonicalizeExecPath, dangerousRoot, isDangerousRootAbs, isReadScoped, isWithin, normalizeAbsolute, resolvePath, rootScope, type PathScope, type ScopeConfig } from "./scope.ts";
+import { buildScopeConfig, canonicalizeExecPath, dangerousRoot, isDangerousRootAbs, isReadScoped, isWithin, normalizeAbsolute, resolvePath, rootScope, type PathScope, type ScopeConfig } from "./scope.ts";
 import type { CwdState } from "../types.ts";
+import type { PermissionRules } from "../permissions/settings.ts";
+import { EMPTY_DOMAIN_SCOPE } from "../permissions/domain_scope.ts";
 
 function firstArg(src: string) {
   return (parse(src).commands[0].command as Command).suffix[0];
@@ -323,4 +325,23 @@ Deno.test("isReadScoped: trusted root grants read; root-first and deny/ask overr
   // ask 覆蓋 trusted
   const asked: ScopeConfig = { ...scope, ask: { roots: [SID], files: [] } };
   assertEquals(isReadScoped(SID + "/x", asked), false);
+});
+
+Deno.test("buildScopeConfig maps allow/deny/ask to distinct fields", () => {
+  const rules: PermissionRules = {
+    bash: { allow: [], deny: [], ask: [] },
+    readScope: {
+      allow: { roots: ["/allowed"], files: [] },
+      deny: { roots: ["/denied"], files: [] },
+      ask: { roots: ["/asked"], files: [] },
+    },
+    webFetch: { allow: EMPTY_DOMAIN_SCOPE, deny: EMPTY_DOMAIN_SCOPE, ask: EMPTY_DOMAIN_SCOPE },
+  };
+  const scope = buildScopeConfig("/proj", rules, "/home/u", ["/trusted"]);
+  assertEquals(scope.root, "/proj");
+  assertEquals(scope.home, "/home/u");
+  assertEquals(scope.trusted, ["/trusted"]);
+  assertEquals(scope.allow.roots, ["/allowed"]);
+  assertEquals(scope.deny.roots, ["/denied"]);
+  assertEquals(scope.ask.roots, ["/asked"]);
 });
