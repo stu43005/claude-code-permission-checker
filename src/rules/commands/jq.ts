@@ -5,7 +5,8 @@ import { staticValue } from "../../engine/word.ts";
 
 /**
  * jq 1.8.1：`jq [options] <jq filter> [file...]`。
- * jq 的 filter 語言沒有寫檔或執行外部程式的構造，故只需正確分辨哪些 token 是路徑。
+ * jq 的 filter 語言沒有寫檔或執行外部程式的構造，但**可以讀檔**（載入 .jq 模組），
+ * 故除了分辨哪些 token 是路徑之外，還須掃描 filter 是否含模組載入構造（見 filterReadsModules）。
  */
 const NO_VALUE_LONG = new Set([
   "--null-input", "--raw-input", "--slurp", "--compact-output", "--raw-output",
@@ -190,7 +191,7 @@ export const jqRule: CommandRule = {
     if (r.dynamic) return ask("jq：含動態 token，無法靜態判定");
     if (r.unknownFlag !== null) return ask(`jq：未列入安全集合的旗標 ${r.unknownFlag}`);
     if (r.filter !== null && filterReadsModules(r.filter)) {
-      return ask("jq：filter 含 include / import，會以 cwd 為基準載入 .jq 模組檔");
+      return ask("jq：filter 含 include / import / modulemeta，會載入 .jq 模組檔（預設搜尋路徑含家目錄）");
     }
     // 路徑檢查先行，使理由字串能區分「路徑超範圍」與「路徑合法但內容不可檢查」，
     // 也讓「哪個位置參數被當成 program 檔」可由理由驗證。
@@ -204,16 +205,16 @@ export const jqRule: CommandRule = {
         return ask(`jq：路徑超出專案範圍或無法解析（${p.value}）`);
       }
     }
-    // -f 由檔案載入 program，本工具讀不到其內容，無法執行上面的 include / import 掃描。
+    // -f 由檔案載入 program，本工具讀不到其內容，無法執行上面的模組構造掃描。
     // 落在專案內的 prog.jq 仍可 include 專案外的模組 → fail-closed。
     if (r.programFromFile) {
-      return ask("jq：-f 的 program 檔內容無法檢查是否含 include / import");
+      return ask("jq：-f 的 program 檔內容無法檢查是否含 include / import / modulemeta");
     }
     return allow();
   },
   /**
    * filter 不是路徑；無任何路徑（含 program 檔）、未用到吃路徑的旗標、
-   * 且 filter 不含會讀檔的 include / import 時，與 cwd 無關。
+   * 且 filter 不含會讀檔的 include / import / modulemeta 時，與 cwd 無關。
    */
   cwdIndependent(ctx: RuleContext): boolean {
     const r = scan(ctx);
