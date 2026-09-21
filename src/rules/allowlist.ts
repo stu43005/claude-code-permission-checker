@@ -6,7 +6,7 @@ import { awkRule } from "./commands/awk.ts";
 import { findRule } from "./commands/find.ts";
 import { dateRule, fileCmdRule, sortRule, treeRule, yqRule } from "./commands/simple-flag.ts";
 import { uniqRule, xxdRule } from "./commands/positional-output.ts";
-import { grepRule } from "./commands/grep.ts";
+import { grepRule, rgRule } from "./commands/grep.ts";
 import { gitRule } from "./commands/git.ts";
 import { denoRule } from "./commands/deno.ts";
 import { ghRule } from "./commands/gh.ts";
@@ -29,6 +29,7 @@ const RULES: CommandRule[] = [
   xxdRule,
   uniqRule,
   grepRule,
+  rgRule,
   gitRule,
   denoRule,
   ghRule,

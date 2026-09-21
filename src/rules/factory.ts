@@ -4,6 +4,7 @@ import { type FlagMatcher, hasAnyFlag, positionals } from "./flags.ts";
 import { type PathScope } from "../engine/scope.ts";
 import { staticValue } from "../engine/word.ts";
 import type { Word } from "../deps.ts";
+import { type CommandSpec, parseArgv } from "./command_spec.ts";
 
 export interface FlagGatedReaderOptions {
   names: string[];
@@ -17,6 +18,43 @@ export interface FlagGatedReaderOptions {
   askReason?: (name: string) => string;
   /** 回 true 表示此次呼叫會遞迴遍歷；遍歷根命中危險根時 deny。 */
   recursive?: (name: string, argv: Word[]) => boolean;
+  /**
+   * 選填：改由 CommandSpec 驅動 argv 分類（每個旗標只描述一次）。
+   * 提供 spec 時，valueFlags / pathValueFlags 不再使用，並可 opt-in cwd 豁免述詞。
+   * 未提供時，行為與既有完全相同。
+   */
+  spec?: (name: string, argv: Word[]) => CommandSpec | undefined;
+  /** opt-in：spec 解析後無路徑操作元 / 路徑值、非遞迴、旗標全已知時視為 cwd 無關。 */
+  cwdIndependentWhenNoPaths?: boolean;
+  /** 上述 opt-in 的例外名單（隱含以 cwd 為操作對象者，如 ls）。 */
+  cwdDependentNames?: string[];
+}
+
+/** spec 驅動的判定；與 cwdIndependent 共用 parseArgv 的同一份快取結果。 */
+function evaluateWithSpec(ctx: RuleContext, spec: CommandSpec): RuleVerdict {
+  const p = parseArgv(ctx, spec);
+  // 遞迴根 deny 必須先於任何路徑 ask，否則既有硬 deny 會被降級成 ask。
+  // 危險根可能藏在被 value-flag 吃掉的位置，故掃描全部 argv token。
+  if (p.isRecursive) {
+    for (const w of ctx.argv) {
+      if (ctx.isDangerousRoot(w)) return deny(recursiveRootDenyReason(ctx.name, w.value));
+    }
+  }
+  if (p.dynamic) return ask(`${ctx.name}：含動態 token，無法靜態判定`);
+  if (p.unknownFlag !== null) {
+    return ask(`${ctx.name}：未列入安全集合的旗標 ${p.unknownFlag}`);
+  }
+  for (const v of p.pathValues) {
+    if (ctx.resolvePathValue(v) !== "in-project") {
+      return ask(`${ctx.name}：旗標的路徑值超出專案範圍或無法解析（${v}）`);
+    }
+  }
+  for (const arg of p.pathOperands) {
+    if (ctx.resolvePath(arg) !== "in-project") {
+      return ask(`${ctx.name}：路徑超出專案範圍或無法靜態解析（${arg.value}）`);
+    }
+  }
+  return allow();
 }
 
 /**
@@ -64,6 +102,8 @@ export function flagGatedReader(opts: FlagGatedReaderOptions): CommandRule {
       if (askFlags.length && hasAnyFlag(ctx.argv, askFlags)) {
         return ask(opts.askReason?.(ctx.name) ?? `${ctx.name}：偵測到寫入 / 副作用參數`);
       }
+      const spec = opts.spec?.(ctx.name, ctx.argv);
+      if (spec) return evaluateWithSpec(ctx, spec);
       // 遞迴根 deny 必須先於任何路徑 ask，否則新增路徑值檢查會把既有硬 deny 降級成 ask。
       // 危險根可能藏在被 value-flag 吃掉的 token 位置，故掃描全部 argv、不限 positionals。
       const isRecursive = opts.recursive?.(ctx.name, ctx.argv) ?? false;
@@ -84,5 +124,15 @@ export function flagGatedReader(opts: FlagGatedReaderOptions): CommandRule {
       }
       return allow();
     },
+    cwdIndependent: opts.cwdIndependentWhenNoPaths
+      ? (ctx: RuleContext) => {
+        if ((opts.cwdDependentNames ?? []).includes(ctx.name)) return false;
+        const spec = opts.spec?.(ctx.name, ctx.argv);
+        if (!spec) return false; // 無 spec → 不豁免（default-deny）
+        const p = parseArgv(ctx, spec); // 與 evaluate 同一份快取結果
+        return !p.isRecursive && !p.dynamic && p.unknownFlag === null &&
+          p.pathOperands.length === 0 && p.pathValues.length === 0;
+      }
+      : undefined,
   };
 }
