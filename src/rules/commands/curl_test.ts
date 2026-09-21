@@ -46,6 +46,8 @@ function ctxOf(src: string, rules: WebFetchRules = ALLOW_EXAMPLE): RuleContext {
   };
 }
 
+const v = (src: string) => curlRule.evaluate(ctxOf(src)).kind;
+
 Deno.test("curl allows read-only fetch to allowed domain", () => {
   assertEquals(curlRule.evaluate(ctxOf("curl https://api.example.com/v1")).kind, "allow");
   assertEquals(curlRule.evaluate(ctxOf("curl -sSL https://api.example.com/v1")).kind, "allow");
@@ -195,4 +197,21 @@ Deno.test("curl --header long form with @file applies read scope", () => {
     curlRule.evaluate(ctxOf("curl --header=@/etc/headers https://api.example.com/")).kind,
     "ask", // inline 值、專案外
   );
+});
+
+Deno.test("curl leaves unquoted ? dynamic", () => {
+  // curl 的判定會比對 preapproved 的 path 前綴，展開會改變判定 → 不套用寬鬆取值
+  assertEquals(v("curl -s https://api.example.com/p?q=1"), "ask");
+  assertEquals(v("curl -s https://api.example.com?q=1"), "ask");
+});
+
+Deno.test("quoted curl URLs are unaffected", () => {
+  assertEquals(v("curl -s 'https://api.example.com/p?q=1'"), "allow");
+  assertEquals(v("curl -s 'https://api.example.com/p'"), "allow");
+});
+
+Deno.test("curl cwdIndependent tracks the evaluate verdict", () => {
+  assertEquals(curlRule.cwdIndependent!(ctxOf("curl -s 'https://api.example.com/p?q=1'")), true);
+  assertEquals(curlRule.cwdIndependent!(ctxOf("curl -s 'https://not-allowed.test/p'")), false);
+  assertEquals(curlRule.cwdIndependent!(ctxOf("curl -s https://api.example.com/p?q=1")), false);
 });

@@ -128,4 +128,13 @@ export const curlRule: CommandRule = {
     }
     return allow();
   },
+
+  /**
+   * allow 形式只走網路；`-H @file` 已由 resolvePathValue 以真實 cwd 檢查。
+   * evaluate 是 ctx 的純函式，故此處重入得到同一個判定；classify 只在 evaluate 已回
+   * allow 時才詢問本述詞，因此不可能放寬判定。
+   */
+  cwdIndependent(ctx: RuleContext): boolean {
+    return curlRule.evaluate(ctx).kind === "allow";
+  },
 };
