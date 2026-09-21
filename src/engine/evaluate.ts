@@ -6,6 +6,7 @@ import { classify } from "./classify.ts";
 import { combine } from "./combine.ts";
 import { EMPTY_RULES, type PermissionRules } from "../permissions/settings.ts";
 import { nameRedefinitionDenyReason, pollingDenyReason, printDisguiseDenyReason } from "../rules/types.ts";
+import { buildScopeConfig, isReadScoped, normalizeAbsolute } from "./scope.ts";
 
 /**
  * 主流程：parse → walk → 四閘 → 合併。任何例外 → ask（fail-safe）。
@@ -35,7 +36,14 @@ export function evaluate(
     if (invocations.length === 0) return { verdict: "allow", reason: "無可執行指令（no-op）" };
     const hit = printDisguiseDeny(script, initialCwd);
     if (hit) return { verdict: "deny", reason: printDisguiseDenyReason(hit.kind) };
-    return combine(invocations.map((inv) => classify(inv, root, rules, home, trustedReadRoots)));
+    const scope = buildScopeConfig(root, rules, home, trustedReadRoots);
+    const sessionCwdInScope = initialCwd.kind === "known" &&
+      isReadScoped(normalizeAbsolute(initialCwd.path), scope);
+    return combine(
+      invocations.map((inv) =>
+        classify(inv, root, rules, home, trustedReadRoots, sessionCwdInScope)
+      ),
+    );
   } catch (_err) {
     return { verdict: "ask", reason: "權限檢查器內部錯誤，保守交付人工確認" };
   }

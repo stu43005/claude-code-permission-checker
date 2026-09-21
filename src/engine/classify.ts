@@ -1,5 +1,5 @@
 import type { CommandInvocation } from "../types.ts";
-import type { RuleVerdict } from "../rules/types.ts";
+import type { RuleContext, RuleVerdict } from "../rules/types.ts";
 import { allow, ask } from "../rules/types.ts";
 import { lookupRule } from "../rules/allowlist.ts";
 import { buildScopeConfig, dangerousRoot, isReadScoped, normalizeAbsolute, resolvePath, resolvePathValue, type ScopeConfig } from "./scope.ts";
@@ -7,6 +7,7 @@ import { hasWriteRedirect } from "./redirect.ts";
 import { settingsAllows } from "../permissions/matcher.ts";
 import { EMPTY_RULES, type PermissionRules } from "../permissions/settings.ts";
 import { resolveUrl } from "../permissions/domain_scope.ts";
+import { staticValue } from "./word.ts";
 
 /**
  * 四條中央前置安全規則（對所有指令通用、不可由 permissions.allow 升級）。
@@ -18,9 +19,17 @@ import { resolveUrl } from "../permissions/domain_scope.ts";
  * src/rules/ 確認無 Deno 檔案系統/子行程 API），故步驟 2 在「危險 cwd/redirect」情境下呼叫
  * rule.evaluate 無 runtime 危害；任何帶中央前置觸發條件的指令永不可能成為 allow。
  */
-function centralPreflightAsk(inv: CommandInvocation, scope: ScopeConfig): RuleVerdict | null {
-  // 一：cwd 範圍（known 但不在「專案 ∪ 外部允許唯讀範圍」）
-  if (inv.cwd.kind === "known" && !isReadScoped(normalizeAbsolute(inv.cwd.path), scope)) {
+function centralPreflightAsk(
+  inv: CommandInvocation,
+  scope: ScopeConfig,
+  skipCwdCheck: boolean,
+): RuleVerdict | null {
+  // 一：cwd 範圍（known 但不在「專案 ∪ 外部允許唯讀範圍」）。skipCwdCheck 由 classify
+  // 依五道護欄算出；規則二/三/四不受影響。
+  if (
+    !skipCwdCheck && inv.cwd.kind === "known" &&
+    !isReadScoped(normalizeAbsolute(inv.cwd.path), scope)
+  ) {
     return ask(`工作目錄超出允許範圍：${inv.cwd.path}`);
   }
   // 二：寫入型重導向
@@ -58,6 +67,8 @@ export function classify(
   rules: PermissionRules = EMPTY_RULES,
   home: string | null = null,
   trustedReadRoots: string[] = [],
+  // 缺省 false = 起點不可信 → 永不豁免（fail-safe；既有呼叫端行為不變）
+  sessionCwdInScope = false,
 ): RuleVerdict {
   const scope: ScopeConfig = buildScopeConfig(root, rules, home, trustedReadRoots);
 
@@ -66,23 +77,32 @@ export function classify(
 
   // 步驟 2：指令規則評估 + 硬 deny 短路（deny 最優先，先於中央前置與升級層）
   const rule = lookupRule(inv.name);
-  const ruleVerdict: RuleVerdict | null = rule
-    ? rule.evaluate({
-      name: inv.name,
-      argv: inv.argv,
-      redirects: inv.redirects,
-      assignments: inv.assignments,
-      cwd: inv.cwd,
-      resolvePath: (w) => resolvePath(w, inv.cwd, scope),
-      resolvePathValue: (v) => resolvePathValue(v, inv.cwd, scope),
-      resolveUrl: (v) => resolveUrl(v, rules.webFetch),
-      isDangerousRoot: (w) => dangerousRoot(w, inv.cwd, scope.home),
-    })
-    : null;
+  const ctx: RuleContext = {
+    name: inv.name,
+    argv: inv.argv,
+    redirects: inv.redirects,
+    assignments: inv.assignments,
+    cwd: inv.cwd,
+    resolvePath: (w) => resolvePath(w, inv.cwd, scope),
+    resolvePathValue: (v) => resolvePathValue(v, inv.cwd, scope),
+    resolveUrl: (v) => resolveUrl(v, rules.webFetch),
+    isDangerousRoot: (w) => dangerousRoot(w, inv.cwd, scope.home),
+  };
+  const ruleVerdict: RuleVerdict | null = rule ? rule.evaluate(ctx) : null;
   if (ruleVerdict?.kind === "deny") return ruleVerdict;
 
+  // 護欄 4：argv 必須全為靜態 token。唯一例外是規則自身以 toleratesNonStaticOperand
+  // 認定的操作元（本工具的判定完全不讀其內容）。
+  const allArgvStatic = inv.argv.every((w) => staticValue(w) !== null);
+  const cwdExempt = ruleVerdict?.kind === "allow" && // 護欄 1
+    sessionCwdInScope && // 護欄 2（起點可信）
+    inv.cwd.kind === "known" &&
+    inv.cwd.origin === "chain-cd" && // 護欄 2（鏈內 cd）
+    (allArgvStatic || (rule?.toleratesNonStaticOperand?.(ctx) ?? false)) && // 護欄 4
+    (rule?.cwdIndependent?.(ctx) ?? false);
+
   // 步驟 3：四條中央前置（通用、不可升級）
-  const central = centralPreflightAsk(inv, scope);
+  const central = centralPreflightAsk(inv, scope, cwdExempt);
   if (central) return central;
 
   // 步驟 4：可升級 ask（未列入 allowlist 或指令規則自身 ask）

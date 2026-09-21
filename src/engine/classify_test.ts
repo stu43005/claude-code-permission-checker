@@ -340,3 +340,106 @@ Deno.test("可升級不退化：指令規則自身範圍外讀取 ask 仍可由 
   // grep 對 /etc/passwd → 規則 ask（非中央前置）→ 可升級為 allow
   assertEquals(onlyWith("grep needle /etc/passwd", rulesOf({ allow: ["Bash(grep *)"] })).kind, "allow");
 });
+
+/** 整條指令鏈的最終決策（session cwd 預設為專案內）。 */
+function decide(src: string, start: CwdState = START) {
+  return evaluate(src, ROOT, start);
+}
+
+/** 單一葉指令的判定，可指定 sessionCwdInScope，用於直接檢驗護欄 2。 */
+function leaf(
+  src: string,
+  name: string,
+  sessionInScope: boolean,
+  start: CwdState = START,
+  rules?: PermissionRules,
+) {
+  const invs = walk(parseCommand(src).script, start, ROOT);
+  const inv = invs.find((i) => i.name === name)!;
+  return classify(inv, ROOT, rules, null, [], sessionInScope);
+}
+
+Deno.test("chain cd out of project no longer asks for cwd-independent commands", () => {
+  assertEquals(decide("cd /tmp && echo hi").verdict, "allow");
+  assertEquals(decide("cd /tmp && pwd").verdict, "allow");
+  assertEquals(decide("cd /tmp && whoami").verdict, "allow");
+});
+
+Deno.test("guardrail 1: a settings.allow upgrade never grants the exemption", () => {
+  // gh api --input 讀本地檔 → 規則自身判 ask；即使 permissions.allow 命中也不得豁免
+  const rules = rulesOf({ allow: ["Bash(gh api:*)"] });
+  assertEquals(leaf("cd /tmp && gh api x --input body.json", "gh", true, START, rules).kind, "ask");
+  // 對照：同一條規則在專案內 cwd 下會被升級成 allow
+  assertEquals(onlyWith("gh api x --input body.json", rules).kind, "allow");
+});
+
+Deno.test("guardrail 2 blocks the leaf itself, not just the chain", () => {
+  const dirty: CwdState = { kind: "known", path: "/outside" };
+  assertEquals(leaf("cd . && echo hi", "echo", false, dirty).kind, "ask");
+  assertEquals(leaf("cd /tmp && echo hi", "echo", false, dirty).kind, "ask");
+  assertEquals(leaf("cd /tmp && echo hi", "echo", true).kind, "allow");
+});
+
+Deno.test("evaluate derives session trust from the initial cwd, not a caller flag", () => {
+  const dirty: CwdState = { kind: "known", path: "/outside" };
+  // evaluate 自己算出 sessionCwdInScope=false，整條鏈必須 ask
+  assertEquals(decide("cd . && echo hi", dirty).verdict, "ask");
+  assertEquals(decide("cd /tmp && echo hi", dirty).verdict, "ask");
+  // gh 的寬鬆 endpoint 述詞會成功，但起點不可信仍不得豁免
+  assertEquals(decide("cd /tmp && gh api repos/o/r/tags?per_page=50", dirty).verdict, "ask");
+  // 逐葉斷言：確認擋下的是 gh 葉指令本身，而不是被前面的 cd 葉指令遮蔽
+  assertEquals(
+    leaf("cd /tmp && gh api repos/o/r/tags?per_page=50", "gh", false, dirty).kind,
+    "ask",
+  );
+  assertEquals(leaf("cd . && gh api repos/o/r/tags?per_page=50", "gh", false, dirty).kind, "ask");
+  // 對照：起點可信時同一個 gh 葉指令才豁免
+  assertEquals(
+    leaf("cd /tmp && gh api repos/o/r/tags?per_page=50", "gh", true).kind,
+    "allow",
+  );
+});
+
+Deno.test("guardrail 3: path operands are still resolved against the real cwd", () => {
+  assertEquals(decide("cd /tmp && head -100 a.txt").verdict, "ask");
+});
+
+Deno.test("guardrail 4: a non-static token blocks the exemption", () => {
+  assertEquals(decide("cd /tmp && echo *").verdict, "ask");
+  assertEquals(decide("cd /tmp && grep *").verdict, "ask");
+  assertEquals(decide("cd /tmp && head -100 *.log").verdict, "ask");
+});
+
+Deno.test("guardrail: which is never cwd-independent (PATH may contain .)", () => {
+  assertEquals(decide("cd /tmp && which some-name").verdict, "ask");
+});
+
+Deno.test("the other central preflight rules still fire under the exemption", () => {
+  assertEquals(decide("cd /tmp && echo hi > out.txt").verdict, "ask"); // 寫入重導向
+  assertEquals(decide("cd /tmp && FOO=1 echo hi").verdict, "ask"); // 賦值前綴
+  assertEquals(decide("cd /tmp && head -1 < ../outside.txt").verdict, "ask"); // 範圍外 <
+});
+
+Deno.test("every non-declaring command still asks after a chain cd", () => {
+  const cases = [
+    // 隱含以 cwd 為操作對象
+    "ls", "tree", "find . -name x", "rg pat", "git status", "deno test",
+    // fileReaderRule 的其餘成員：與 head/wc 共用規則，必須確認沒有被順帶豁免
+    "cat", "cut -c1", "tr a b", "nl", "fold -w 80", "column -t",
+    "stat x", "cmp a b", "comm a b", "md5sum", "hexdump", "basename x", "dirname x",
+    "realpath x", "readlink x",
+    // 其他未宣告的規則
+    "awk '{print}'", "yq '.'", "sort", "uniq", "xxd", "diff a b", "file x", "date -r x",
+    "which some-name",
+  ];
+  for (const c of cases) {
+    assertEquals(decide(`cd /tmp && ${c}`).verdict, "ask", c);
+  }
+});
+
+Deno.test("find's hard deny needs a real root; /tmp is only an ask", () => {
+  // dangerousRoot 只對磁碟根 / 家目錄根 deny；/tmp 兩者都不是
+  assertEquals(decide("cd /tmp && find . -name x").verdict, "ask");
+  assertEquals(decide("cd /tmp && find / -name x").verdict, "deny");
+  assertEquals(decide("cd / && find . -name x").verdict, "deny");
+});
