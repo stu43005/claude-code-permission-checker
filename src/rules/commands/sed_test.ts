@@ -5,7 +5,7 @@ import { sedRule } from "./sed.ts";
 import type { RuleContext } from "../types.ts";
 import { dangerousRoot, resolvePath, resolvePathValue, rootScope } from "../../engine/scope.ts";
 
-function ctxOf(src: string): RuleContext {
+export function ctxOf(src: string): RuleContext {
   const cmd = parse(src).commands[0].command as Command;
   const cwd = { kind: "known", path: "/proj" } as const;
   return {
@@ -20,6 +20,8 @@ function ctxOf(src: string): RuleContext {
     isDangerousRoot: (w) => dangerousRoot(w, cwd, null),
   };
 }
+
+const v = (src: string) => sedRule.evaluate(ctxOf(src)).kind;
 
 Deno.test("sed -n print range allows", () => {
   assertEquals(sedRule.evaluate(ctxOf("sed -n '30,45p' file")).kind, "allow");
@@ -64,8 +66,6 @@ Deno.test("sed allowed form but out-of-project file asks", () => {
 Deno.test("sed with no static program (dynamic) asks", () => {
   assertEquals(sedRule.evaluate(ctxOf("sed $PROG file")).kind, "ask");
 });
-
-const v = (src: string) => sedRule.evaluate(ctxOf(src)).kind;
 
 Deno.test("unknown sed flags ask", () => {
   assertEquals(v("sed --totally-unknown 'p'"), "ask");
