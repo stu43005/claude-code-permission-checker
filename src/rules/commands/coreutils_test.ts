@@ -76,3 +76,39 @@ Deno.test("ls 非遞迴碰根 / cat 碰根 -> 非 deny", () => {
   assertEquals(fileReaderRule.evaluate(ctxOf("cat /")).kind, "ask");
   assertEquals(fileReaderRule.evaluate(ctxOf("ls -R ./sub")).kind, "allow");
 });
+
+Deno.test("realpath flags are scope-checked in the separate-value form too", () => {
+  assertEquals(fileReaderRule.evaluate(ctxOf("realpath --relative-to ../out a.txt")).kind, "ask");
+  assertEquals(fileReaderRule.evaluate(ctxOf("realpath --relative-base ../out a.txt")).kind, "ask");
+});
+
+Deno.test("wc --files0-from is scope-checked in both forms", () => {
+  assertEquals(fileReaderRule.evaluate(ctxOf("wc --files0-from=list.txt")).kind, "allow");
+  assertEquals(fileReaderRule.evaluate(ctxOf("wc --files0-from=../out/list.txt")).kind, "ask");
+  assertEquals(fileReaderRule.evaluate(ctxOf("wc --files0-from ../out/list.txt")).kind, "ask");
+});
+
+Deno.test("realpath --relative-to / --relative-base are scope-checked", () => {
+  assertEquals(fileReaderRule.evaluate(ctxOf("realpath --relative-to=sub a.txt")).kind, "allow");
+  assertEquals(fileReaderRule.evaluate(ctxOf("realpath --relative-to=../out a.txt")).kind, "ask");
+  assertEquals(fileReaderRule.evaluate(ctxOf("realpath --relative-base=../out a.txt")).kind, "ask");
+});
+
+Deno.test("diff -X / -S are scope-checked in both forms", () => {
+  assertEquals(diffRule.evaluate(ctxOf("diff -X ex.txt a.txt b.txt")).kind, "allow");
+  assertEquals(diffRule.evaluate(ctxOf("diff -X ../out.txt a.txt b.txt")).kind, "ask");
+  assertEquals(diffRule.evaluate(ctxOf("diff -X../out.txt a.txt b.txt")).kind, "ask");
+  assertEquals(diffRule.evaluate(ctxOf("diff --starting-file=../out a.txt b.txt")).kind, "ask");
+  // 群集寫法無法可靠取值 → 保守 ask（含數字短選項的群集）
+  assertEquals(diffRule.evaluate(ctxOf("diff -qX../out.txt a.txt b.txt")).kind, "ask");
+  assertEquals(diffRule.evaluate(ctxOf("diff -qS../out a.txt b.txt")).kind, "ask");
+  assertEquals(diffRule.evaluate(ctxOf("diff -u0X../out.txt a.txt b.txt")).kind, "ask");
+  assertEquals(diffRule.evaluate(ctxOf("diff -S ../out a.txt b.txt")).kind, "ask");
+});
+
+Deno.test("a recursive root deny outranks a path-value ask", () => {
+  assertEquals(
+    fileReaderRule.evaluate(ctxOf("ls -R -I x --relative-to=../out /")).kind,
+    "deny",
+  );
+});

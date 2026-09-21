@@ -64,11 +64,8 @@ export function flagGatedReader(opts: FlagGatedReaderOptions): CommandRule {
       if (askFlags.length && hasAnyFlag(ctx.argv, askFlags)) {
         return ask(opts.askReason?.(ctx.name) ?? `${ctx.name}：偵測到寫入 / 副作用參數`);
       }
-      const pathFlagVerdict = checkPathValueFlags(ctx, opts.pathValueFlags ?? []);
-      if (pathFlagVerdict) return pathFlagVerdict;
-      // 遞迴遍歷時，危險根可能藏在「被 value-flag 吃掉的 token」位置（例如 grep 的 -r 會把
-      // 其後的根路徑當值吞掉，使其不在 positionals 中），故掃描全部 argv token、不限 positionals，
-      // 避免漏判成 allow（誤放行）。非危險根的 flag/值 token（-r、數字等）自然回 false。
+      // 遞迴根 deny 必須先於任何路徑 ask，否則新增路徑值檢查會把既有硬 deny 降級成 ask。
+      // 危險根可能藏在被 value-flag 吃掉的 token 位置，故掃描全部 argv、不限 positionals。
       const isRecursive = opts.recursive?.(ctx.name, ctx.argv) ?? false;
       if (isRecursive) {
         for (const w of ctx.argv) {
@@ -77,6 +74,8 @@ export function flagGatedReader(opts: FlagGatedReaderOptions): CommandRule {
           }
         }
       }
+      const pathFlagVerdict = checkPathValueFlags(ctx, opts.pathValueFlags ?? []);
+      if (pathFlagVerdict) return pathFlagVerdict;
       for (const arg of positionals(ctx.argv, valueFlags)) {
         const scope = ctx.resolvePath(arg);
         if (scope !== "in-project") {

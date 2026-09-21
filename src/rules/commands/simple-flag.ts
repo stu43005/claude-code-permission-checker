@@ -4,9 +4,17 @@ import { exact, prefix } from "../flags.ts";
 
 export const sortRule: CommandRule = flagGatedReader({
   names: ["sort"],
-  askFlags: [exact("-o", "--output", "-T", "--temporary-directory"), prefix("-o", "--output=", "-T", "--temporary-directory=")],
-  valueFlags: [exact("-o", "-T", "-S", "-k", "-t", "--output", "--temporary-directory", "--buffer-size", "--key", "--field-separator")],
-  askReason: () => "sort：-o / -T 會寫檔或指定暫存目錄",
+  askFlags: [
+    exact("-o", "--output", "-T", "--temporary-directory", "--compress-program", "--random-source"),
+    prefix("-o", "--output=", "-T", "--temporary-directory=", "--compress-program=", "--random-source="),
+  ],
+  valueFlags: [exact(
+    "-o", "-T", "-S", "-k", "-t", "--output", "--temporary-directory", "--buffer-size",
+    "--key", "--field-separator", "--files0-from", "--compress-program", "--random-source",
+  )],
+  pathValueFlags: ["--files0-from"],
+  askReason: () =>
+    "sort：-o / -T 會寫檔或指定暫存目錄；--compress-program 會執行外部程式；--random-source 會讀檔",
 });
 
 export const yqRule: CommandRule = flagGatedReader({

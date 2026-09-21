@@ -68,3 +68,15 @@ Deno.test("tree 專案內子目錄 -> allow；-o 寫檔 -> ask", () => {
   assertEquals(treeRule.evaluate(ctxOf("tree", "tree ./sub")).kind, "allow");
   assertEquals(treeRule.evaluate(ctxOf("tree", "tree -o out.txt")).kind, "ask");
 });
+
+Deno.test("sort --files0-from is scope-checked in both forms", () => {
+  assertEquals(v(sortRule, "sort", "sort --files0-from=list.txt"), "allow");
+  assertEquals(v(sortRule, "sort", "sort --files0-from=../out/list.txt"), "ask");
+  assertEquals(v(sortRule, "sort", "sort --files0-from ../out/list.txt"), "ask");
+});
+
+Deno.test("sort's program / random-source flags ask in both forms", () => {
+  assertEquals(v(sortRule, "sort", "sort --compress-program gzip f.txt"), "ask");
+  assertEquals(v(sortRule, "sort", "sort --compress-program=gzip f.txt"), "ask");
+  assertEquals(v(sortRule, "sort", "sort -R --random-source=../secret f.txt"), "ask");
+});
