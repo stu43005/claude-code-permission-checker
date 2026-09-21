@@ -25,7 +25,7 @@ Deno.test("&& chain enumerates both", () => {
 Deno.test("cd threads cwd across && to next command", () => {
   const invs = walk(parseCommand("cd src && cat a.txt").script, START, ROOT);
   const cat = invs.find((i) => i.name === "cat")!;
-  assertEquals(cat.cwd, { kind: "known", path: "/proj/src" });
+  assertEquals(cat.cwd, { kind: "known", path: "/proj/src", origin: "chain-cd" });
 });
 
 Deno.test("cd in subshell does not leak out", () => {
@@ -42,7 +42,7 @@ Deno.test("git -C sets per-command cwd without leaking", () => {
   const invs = walk(parseCommand("git -C sub status ; cat a").script, START, ROOT);
   const git = invs.find((i) => i.name === "git")!;
   const cat = invs.find((i) => i.name === "cat")!;
-  assertEquals(git.cwd, { kind: "known", path: "/proj/sub" });
+  assertEquals(git.cwd, { kind: "known", path: "/proj/sub", origin: "chain-cd" });
   assertEquals(cat.cwd, { kind: "known", path: "/proj" });
 });
 
@@ -210,4 +210,12 @@ Deno.test("hasAliasRedefinition: 非啟用/查詢/資料/非 alias → false", (
   assertEquals(hasAliasRedefinition(nrInvs("command -V unalias")), false);
   assertEquals(hasAliasRedefinition(nrInvs("cat > setup.sh <<'EOF'\nalias grep=x\nEOF")), false);
   assertEquals(hasAliasRedefinition(nrInvs("echo 'alias grep=x'")), false);
+});
+
+Deno.test("in-chain cd stamps origin chain-cd; session cwd does not", () => {
+  const invs = walk(parseCommand("cd /tmp && cat a").script, START, "/proj");
+  const cd = invs.find((i) => i.name === "cd")!;
+  const cat = invs.find((i) => i.name === "cat")!;
+  assertEquals(cd.cwd, { kind: "known", path: "/proj" }); // cd 帶的是變更前的 session cwd
+  assertEquals(cat.cwd, { kind: "known", path: "/tmp", origin: "chain-cd" });
 });

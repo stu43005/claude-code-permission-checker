@@ -11,10 +11,16 @@ export function isCd(cmd: Command): boolean {
 
 /** 把單一靜態路徑接到目前 cwd 上；動態 / cwd 未知 → unknown。 */
 function applyPath(cwd: CwdState, value: string): CwdState {
-  if (isAbsolute(value)) return { kind: "known", path: normalizeAbsolute(value) };
+  if (isAbsolute(value)) {
+    return { kind: "known", path: normalizeAbsolute(value), origin: "chain-cd" };
+  }
   if (cwd.kind === "unknown") return UNKNOWN;
   const base = cwd.path.endsWith("/") ? cwd.path : cwd.path + "/";
-  return { kind: "known", path: normalizeAbsolute(base + value.replace(/\\/g, "/")) };
+  return {
+    kind: "known",
+    path: normalizeAbsolute(base + value.replace(/\\/g, "/")),
+    origin: "chain-cd",
+  };
 }
 
 /** `cd` 之後的新 threaded cwd。無參數（=$HOME）或動態參數 → unknown。 */

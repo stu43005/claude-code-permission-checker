@@ -4,7 +4,9 @@ export type Verdict = "allow" | "ask" | "deny";
 
 /** 指令執行時的有效工作目錄狀態。 */
 export type CwdState =
-  | { kind: "known"; path: string } // 已正規化的絕對 posix 路徑
+  // origin 缺席 = 由 hook 傳入的 session cwd；"chain-cd" = 由本次指令鏈內的
+  // cd / git -C 等推導而來。缺席時一律不給 cwd 豁免（fail-safe）。
+  | { kind: "known"; path: string; origin?: "chain-cd" } // 已正規化的絕對 posix 路徑
   | { kind: "unknown" }; // 無法靜態確定
 
 /** 從 AST 抽取出的單一葉指令呼叫（已附上其執行 cwd）。 */

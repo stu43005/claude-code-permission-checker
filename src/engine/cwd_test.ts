@@ -14,12 +14,12 @@ Deno.test("isCd recognises cd", () => {
 
 Deno.test("applyCd: static relative path updates known cwd", () => {
   const next = applyCd(cmdOf("cd src"), { kind: "known", path: "/proj" });
-  assertEquals(next, { kind: "known", path: "/proj/src" });
+  assertEquals(next, { kind: "known", path: "/proj/src", origin: "chain-cd" });
 });
 
 Deno.test("applyCd: absolute path", () => {
   const next = applyCd(cmdOf("cd /tmp"), { kind: "known", path: "/proj" });
-  assertEquals(next, { kind: "known", path: "/tmp" });
+  assertEquals(next, { kind: "known", path: "/tmp", origin: "chain-cd" });
 });
 
 Deno.test("applyCd: no arg (=$HOME) -> unknown", () => {
@@ -32,7 +32,7 @@ Deno.test("applyCd: dynamic arg -> unknown", () => {
 
 Deno.test("gitEffectiveCwd: -C subdir resolves under cwd", () => {
   const c = gitEffectiveCwd(cmdOf("git -C sub status"), { kind: "known", path: "/proj" });
-  assertEquals(c, { kind: "known", path: "/proj/sub" });
+  assertEquals(c, { kind: "known", path: "/proj/sub", origin: "chain-cd" });
 });
 
 Deno.test("gitEffectiveCwd: --work-tree wins over -C base", () => {
@@ -40,7 +40,7 @@ Deno.test("gitEffectiveCwd: --work-tree wins over -C base", () => {
     cmdOf("git -C sub --work-tree=wt status"),
     { kind: "known", path: "/proj" },
   );
-  assertEquals(c, { kind: "known", path: "/proj/sub/wt" });
+  assertEquals(c, { kind: "known", path: "/proj/sub/wt", origin: "chain-cd" });
 });
 
 Deno.test("gitEffectiveCwd: -c core.worktree changes base", () => {
@@ -48,13 +48,13 @@ Deno.test("gitEffectiveCwd: -c core.worktree changes base", () => {
     cmdOf("git -c core.worktree=/outside status"),
     { kind: "known", path: "/proj" },
   );
-  assertEquals(c, { kind: "known", path: "/outside" });
+  assertEquals(c, { kind: "known", path: "/outside", origin: "chain-cd" });
 });
 
 Deno.test("gitEffectiveCwd: --git-dir out-of-project sets cwd outside", () => {
   assertEquals(
     gitEffectiveCwd(cmdOf("git --git-dir=/outside/.git status"), { kind: "known", path: "/proj" }),
-    { kind: "known", path: "/outside/.git" },
+    { kind: "known", path: "/outside/.git", origin: "chain-cd" },
   );
 });
 
