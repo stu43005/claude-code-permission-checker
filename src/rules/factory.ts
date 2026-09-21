@@ -4,7 +4,7 @@ import { type FlagMatcher, hasAnyFlag, positionals } from "./flags.ts";
 import { type PathScope } from "../engine/scope.ts";
 import { staticValue } from "../engine/word.ts";
 import type { Word } from "../deps.ts";
-import { type CommandSpec, parseArgv } from "./command_spec.ts";
+import { type ArgvParse, type CommandSpec, parseArgv } from "./command_spec.ts";
 
 export interface FlagGatedReaderOptions {
   names: string[];
@@ -28,6 +28,12 @@ export interface FlagGatedReaderOptions {
   cwdIndependentWhenNoPaths?: boolean;
   /** 上述 opt-in 的例外名單（隱含以 cwd 為操作對象者，如 ls）。 */
   cwdDependentNames?: string[];
+  /**
+   * 述詞的額外前置條件；回 false 即不豁免。供有 askFlags 的規則補上同一條件。
+   * 參數是 parseArgv 的結果（與 evaluate 同一份快取），**不是** RuleContext —— 傳 ctx 會
+   * 誘使實作重掃 argv，正是單一解析契約要避免的。
+   */
+  cwdIndependentExtraGuard?: (parse: ArgvParse) => boolean;
 }
 
 /** spec 驅動的判定；與 cwdIndependent 共用 parseArgv 的同一份快取結果。 */
@@ -130,6 +136,7 @@ export function flagGatedReader(opts: FlagGatedReaderOptions): CommandRule {
         const spec = opts.spec?.(ctx.name, ctx.argv);
         if (!spec) return false; // 無 spec → 不豁免（default-deny）
         const p = parseArgv(ctx, spec); // 與 evaluate 同一份快取結果
+        if (opts.cwdIndependentExtraGuard && !opts.cwdIndependentExtraGuard(p)) return false;
         return !p.isRecursive && !p.dynamic && p.unknownFlag === null &&
           p.pathOperands.length === 0 && p.pathValues.length === 0;
       }

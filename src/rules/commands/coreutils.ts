@@ -2,6 +2,30 @@ import type { CommandRule } from "../types.ts";
 import { allow } from "../types.ts";
 import { flagGatedReader } from "../factory.ts";
 import { exact, type FlagMatcher, hasAnyFlag } from "../flags.ts";
+import type { CommandSpec, FlagSpec } from "../command_spec.ts";
+
+/** head / wc 的旗標表。只有這兩個成員參與 cwd 豁免，故只為它們建模。 */
+const HEAD_SPEC: CommandSpec = {
+  flags: [
+    ...["-q", "--quiet", "--silent", "-v", "--verbose", "-z", "--zero-terminated"]
+      .map((name): FlagSpec => ({ name, value: "none" })),
+    ...["-c", "--bytes", "-n", "--lines"]
+      .map((name): FlagSpec => ({ name, value: "required" })),
+  ],
+  positionals: "paths",
+  numericShorthand: true, // head -100
+};
+
+const WC_SPEC: CommandSpec = {
+  flags: [
+    ...["-c", "--bytes", "-m", "--chars", "-l", "--lines", "-L", "--max-line-length", "-w", "--words"]
+      .map((name): FlagSpec => ({ name, value: "none" })),
+    { name: "--files0-from", value: "required", valueIsPath: true },
+  ],
+  positionals: "paths",
+};
+
+const SPECS: Record<string, CommandSpec> = { head: HEAD_SPEC, wc: WC_SPEC };
 
 /**
  * 會把非 flag 參數當作要讀取 / 解析的路徑，需做範圍檢查（spec line 218 要求整份
@@ -14,6 +38,8 @@ export const fileReaderRule: CommandRule = flagGatedReader({
     "cmp", "comm", "md5sum", "sha256sum", "hexdump", "nl", "fold",
     "basename", "dirname", "realpath", "readlink",
   ],
+  // head / wc 走 CommandSpec；其餘成員沿用下方 legacy 設定，且一律不參與 cwd 豁免。
+  spec: (name) => SPECS[name],
   // 這些旗標的值是會被讀取的路徑，過去被當一般 flag 跳過而未檢查：
   //   wc       --files0-from=F      從 F 讀 NUL 分隔的檔名清單
   //   realpath --relative-to=DIR / --relative-base=DIR
@@ -21,6 +47,9 @@ export const fileReaderRule: CommandRule = flagGatedReader({
   pathValueFlags: ["--files0-from", "--relative-to", "--relative-base"],
   // 這些指令無「會寫檔」的 flag；故 askFlags 留空。
   recursive: (n, a) => n === "ls" && hasAnyFlag(a, [exact("-R", "--recursive")]),
+  cwdIndependentWhenNoPaths: true,
+  // ls 無操作元時列出 cwd。其餘未提供 spec 的成員由「無 spec → 不豁免」自動排除。
+  cwdDependentNames: ["ls"],
 });
 
 /**
@@ -42,10 +71,16 @@ export const diffRule: CommandRule = flagGatedReader({
   pathValueFlags: ["--from-file", "--to-file", "-X", "--exclude-from", "-S", "--starting-file"],
 });
 
-/** 不接受檔案路徑操作元、且無寫入能力的純工具：一律 allow。 */
+/**
+ * 不接受檔案路徑操作元、且無寫入能力的純工具：一律 allow。
+ * cwd 無關宣告排除 `which`：它依 PATH 逐段搜尋，而 PATH 合法地可能含 `.` 或空字串段，
+ * 兩者都相對於 cwd 解析 —— `cd /outside && which x` 等於探測 /outside/x 是否存在。
+ * 執行期 PATH 無法靜態得知，故一律不豁免。
+ */
 export const pureUtilRule: CommandRule = {
   names: ["echo", "pwd", "whoami", "which"],
   evaluate: () => allow(),
+  cwdIndependent: (ctx) => ctx.name !== "which",
 };
 
 /** cd 本身不寫檔（cwd 變動由 walk 處理）：一律 allow。 */

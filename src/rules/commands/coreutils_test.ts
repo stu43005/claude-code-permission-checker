@@ -112,3 +112,39 @@ Deno.test("a recursive root deny outranks a path-value ask", () => {
     "deny",
   );
 });
+
+Deno.test("head / wc non-path flag values are not treated as paths", () => {
+  assertEquals(fileReaderRule.evaluate(ctxOf("head -n 10")).kind, "allow");
+  assertEquals(fileReaderRule.evaluate(ctxOf("head -100")).kind, "allow");
+  assertEquals(fileReaderRule.evaluate(ctxOf("wc -l")).kind, "allow");
+});
+
+Deno.test("head / wc still scope-check their file operands", () => {
+  assertEquals(fileReaderRule.evaluate(ctxOf("head -100 ../out.txt")).kind, "ask");
+  assertEquals(fileReaderRule.evaluate(ctxOf("wc -l ../out.txt")).kind, "ask");
+});
+
+Deno.test("unknown head / wc flags ask; other members keep legacy behavior", () => {
+  assertEquals(fileReaderRule.evaluate(ctxOf("head --totally-unknown")).kind, "ask");
+  assertEquals(fileReaderRule.evaluate(ctxOf("wc -1unknown")).kind, "ask");
+  // cat 沒有 spec，走既有路徑：未知旗標照舊被當一般 flag 跳過
+  assertEquals(fileReaderRule.evaluate(ctxOf("cat --totally-unknown a.txt")).kind, "allow");
+});
+
+Deno.test("which is never cwd-independent; the other pure utils are", () => {
+  assertEquals(pureUtilRule.cwdIndependent!(ctxOf("which x")), false);
+  assertEquals(pureUtilRule.cwdIndependent!(ctxOf("echo hi")), true);
+  assertEquals(pureUtilRule.cwdIndependent!(ctxOf("pwd")), true);
+  assertEquals(pureUtilRule.cwdIndependent!(ctxOf("whoami")), true);
+});
+
+Deno.test("head / wc declare cwd-independence only with no operands", () => {
+  assertEquals(fileReaderRule.cwdIndependent!(ctxOf("head -100")), true);
+  assertEquals(fileReaderRule.cwdIndependent!(ctxOf("wc -l")), true);
+  assertEquals(fileReaderRule.cwdIndependent!(ctxOf("head -100 a.txt")), false);
+  assertEquals(fileReaderRule.cwdIndependent!(ctxOf("wc --files0-from=list")), false);
+  // 未宣告的成員一律 false
+  assertEquals(fileReaderRule.cwdIndependent!(ctxOf("cat")), false);
+  assertEquals(fileReaderRule.cwdIndependent!(ctxOf("ls")), false);
+  assertEquals(fileReaderRule.cwdIndependent!(ctxOf("tr a b")), false);
+});
