@@ -41,7 +41,10 @@ operational verification 會讀取真實的 settings.json（含使用者 `<confi
 代表該指令被 `permissions.allow`（如 `Bash(deno test *)`）升級了——這正是 `(hook=ask, settings=allow) → allow`
 的設計行為（見下「hook 決策 vs settings.json 權限的優先序」），**屬合法、不是 bug**。要單獨驗證 builtin 分類
 本身，請以單元測試（rule 的 `evaluate`）為準，或在不含對應 `permissions.allow` 的環境下餵 JSON。
-但此「合法升級」**僅限可升級 ask**：若 binary 對帶**寫入重導向／cwd 超範圍／賦值前綴／範圍外 `<`** 的指令回 `allow`，那**是 regression、不是功能正常**——這四條中央前置安全 ask 對所有指令通用且不可由 `permissions.allow` 升級（例：`npm test --x > /etc/passwd` 即使命中 `Bash(npm test:*)` 仍須 `ask`）。
+但此「合法升級」**僅限可升級 ask**：若 binary 對帶**寫入重導向／賦值前綴／範圍外 `<`** 的指令回 `allow`，那**是 regression**——這三條
+中央前置 ask 對所有指令通用且不可由 `permissions.allow` 升級。**cwd 超範圍**則有一個受控例外：
+符合上述五道護欄的純唯讀、與 cwd 無關的指令（如 `cd /outside && gh api …`）會 `allow`，這是設計
+行為而非 regression；不符合任一護欄者仍必須 `ask`。
 
 ## 架構（評估管線）
 
@@ -71,12 +74,25 @@ parse.ts (unbash) → walk.ts → 閘① sleep → 閘② 名稱重定義 → no
   deny/ask 命中才升級；builtin 已判 `allow` 者原樣返回，不受 rules 影響）；⑤ 指令規則 `allow` → allow。
   純函式 `centralPreflightAsk` 封裝步驟 ③。**中央前置 ask 永不進升級層。**
   此外，builtin 回 `deny`（遞迴遍歷磁碟根/家目錄根，由 `scope.ts` 的 `dangerousRoot` 偵測、經 `RuleContext.isDangerousRoot` 提供給規則，接於 find/tree/ls -R/grep -r/rg 的遞迴閘門）時**先於升級層短路返回**，不經 `settingsAllows`，故 `permissions.allow` 無法解除此 deny。
+  另計算 cwd 豁免旗標（`cwdIndependent` / `toleratesNonStaticOperand` 兩個可選述詞 + 五道護欄），
+  以 `skipCwdCheck` 傳給 `centralPreflightAsk`，**僅**跳過規則一。
 - **`scope.ts`** 純詞法路徑解析（不碰檔案系統）。`resolvePath`/`resolvePathValue` 回三態
   `in-project` / `out-of-project` / `dynamic`，後兩者 → ask。
   另提供 `isDangerousRootAbs`/`dangerousRoot` 危險根偵測（字面 `~`/`~/`、lone `$HOME`/`${HOME}`/`$HOME/`、Windows `$USERPROFILE`、靜態絕對等於磁碟根 `/`、`X:/` 或家目錄），供遞迴指令回 `deny`。
-- **`rules/`**：`types.ts`（`CommandRule`/`RuleContext`/`RuleVerdict` + `allow()`/`ask()`）、
-  `flags.ts`（flag matcher、positionals）、`factory.ts`（`flagGatedReader`）、
-  `allowlist.ts`（name → rule 索引，載入時偵測重複 name）、`commands/*.ts`（每類指令一檔）。
+  另提供 `buildScopeConfig`，供 `evaluate`（計算 `sessionCwdInScope`）與 `classify` 共用同一份範圍定義。
+- **`rules/`**：`types.ts`（`CommandRule`/`RuleContext`/`RuleVerdict` + `allow()`/`ask()`/`deny()`，
+  另含 `cwdIndependent` / `toleratesNonStaticOperand` 兩個可選述詞）、
+  `command_spec.ts`（`CommandSpec`：每個旗標只描述一次——名稱、吃值方式
+  （`none` / `required` / `attached-only`）、值是否為路徑；位置參數語義與遞迴判定皆可依**同一次解析**
+  的 `seenFlags` 動態決定。`parseArgv` 對每個 `RuleContext` 只解析一次並快取，`evaluate` 與
+  `cwdIndependent` 因此讀到**同一份**結果）、`flags.ts`、`factory.ts`、`allowlist.ts`、`commands/*.ts`
+  （本次新增 `commands/jq.ts`，`jq` 已自 `fileReaderRule` 移出；`rg` 已自 `grepRule.names` 移出、
+  成為 `grep.ts` 內獨立的 `rgRule`）。
+
+  **解析器歸屬與豁免資格是兩件事**：走 `CommandSpec` 的只有 `grep`/`egrep`/`fgrep`、`head`、`wc`、
+  `tail`；`gh`、`jq`、`sed` 各有自己的**單一 memoized 掃描**（同樣保證 evaluate 與述詞讀同一份結果）；
+  `curl` 與 `rg` 沿用既有 legacy 解析。豁免資格則由 `cwdIndependent` 宣告，兩者不重疊：
+  `curl` 不走 `CommandSpec` 但會豁免，`rg` 既不走 `CommandSpec` 也不豁免（恆為遞迴）。
 - **`permissions/`**：`settings.ts`（`loadPermissionRules`：讀專案 `.claude/settings.json`、
   `.claude/settings.local.json`、使用者 `<configDir>/settings.json`（`<configDir> = CLAUDE_CONFIG_DIR ?? <home>/.claude`），抽出 `permissions.{allow,deny,ask}` 中
   的 `Bash(...)` 規則並 union；家目錄依平台解析 `USERPROFILE`/`HOME`；fail-safe：讀檔/解析失敗退化為空
@@ -89,11 +105,24 @@ parse.ts (unbash) → walk.ts → 閘① sleep → 閘② 名稱重定義 → no
 `classify` **先評估指令規則**：若其回硬 `deny`（遞迴根掃描）立即返回，使硬 deny 不被中央前置 ask 遮蔽、
 亦不被升級層解除。指令規則非 deny 時，對**所有指令**（不論是否 allowlisted）施加以下四條中央前置規則
 （命中即回**不可升級** `ask`，先於可升級 ask 區的 `settingsAllows`）；其安全性不依賴指令規則內部行為
-（中央前置覆寫 rule 的 allow/ask，唯一越過的是 rule deny；此順序依賴 rule.evaluate 純函式契約）：
+（中央前置覆寫 rule 的 allow/ask，能越過的只有 rule deny，以及規則宣告 `cwdIndependent` 且五道護欄
+全部成立時的規則一；此順序依賴 rule.evaluate 純函式契約）：
 
 （註：對「遞迴遍歷磁碟根/家目錄根」的 `deny` 不是中央前置規則，而是各遞迴指令規則內以 `isDangerousRoot` 判定、再由 `classify` 對 `deny` 短路；故不在本四條之列。）
 
-1. **cwd 範圍**：`cwd.kind === "known"` 但落在專案根外 → ask。
+1. **cwd 範圍**：`cwd.kind === "known"` 但落在「專案 ∪ 使用者以 `Read()/Edit()/Write()` 放寬的外部
+   唯讀範圍 ∪ 當前 session 的 trusted read roots」之外 → ask（判定由 `scope.ts` 的 `isReadScoped`
+   統一負責）。**唯一例外**：五道護欄全部成立時跳過本條（且只跳過本條）——
+   (1) 指令規則自身回 `allow`（`permissions.allow` 升級的 ask 永不豁免）；
+   (2) hook 傳入的 session cwd 本身在範圍內 **且** 當前 cwd 由鏈內 `cd` 產生（`origin === "chain-cd"`）；
+   (3) 相對路徑仍以真實 cwd 解析；
+   (4) argv 全為靜態 token（唯一例外是 `gh api` 的 endpoint 操作元，由規則以
+       `toleratesNonStaticOperand` 認定）；
+   (5) 每個旗標都命中該規則的已知旗標表。
+   宣告方式為 `CommandRule.cwdIndependent`，未宣告 = 不豁免（default-deny）。
+   **目前宣告者**：`gh`（僅 `api` / `search`）、`head`、`wc`、`tail`、`grep`、`sed`、`jq`、
+   `curl`（僅 allow 形式；**不含**任何寬鬆取值），加上不接受路徑操作元的 `echo` / `pwd` / `whoami`
+   （`which` 明確排除：PATH 可含 `.` 或空段）。
 2. **寫入型重導向**：`> >> >| &> &>> <>`（及 `>&` 接檔名）→ ask；null 裝置（`/dev/null`、`NUL`）
    與純 fd 複製（`2>&1`、`>&` 接 fd 數字）不算寫入。
 3. **環境變數賦值前綴**：任何 `var=val` 前綴（`LD_PRELOAD=…` 等）→ ask。
@@ -106,8 +135,9 @@ parse.ts (unbash) → walk.ts → 閘① sleep → 閘② 名稱重定義 → no
 - **default-deny**：未明確判定為安全唯讀的一律 ask。新增指令規則時，未涵蓋的形式必須 fallback 到 ask。
 - **deny 四類**：① 遞迴遍歷磁碟根/家目錄根（find/tree/ls -R/grep -r/rg）；② 整鏈 print-only 偽裝＋跨載具（evaluate 閘③）；③ sleep 輪詢等待（evaluate 閘①）；④ 名稱重定義（shell 函式定義、alias 類，evaluate 閘②）。閘①②③ 皆在 `classify` 前短路、不過 `settingsAllows`，不可由 `permissions.allow` 解除；其中閘②③ 亦不可由 `permissions.allow` 升級。verdict 三態優先序 `deny > ask > allow`。**永遠 `exit 0`**；任何例外都 try/catch 成 ask（fail-safe）。
 - **deny 為硬性**：`classify` 對 builtin `deny` 短路，**不經** `permissions.allow` 升級層（升級層只把 `ask`
-  變 `allow`，永遠碰不到 `deny`）。`classify` 先評估指令規則：其硬 deny 優先於任何中央前置 ask。**四條中央
-  前置 ask 亦為硬性**——對所有指令通用、命中即不可升級（升級層只套用於「未列入 allowlist」與「指令規則
+  變 `allow`，永遠碰不到 `deny`）。`classify` 先評估指令規則：其硬 deny 優先於任何中央前置 ask。能越過
+  中央前置的只有兩種情形：rule deny，以及規則宣告 `cwdIndependent` 且五道護欄全部成立時的**規則一**。
+  **四條中央前置 ask 亦為硬性**——對所有指令通用、命中即不可升級（升級層只套用於「未列入 allowlist」與「指令規則
   自身」的 ask），故寫入重導向 / cwd 超範圍 / 範圍外 `<` / 賦值前綴永不被 `Bash(...)` 升級。deny 漏判
   （遞迴/根偵測未覆蓋、home env 缺失）只退回 `ask`，絕不誤放行。
 - **新增/修改規則 = 改 `rules/commands/*.ts` → 在 `allowlist.ts` 註冊 → `deno task build`**。
@@ -127,9 +157,9 @@ parse.ts (unbash) → walk.ts → 閘① sleep → 閘② 名稱重定義 → no
 
 **`RuleContext` 可用**：`name`、`argv`(`Word[]`)、`redirects`、`assignments`、`cwd`、
 `resolvePath(word)` / `resolvePathValue(string)`（三態範圍檢查）。靜態取值用 `staticValue(word)`
-（動態回 `null` → 當作不可判定 → ask）。**不要重複處理**中央前置規則已涵蓋的事（cwd 範圍、寫入重導向、賦值前綴、範圍外 `<`）——這四項由中央前置
-統一處理；指令規則雖**先於**中央前置評估，但其 allow/ask 會被中央前置 ask 覆寫（唯一能越過的是 rule deny），
-故規則無論回什麼都不影響這四項的最終結果。
+（動態回 `null` → 當作不可判定 → ask）。**不要重複處理**中央前置規則已涵蓋的事（cwd 範圍、寫入重導向、賦值前綴、範圍外 `<`）。規則雖**先於**
+中央前置評估，但其 allow/ask 會被中央前置 ask 覆寫；能越過的只有 rule deny，以及規則明確宣告
+`cwdIndependent` 且五道護欄全部成立時的**規則一**。規則二/三/四永遠不受規則行為影響。
 
 ### 一律 allowlist 優先於 denylist（寧可 ask，也不要誤放危險指令）
 
@@ -138,10 +168,18 @@ parse.ts (unbash) → walk.ts → 閘① sleep → 閘② 名稱重定義 → no
   只是對未知新形式多問一次（安全方向）。這是本工具的根本取捨——**誤 ask 可接受，誤 allow 不可接受**。
 - **子指令型**（git / gh）：維護「唯讀子指令集合」，集合內才 allow、其餘 ask（見 `git.ts` / `gh.ts`）。
   全域選項同理：未知全域選項一律 ask（見 `git.ts` 的全域選項 allowlist）。
-- **旗標型**：用 `factory.ts` 的 `flagGatedReader`——`askFlags` 命中即 ask、`valueFlags` 正確跳過吃值
-  旗標、`pathValueFlags` 對旗標的路徑值做範圍檢查；位置參數一律 `resolvePath`。
+- **旗標型**：用 `factory.ts` 的 `flagGatedReader`。`askFlags` 兩條路徑都先套用；其餘分成兩種：
+  - **有提供 `spec`（CommandSpec）者**：argv 分類**完全由 spec 決定**，`valueFlags` /
+    `pathValueFlags` 一律不參與。旗標的路徑值靠 `FlagSpec.valueIsPath` 宣告；位置參數是不是路徑
+    靠 `CommandSpec.positionals`（`grep` 未給 `-e`/`-f` 時第一個位置參數是 PATTERN，不做範圍檢查）。
+    **替這類規則新增吃路徑的旗標時，要加在 `FlagSpec` 上並設 `valueIsPath: true`**——加到
+    `pathValueFlags` 不會有任何作用。
+  - **未提供 `spec` 的 legacy 規則**：維持既有行為——`valueFlags` 跳過吃值旗標、`pathValueFlags`
+    對旗標路徑值做範圍檢查、所有位置參數一律 `resolvePath`。
 - **程式內嵌型**（sed / awk）：掃描程式碼，**只在能靜態確認純唯讀時 allow**，任何無法確認的構造 → ask。
 - 動態 token（變數 / `$()` / 可逸出 glob）一律當不可判定 → ask，不要臆測其展開結果。
+  **唯一例外**：`gh api` 的 endpoint 操作元容忍「單一 `?` 查詢串」形態（見 `word.ts` 的
+  `nonPathStaticValue`），因為本工具的判定完全不讀該 token 的內容。
 
 ## ⚠️ 不要再犯的問題
 
@@ -177,8 +215,25 @@ parse.ts (unbash) → walk.ts → 閘① sleep → 閘② 名稱重定義 → no
   未知的全域選項一律 ask；危險者（`-c <非安全config 如 diff.external/core.pager/*.textconv>`、
   `--exec-path`、`--config-env`、讀取子指令的 `--output=`、`git grep -O`、`--ext-diff`）明確 ask。
   新增 git/gh 形式時沿用 allowlist 思維。
-- **吃路徑值的 flag 要 scope-check 其值**：`grep -f <patternfile>`、`diff --from-file=<file>` 的
-  值是會被讀取的路徑，必須 `resolvePath`（見 `factory.ts` 的 `pathValueFlags`），不能只當 flag 跳過。
+- **gh 已改為旗標 allowlist**：未知旗標一律 ask（同時免疫 gh 版本漂移）。本機副作用旗標
+  `-w`/`--web`（開瀏覽器）與 `--cache`（寫本機快取）對所有子指令一律 ask。非 GET 方法與寫入 body
+  的偵測在 `gh.ts` 的 `parseGh` 內以**旗標感知解析**進行（不再是獨立的 `ghApiMutates`），群集寫法
+  （`-iXPOST`）與**子指令之前的旗標**（`gh -XPOST api …`）同樣攔下。`gh api` 的 endpoint 含
+  `{owner}`/`{repo}`/`{branch}` 時目標由 cwd 的 git repo 決定 → 不得享有 cwd 豁免（一般判定不變）。
+- **`nonPathStaticValue`**：只容忍「單一 `?` 查詢串」形態（恰一個未跳脫 `?`、不在索引 0、其後不含 `/`）
+  且**無 `parts`**（整個 word 皆未加引號）的 token，且**只可用於 `gh api` 的 endpoint 操作元**。
+  安全性由「本工具的判定完全不讀該 token 內容」保證——`gh.ts` 的 `parseGh` 只由**旗標**決定
+  HTTP 方法與副作用，不讀 endpoint 路徑。另兩道護欄：元字元須落在第一個 `/` 之後；被救回的
+  endpoint 不得含 `{` / `}`（`?` 可展開成它們而形成 cwd 佔位符）。
+  旗標、旗標值、任何路徑、以及 **`curl` 的所有 token** 一律沿用 `staticValue`：`curl` 的判定會比對
+  preapproved 的 **path 前綴**（`matchesPreapproved`），展開會改變判定，故 `curl` 不套用寬鬆取值。
+- **吃路徑值的 flag 要 scope-check 其值**：其值是會被讀取的路徑，必須做範圍檢查
+  （`RuleContext.resolvePathValue`），不能只當 flag 跳過。**宣告位置依該規則走哪條路徑而不同**：
+  - 走 `CommandSpec` 者（`grep`/`egrep`/`fgrep`、`head`、`wc`、`tail`）寫在 `FlagSpec` 上、
+    設 `valueIsPath: true`（例：`grep -f <patternfile>`、`grep --exclude-from=<file>`、
+    `wc --files0-from=<file>`）。加到 `pathValueFlags` **不會有任何作用**。
+  - 走 legacy 路徑者（`diff`、`realpath` 等）仍用 `factory.ts` 的 `pathValueFlags`
+    （例：`diff --from-file=<file>`、`realpath --relative-to=<dir>`）。
 - **gh api 寫入偵測要含黏寫形式**：`-X POST`、`--method=DELETE`、`-f`/`-F`/`--field`/`--input`，以及
   黏寫 `-fname=x`/`-FKEY=@file`/`-XPATCH` 都代表寫入請求 → ask。
 - **sed/awk 程式碼會寫檔/執行**：即使無 `-i`，腳本內 `w`/`e`/`s///w`（sed）、`print >`/`system()`/
