@@ -223,12 +223,14 @@ Deno.test("canonicalizeExecPath: bare command name unchanged", () => {
 });
 
 Deno.test("canonicalizeExecPath: folds middle // and removes . segment", () => {
-  assertEquals(canonicalizeExecPath("/a//b/c", null), "/a/b/c");
-  assertEquals(canonicalizeExecPath("/a/./b", null), "/a/b");
+  // 首段刻意用多字母：單字母首段（/a）在 Windows 會被 normalizeAbsolute 正規化成
+  // 磁碟形式（A:/），那是刻意行為，與本測試要驗的 // 折疊、. 移除無關。
+  assertEquals(canonicalizeExecPath("/dir//b/c", null), "/dir/b/c");
+  assertEquals(canonicalizeExecPath("/dir/./b", null), "/dir/b");
 });
 
 Deno.test("canonicalizeExecPath: home unavailable still normalizes non-tilde paths", () => {
-  assertEquals(canonicalizeExecPath("/a//b", null), "/a/b");
+  assertEquals(canonicalizeExecPath("/dir//b", null), "/dir/b");
 });
 
 Deno.test("canonicalizeExecPath: expands ~ and ~/x when home known", () => {
@@ -248,7 +250,7 @@ Deno.test("canonicalizeExecPath: .. segment left literal (symlink safety)", () =
 });
 
 Deno.test("canonicalizeExecPath: '..' inside a filename is not a .. segment", () => {
-  assertEquals(canonicalizeExecPath("/a//foo..bar", null), "/a/foo..bar");
+  assertEquals(canonicalizeExecPath("/dir//foo..bar", null), "/dir/foo..bar");
 });
 
 Deno.test("canonicalizeExecPath: leading // (UNC) left literal", () => {
@@ -270,7 +272,7 @@ Deno.test("canonicalizeExecPath: relative stays relative, folds //", () => {
 });
 
 Deno.test("canonicalizeExecPath: preserves trailing slash (directory boundary)", () => {
-  assertEquals(canonicalizeExecPath("/a/scripts/", null), "/a/scripts/");
+  assertEquals(canonicalizeExecPath("/dir/scripts/", null), "/dir/scripts/");
 });
 
 Deno.test("canonicalizeExecPath: leading ./ kept literal (path-exec vs PATH-lookup)", () => {
