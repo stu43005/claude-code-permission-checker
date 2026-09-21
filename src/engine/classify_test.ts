@@ -443,3 +443,86 @@ Deno.test("find's hard deny needs a real root; /tmp is only an ask", () => {
   assertEquals(decide("cd /tmp && find / -name x").verdict, "deny");
   assertEquals(decide("cd / && find . -name x").verdict, "deny");
 });
+
+Deno.test("every declaring command takes the exemption in its read-only form", () => {
+  const cases = [
+    "head -100", "wc -l", "tail -200", "grep -E 'Retry'",
+    "sed -n '600,750p'", "jq -r '.name'",
+    "gh api repos/o/r/tags?per_page=50", "gh search code x --language go",
+    "echo hi", "pwd", "whoami",
+  ];
+  for (const c of cases) {
+    assertEquals(decide(`cd /tmp && ${c}`).verdict, "allow", c);
+  }
+});
+
+Deno.test("curl takes the exemption for a quoted allowed URL", () => {
+  // classify_test.ts 既有的 webFetchRulesOf 提供 WebFetch 網域規則；
+  // api.example.com 是該檔既有測試使用的網域（api.github.com 不在 preapproved 清單內）
+  const rules = webFetchRulesOf({ allow: ["WebFetch(domain:api.example.com)"] });
+  assertEquals(
+    evaluate("cd /tmp && curl -s 'https://api.example.com/repos/o/r'", ROOT, START, rules).verdict,
+    "allow",
+  );
+  // 未加引號的 `?` → curl 不套用寬鬆取值 → ask
+  assertEquals(
+    evaluate("cd /tmp && curl -s https://api.example.com/repos/o/r?x=1", ROOT, START, rules).verdict,
+    "ask",
+  );
+  // 範圍外的 -H @file 以真實 cwd 檢查 → ask
+  assertEquals(
+    evaluate("cd /tmp && curl -s -H @../h.txt 'https://api.example.com/x'", ROOT, START, rules).verdict,
+    "ask",
+  );
+  // 網域未放行 → ask（確認上面的 allow 真的來自網域規則，不是碰巧）
+  assertEquals(
+    evaluate("cd /tmp && curl -s 'https://not-allowed.test/x'", ROOT, START, rules).verdict,
+    "ask",
+  );
+});
+
+Deno.test("the same seven with a path operand or path flag still ask", () => {
+  const cases = [
+    "head -100 a.txt", "wc -l a.txt", "tail -200 a.txt", "grep pat a.txt",
+    "sed -n '1p' a.txt", "jq -r '.name' a.json",
+    "wc --files0-from=list", "grep --exclude-from=f pat", "jq -f prog.jq",
+    "jq -L mods '.'", "sed -nfprog.sed p",
+    "gh pr diff", "gh repo view", "gh api 'repos/{owner}/{repo}/issues'",
+    "gh search code x --web", "gh api x --cache 1h", "gh api x --totally-unknown",
+    "head --totally-unknown", "grep --totally-unknown pat", "sed --totally-unknown 'p'",
+  ];
+  for (const c of cases) {
+    assertEquals(decide(`cd /tmp && ${c}`).verdict, "ask", c);
+  }
+});
+
+Deno.test("the baseline pipeline shapes now allow end to end", () => {
+  assertEquals(
+    decide("cd /tmp && gh api repos/o/r/contents/pkg?ref=v1 | jq -r '.[].name'").verdict,
+    "allow",
+  );
+  assertEquals(
+    decide("cd /tmp && gh api repos/o/r/x -H 'Accept: application/vnd.github.raw' 2>&1 | grep -A 10 -B 2 -E 'Retry|backoff'").verdict,
+    "allow",
+  );
+  assertEquals(decide("cd /tmp && gh api repos/o/r/x 2>&1 | wc -l").verdict, "allow");
+  assertEquals(decide("cd /tmp && gh api repos/o/r/x 2>&1 | sed -n '600,750p'").verdict, "allow");
+  assertEquals(decide("cd /tmp && gh api repos/o/r/tags?per_page=50 | head -100").verdict, "allow");
+  assertEquals(decide("cd /tmp && gh api repos/o/r/x 2>&1 | tail -200").verdict, "allow");
+});
+
+Deno.test("expansion invariance holds through the cwd exemption, not just evaluate", () => {
+  // 原 token 與其任一展開結果，在「鏈內 cd 到專案外」的完整判定下必須一致
+  const base = evaluate("cd /tmp && gh api repos/o/r/tags?per_page=50", ROOT, START).verdict;
+  assertEquals(base, "allow");
+  for (const ch of ["X", "-", "_", ".", "{", "}", "$", ";", " "]) {
+    assertEquals(
+      evaluate(`cd /tmp && gh api 'repos/o/r/tags${ch}per_page=50'`, ROOT, START).verdict,
+      base,
+      ch,
+    );
+  }
+  // 大括號是唯一例外，且兩側都必須 ask —— 原 token 因護欄 ask、展開結果因佔位符不豁免
+  assertEquals(evaluate("cd /tmp && gh api repos/o/r/x?owner}", ROOT, START).verdict, "ask");
+  assertEquals(evaluate("cd /tmp && gh api 'repos/o/r/x{owner}'", ROOT, START).verdict, "ask");
+});

@@ -180,3 +180,72 @@ Deno.test("only api and search are cwd-independent", () => {
   assertEquals(ghRule.cwdIndependent!(ctxOf("gh issue list --repo o/r")), false);
   assertEquals(ghRule.cwdIndependent!(ctxOf("gh api x --cache 1h")), false);
 });
+
+/** 以指定目錄為 cwd/root 建立 RuleContext（fixture 用）。 */
+function ctxIn(dir: string, src: string): RuleContext {
+  const cmd = parse(src).commands[0].command as Command;
+  const cwd = { kind: "known", path: dir } as const;
+  return {
+    name: "gh",
+    argv: cmd.suffix,
+    redirects: cmd.redirects,
+    assignments: cmd.prefix,
+    cwd,
+    resolvePath: (w) => resolvePath(w, cwd, rootScope(dir)),
+    resolvePathValue: (x) => resolvePathValue(x, cwd, rootScope(dir)),
+    resolveUrl: () => "not-allowed",
+    isDangerousRoot: (w) => dangerousRoot(w, cwd, null),
+  };
+}
+
+Deno.test("gh api verdict does not depend on cwd filesystem contents", async () => {
+  // cwd 與專案根刻意設成同一個暫存目錄：本測試要隔離的唯一變因是「檔案存不存在」，
+  // 路徑範圍不是受測對象（範圍行為由 classify_test.ts 的整合測試涵蓋）。
+  const dir = (await Deno.makeTempDir()).replace(/\\/g, "/");
+  const src = "gh api repos/o/r/tags?per_page=50";
+  try {
+    const before = ghRule.evaluate(ctxIn(dir, src)).kind;
+    // 建立一個「把 ? 換成單一字元」後可匹配的檔案
+    await Deno.mkdir(`${dir}/repos/o/r`, { recursive: true });
+    await Deno.writeTextFile(`${dir}/repos/o/r/tagsXper_page=50`, "");
+    const after = ghRule.evaluate(ctxIn(dir, src)).kind;
+    assertEquals(before, after);
+    assertEquals(after, "allow");
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test("every single-character expansion of the endpoint yields the same verdict", () => {
+  const base = v("gh api repos/o/r/tags?per_page=50");
+  assertEquals(base, "allow");
+  // `?` 在 bash 中可展開成「除 `/` 外的任一字元」。逐一列舉不可行，故取**每個字元類**
+  // 的代表：英數、連字號與底線（常見檔名字元）、點、空白、shell 元字元、引號、非 ASCII，
+  // 外加大括號。
+  //
+  // 大括號**必須**納入且必然安全：佔位符是完整的 `{owner}` / `{repo}` / `{branch}`，
+  // 需要左右各一個大括號；而被救回的 endpoint 原本就不得含任何大括號（護欄會先 ask），
+  // 單一 `?` 的展開至多只能新增**一個**大括號字元，湊不出佔位符。
+  const chars = ["X", "x", "9", "-", "_", ".", " ", "&", ";", "|", "$", "*", "'", '"', "中", "{", "}"];
+  for (const ch of chars) {
+    // 以單引號包住整個 endpoint，確保測試餵進去的是「展開後的字面值」本身，
+    // 不會又被 parser 當成新的 glob 或 shell 結構。
+    const src = `gh api 'repos/o/r/tags${ch === "'" ? "" : ch}per_page=50'`;
+    if (ch === "'") continue; // 單引號本身以雙引號包覆另測
+    assertEquals(v(src), base, ch);
+  }
+  assertEquals(v(`gh api "repos/o/r/tags'per_page=50"`), base, "single quote");
+});
+
+Deno.test("multiple expanded endpoints are a gh usage error, never a write", () => {
+  // 兩個位置操作元：gh 自己會報錯；本工具的判定仍是 allow（GET、無寫入旗標）
+  assertEquals(v("gh api repos/o/r/tagsXq=1 repos/o/r/tagsYq=1"), "allow");
+});
+
+Deno.test("an endpoint that could expand into a placeholder is rejected up front", () => {
+  // `repos/o/r/x?owner}` 展開可得 `repos/o/r/x{owner}` → 含 cwd 佔位符。
+  // 原 token 與其展開結果的豁免判定必須一致，故原 token 直接 ask。
+  assertEquals(v("gh api repos/o/r/x?owner}"), "ask");
+  assertEquals(v("gh api repos/o/r/x{owner}"), "allow"); // 展開結果本身：一般判定不變
+  assertEquals(ghRule.cwdIndependent!(ctxOf("gh api repos/o/r/x{owner}")), false);
+});
