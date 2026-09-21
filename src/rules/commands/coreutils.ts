@@ -11,7 +11,7 @@ import { exact, type FlagMatcher, hasAnyFlag } from "../flags.ts";
 export const fileReaderRule: CommandRule = flagGatedReader({
   names: [
     "cat", "head", "wc", "ls", "stat", "cut", "tr", "column",
-    "cmp", "comm", "md5sum", "sha256sum", "hexdump", "jq", "nl", "fold",
+    "cmp", "comm", "md5sum", "sha256sum", "hexdump", "nl", "fold",
     "basename", "dirname", "realpath", "readlink",
   ],
   // 這些旗標的值是會被讀取的路徑，過去被當一般 flag 跳過而未檢查：

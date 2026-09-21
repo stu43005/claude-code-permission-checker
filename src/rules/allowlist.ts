@@ -7,6 +7,7 @@ import { findRule } from "./commands/find.ts";
 import { dateRule, fileCmdRule, sortRule, treeRule, yqRule } from "./commands/simple-flag.ts";
 import { uniqRule, xxdRule } from "./commands/positional-output.ts";
 import { grepRule, rgRule } from "./commands/grep.ts";
+import { jqRule } from "./commands/jq.ts";
 import { gitRule } from "./commands/git.ts";
 import { denoRule } from "./commands/deno.ts";
 import { ghRule } from "./commands/gh.ts";
@@ -30,6 +31,7 @@ const RULES: CommandRule[] = [
   uniqRule,
   grepRule,
   rgRule,
+  jqRule,
   gitRule,
   denoRule,
   ghRule,
