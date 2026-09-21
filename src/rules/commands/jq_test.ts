@@ -121,6 +121,16 @@ Deno.test("a filter that loads modules reads files relative to cwd", () => {
   assertEquals(v("jq -r '.name'"), "allow");
 });
 
+Deno.test("a filter using modulemeta reads a module file", () => {
+  // 實測（jq 1.8.1）：`jq -n '"homemod" | modulemeta'` 在完全沒有 -L 的情況下
+  // 讀到了 ~/.jq/homemod.jq 並印出其 metadata → 預設搜尋路徑即可觸及專案外
+  assertEquals(v(`jq -n '"m" | modulemeta'`), "ask");
+  assertEquals(jqRule.cwdIndependent!(ctxOf(`jq -n '"m" | modulemeta'`)), false);
+  // 一般 filter 不受影響
+  assertEquals(v("jq -r '.name'"), "allow");
+  assertEquals(jqRule.cwdIndependent!(ctxOf("jq -r '.name'")), true);
+});
+
 Deno.test("jq cwdIndependent requires zero inputs and no path flag", () => {
   assertEquals(jqRule.cwdIndependent!(ctxOf("jq -r '.name'")), true);
   assertEquals(jqRule.cwdIndependent!(ctxOf("jq -r '.name' a.json")), false);

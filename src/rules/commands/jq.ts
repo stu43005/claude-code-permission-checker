@@ -173,11 +173,14 @@ function doScan(ctx: RuleContext): JqScan {
  * filter 是否含會讀檔的模組構造。
  * `include "m" {search:"."};` 與 `import "m" as $x {search:"."};` 會以 cwd（或 search
  * 指定的目錄）為基準載入 `m.jq` —— 實測 `jq -n 'include "secret" {search:"."}; s'`
- * 確實讀到並輸出了 ./secret.jq 的內容。本工具無法靜態確認其目標落在專案內，故一律 ask。
- * 採保守詞法比對，寧可誤 ask。
+ * 確實讀到並輸出了 ./secret.jq 的內容。
+ * `modulemeta` 同樣會載入模組檔：實測 `jq -n '"homemod" | modulemeta'` 在**完全沒有
+ * `-L`** 的情況下讀到了家目錄下的 `~/.jq/homemod.jq` 並印出其 metadata —— 預設搜尋路徑
+ * 即可觸及專案外，故不能只靠 `-L` 的路徑檢查攔截。
+ * 本工具無法靜態確認其目標落在專案內，故一律 ask。採保守詞法比對，寧可誤 ask。
  */
 function filterReadsModules(filter: string): boolean {
-  return /\b(include|import)\b/.test(filter);
+  return /\b(include|import|modulemeta)\b/.test(filter);
 }
 
 export const jqRule: CommandRule = {
