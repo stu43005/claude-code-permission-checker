@@ -29,6 +29,20 @@ export interface CommandRule {
   /** 此規則涵蓋的指令名（含別名）。 */
   names: string[];
   evaluate(ctx: RuleContext): RuleVerdict;
+  /**
+   * 此次呼叫的安全判定是否與 cwd 無關，需同時滿足：
+   *  (a) 不以 cwd 相對路徑讀取檔案；
+   *  (b) 不隱含以 cwd 為操作對象（如 ls / find 無操作元時作用於 cwd）；
+   *  (c) 安全判定所依據的資訊不取決於 shell 對 cwd 的 glob 展開結果。
+   * (c) 是「判定不依賴展開結果」，不是「不含 glob 元字元」。
+   * 未宣告 = 否（default-deny）。必須為純函式、不得有副作用。
+   */
+  cwdIndependent?(ctx: RuleContext): boolean;
+  /**
+   * 此次呼叫是否僅含一種非靜態 token：本工具的判定完全不讀其內容的操作元
+   * （目前只有 gh api 的 endpoint）。其餘 token 必須皆為靜態。必須為純函式。
+   */
+  toleratesNonStaticOperand?(ctx: RuleContext): boolean;
 }
 
 /** 便利建構子。 */
