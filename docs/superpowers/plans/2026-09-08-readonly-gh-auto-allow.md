@@ -607,7 +607,9 @@ scan. Adding path-valued flags to `fileReaderRule` therefore downgrades an exist
 of `deny` (recursing from the filesystem root). Reorder so the deny always wins:
 
 The complete replacement for `flagGatedReader`'s `evaluate` — the only change is that the
-recursive-deny block moved above `checkPathValueFlags`:
+recursive-deny block moved above `checkPathValueFlags`. Keep using the existing
+`const valueFlags = opts.valueFlags ?? [];` binding declared just above the returned object;
+re-deriving it inline would leave that declaration unused and fail `deno task lint`:
 
 ```ts
     evaluate(ctx: RuleContext): RuleVerdict {
@@ -626,7 +628,7 @@ recursive-deny block moved above `checkPathValueFlags`:
       }
       const pathFlagVerdict = checkPathValueFlags(ctx, opts.pathValueFlags ?? []);
       if (pathFlagVerdict) return pathFlagVerdict;
-      for (const arg of positionals(ctx.argv, opts.valueFlags ?? [])) {
+      for (const arg of positionals(ctx.argv, valueFlags)) {
         const scope = ctx.resolvePath(arg);
         if (scope !== "in-project") {
           return ask(`${ctx.name}：路徑超出專案範圍或無法靜態解析（${arg.value}）`);
