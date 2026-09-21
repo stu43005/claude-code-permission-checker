@@ -67,3 +67,72 @@ export function staticValue(word: Word): string | null {
   // 有 parts → 沿用 unbash 的 value（引號內反斜線已正確保留）。
   return word.parts ? word.value : removeBackslashEscapes(word.value);
 }
+
+/** 回傳第一個未跳脫 glob 元字元（`*` `?` `[`）的索引；無則回 -1。 */
+export function firstGlobMetacharIndex(value: string): number {
+  for (let i = 0; i < value.length; i++) {
+    const c = value[i];
+    if (c === "\\") { i++; continue; } // 跳過被跳脫的字元
+    if (c === "*" || c === "?" || c === "[") return i;
+  }
+  return -1;
+}
+
+/**
+ * 「單一 `?` 查詢串」形態：三項全部成立才容忍。
+ *  1. 未跳脫的 glob 元字元恰好一個，且該字元是 `?`（`*` / `[` 一律不容忍）；
+ *  2. 該 `?` 不在索引 0 —— 字面前綴非空，故展開結果不可能以 `-` 開頭、不會變成旗標；
+ *  3. 該 `?` 之後的子字串不含 `/` —— 等價於「`?` 位於最後一個 `/` 之後」，
+ *     故所有前段路徑都落在字面前綴內。
+ */
+function isSingleQueryGlob(value: string): boolean {
+  const first = firstGlobMetacharIndex(value);
+  if (first <= 0) return false;
+  if (value[first] !== "?") return false;
+  const rest = value.slice(first + 1);
+  if (firstGlobMetacharIndex(rest) !== -1) return false;
+  return !rest.includes("/");
+}
+
+/**
+ * `nonPathStaticValue` 的回傳型別。
+ *
+ * 與 `staticValue` 的唯一差異：未加引號、且符合「單一 `?` 查詢串」形態的 token
+ * 不再視為動態，而是回傳一組結構化結果而非單純字串——因為呼叫端（gh）必須另外
+ * 檢查那個被容忍的 `?` 位在哪裡（必須落在 endpoint 的第一個 `/` 之後）。
+ */
+export interface RelaxedOperand {
+  /** bash quote removal 後的值 —— 這是要拿去做語義判定（子指令、佔位符…）的字串。 */
+  value: string;
+  /**
+   * 被容忍的 `?` 在**原始未展開字串**中的索引；該 token 本就靜態（無活躍元字元）時為 -1。
+   * 呼叫端要判斷「元字元位置」時**必須**用這個索引搭配 `raw`，
+   * 不可對 `value` 重跑 `firstGlobMetacharIndex` —— quote removal 已抹除跳脫資訊，
+   * 重掃會把 `a\?b`（活躍 `?`）誤判成無元字元，也會把 `a\?b`（字面 `?`）誤判成活躍。
+   */
+  globIndex: number;
+  /** 原始字串（未做 quote removal），供呼叫端與 globIndex 搭配做位置判定。 */
+  raw: string;
+}
+
+/**
+ * 「本工具的判定完全不讀其內容」的操作元專用靜態取值。
+ * 與 staticValue 的唯一差異：未加引號、且符合「單一 `?` 查詢串」形態的 token
+ * 不再視為動態。`*` / `[` / 多重元字元 / `?` 後含 `/` 一律回 null。
+ *
+ * **目前唯一合法用途是 `gh api` 的 endpoint 操作元**——gh api 的判定只掃描旗標、
+ * 完全不讀 endpoint 路徑，故展開結果不影響判定。路徑、旗標、旗標值，以及 curl 的
+ * 任何 token（其判定會比對 preapproved 的 path 前綴）一律不得使用本函式。
+ */
+export function nonPathStaticValue(word: Word): RelaxedOperand | null {
+  const strict = staticValue(word);
+  if (strict !== null) return { value: strict, globIndex: -1, raw: word.value };
+  // 有 parts（含任何引號片段）→ 一律拒絕。word.value 是 quote-removed 的串接，
+  // 引號內的反斜線與 shell 跳脫已無法區分，逐字掃描會誤判哪些元字元是活的。
+  if (word.parts) return null;
+  // 無 parts = 整個 word 皆為未加引號字面值：firstGlobMetacharIndex 本身處理跳脫，
+  // 故在原字串上判形態並記下位置，再回傳 bash quote removal 後的值。
+  const raw = word.value;
+  if (!isSingleQueryGlob(raw)) return null;
+  return { value: removeBackslashEscapes(raw), globIndex: firstGlobMetacharIndex(raw), raw };
+}
