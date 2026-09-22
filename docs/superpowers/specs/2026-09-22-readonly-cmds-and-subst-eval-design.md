@@ -64,6 +64,7 @@ parse → walk ─┬─ applyCd ── 新增：staticValue 失敗時改試 eva
 | 檔案 | 職責 |
 |---|---|
 | `src/engine/subst_eval.ts` | command substitution 靜態求值框架：`SubstEvaluator` 註冊表 + `evalSubstitutionWord` |
+| `src/rules/commands/base64.ts` | base64 規則（獨立，不得併入 `fileReaderRule`——理由見元件四） |
 | `src/rules/commands/cygpath.ts` | cygpath 指令規則 |
 | `src/rules/commands/test.ts` | `test` 規則 |
 | `src/rules/commands/npm.ts` | npm 子指令 allowlist |
@@ -74,8 +75,7 @@ parse → walk ─┬─ applyCd ── 新增：staticValue 失敗時改試 eva
 |---|---|
 | `src/engine/cwd.ts` | `applyCd` 取值改為「先 `staticValue`，失敗再試 `evalSubstitutionWord`」；`cd -` / `cd ~` 語義修正 |
 | `src/engine/classify.ts` | `centralPreflightAsk` 規則一擴充 `unknown` 分支 |
-| `src/rules/commands/coreutils.ts` | `base64` 併入 `fileReaderRule.names`；`-w`/`--wrap` 加入 `valueFlags` |
-| `src/rules/allowlist.ts` | 註冊三條新規則 |
+| `src/rules/allowlist.ts` | 註冊四條新規則（`coreutils.ts` 不動） |
 | `CLAUDE.md` | 同步管線、不變量與已接受限制 |
 
 ## 元件一：求值框架（`src/engine/subst_eval.ts`）
@@ -95,14 +95,25 @@ export function evalSubstitutionWord(word: Word, cwd: CwdState): string | null;
 
 全部滿足才求值，任一不成立回 `null`（→ cwd unknown → 由規則一 ask）：
 
-1. word 的 parts 恰為一個 `CommandExpansion`，不與任何字面文字混合（排除
-   `"$(cygpath -u 'D:/x')/sub"` 這類混合形態）。
-2. 內層 `Script` 恰含一個 `Statement`、其 `command` 為單一 `Command`；有 pipeline、`&&`/`;`、
+1. word 的 `parts` 恰為一個 `DoubleQuoted`，且該 `DoubleQuoted.parts` 恰為一個
+   `CommandExpansion`。實測本專案解析器：`cd "$(cygpath -u 'D:/proj')"` 為此形；
+   混合形態的 `DoubleQuoted.parts` 會是 `[CommandExpansion, Literal]`
+   （`cd "$(echo foo)/sub"`）或 `[Literal, CommandExpansion]`（`cd "pre$(echo foo)"`），
+   兩者皆排除。
+2. **未加引號的 substitution 一律不求值**，即使其 `parts` 恰為一個 `CommandExpansion`
+   （`cd $(echo foo)` 即為此形）。理由：bash 對未加引號的展開結果施以 word splitting 與
+   空值移除，語義與「求值成單一字串」不同——`cd $(echo -n)` 展開後是**零個參數**，
+   實際執行的是 `cd`（無參數 → `$HOME`），而非 cd 到空字串。求值成空字串再交給
+   `applyPath` 會得到「cwd 不變」，與真實行為相反。
+3. 內層 `Script` 恰含一個 `Statement`、其 `command` 為單一 `Command`；有 pipeline、`&&`/`;`、
    控制流、重導向或賦值前綴一律不求值。
-3. 指令名靜態且命中註冊表。
-4. 所有 argv 皆靜態（`staticValue` 非 null）。
-5. 註冊的求值器回非 null。
-6. 求值結果不含換行字元（多行輸出用作 cd 目標無意義，保守放棄）。
+4. 指令名靜態且命中註冊表。
+5. 所有 argv 皆靜態（`staticValue` 非 null）。
+6. 註冊的求值器回非 null。
+7. 求值結果不含換行字元（多行輸出用作 cd 目標無意義，保守放棄）。
+8. 求值結果非空字串。空字串沒有任何安全的解釋：`applyPath` 會把它接成「cwd 不變」，
+   而 bash 在加引號時是 cd 到空字串（失敗、cwd 不變）、未加引號時是 cd 到 `$HOME`。
+   統一回 `null`。
 
 ### 註冊成員與各自的求值邊界
 
@@ -122,10 +133,15 @@ POSIX 路徑，兩者不可混同）。
 `applyPath` 隨即呼叫 `normalizeAbsolute`，`D:/x`、`D:\x`、`/d/x` 在 Windows 上會正規化成同一字串，
 故不需實作實際的字元轉換。`-a` 額外要求 cwd 為 known（相對路徑以 cwd 展開）。
 
-不可求值旗標（回 `null`）：`-d`、`-t dos`、`-s`（皆為 DOS 8.3 短名，需查檔案系統）、`-M`、
-`-D`/`-H`/`-O`/`-P`/`-S`/`-W`/`-F`/`-A`（輸出系統目錄）、`-f`/`-o`（讀檔取操作元）、
-`-p`（PATH 列表語義）、`-l`（長名，對既有短名路徑需查檔案系統）、`-r`（`\\?\` 前綴，
-`normalizeAbsolute` 不保證等價）。未知旗標亦回 `null`。
+不可求值旗標（回 `null`）：
+
+- 查檔案系統：`-d`、`-t dos`、`-s`（DOS 8.3 短名）、`-l`（長名還原）、`-M`（binary/text）
+- 輸出與輸入無關：`-D`/`-H`/`-O`/`-P`/`-S`/`-W`/`-F`/`-A`
+- 讀檔取操作元／選項：`-f`、`-o`
+- 輸出形式與 `normalizeAbsolute` 不保證等價：`-U`（`/proc/cygdrive/…`）、`-r`（`\\?\…`）、
+  `-p`（PATH 列表，非單一路徑）
+
+未知旗標亦回 `null`。
 
 操作元必須恰為一個。
 
@@ -183,6 +199,15 @@ val === null → UNKNOWN
 - `cd -`：回上一個工作目錄，靜態不可知 → `UNKNOWN`
 - `cd ~` / `cd ~/<rest>`：home 已知時解析為 home（或 home + rest），home 未知 → `UNKNOWN`
 
+**tilde 展開必須依 word 結構判定，不能只看結果字串。** 實測本專案解析器：`cd ~` 的 word
+`value` 為 `"~"`、`parts` 為**空陣列**（純字面）；而 `cd "~"` 的 `value` 同樣是 `"~"`、
+`parts` 為 `["DoubleQuoted"]`。兩者字串相同但 bash 語義相反——引號會抑制 tilde expansion，
+`cd "~"` 是進入名為 `~` 的相對子目錄。因此：
+
+- **僅當 `parts` 為空**（未加引號的純字面 token）時才展開 `~`
+- `parts` 非空（引號包裝、或由 substitution 產生的字面 `~`）時**維持既有相對路徑語義**
+  （`<cwd>/~`），該行為對這些情形本就是正確的
+
 （`cd` 無參數已是 `UNKNOWN`，不變。）
 
 ## 元件三：中央前置規則一擴充（`src/engine/classify.ts`）
@@ -199,15 +224,25 @@ val === null → UNKNOWN
 
 ## 元件四：四條 allowlist 規則
 
-### base64（併入 `fileReaderRule`）
+### base64（獨立規則，`src/rules/commands/base64.ts`）
 
-`base64` 加入 `fileReaderRule.names`（與 `md5sum`/`sha256sum`/`hexdump` 同群組：位置參數視為
-要讀取的路徑、做範圍檢查）。同時把 `-w`/`--wrap` 加入該規則的 `valueFlags`。
+**不得併入 `fileReaderRule`。** `base64` 的 `-w`/`--wrap` 吃一個整數值，若把它加進
+`fileReaderRule` 的 `valueFlags`，該設定會套用到該規則的**全部** `names`——而
+GNU `md5sum`/`sha256sum` 的 `-w` 是 `--warn`（不吃值，警告格式錯誤的 checksum 行）。
+屆時 `md5sum -c -w /outside/checksums` 的 `/outside/checksums` 會被 `positionals()` 當成
+value-flag 的值而跳過，失去唯一的路徑操作元、在專案內 cwd 下取得 allow，但 md5sum 實際會讀取
+該外部檔。這是對既有指令的安全回歸。
 
-`-w` 吃一個整數值。未登記為 value-flag 時，`base64 -w 0 f.txt` 的 `0` 會被 `positionals()` 當成
-路徑操作元而 `resolvePath("0")`，造成誤 ask。`--wrap=0` 黏寫形式因以 `-` 開頭本就會被跳過。
+改為獨立規則，以 `CommandSpec` 描述旗標（每個旗標只描述一次、只作用於本規則）：
 
-`base64` 無任何輸出到檔案的旗標，輸出恆為 stdout，故不需新增 `askFlags`。
+- `-d`/`--decode`、`-i`/`--ignore-garbage`：`value: "none"`
+- `-w`/`--wrap`：`value: "required"`（不是路徑，故不設 `valueIsPath`）
+- `positionals: "paths"`：位置參數是要讀取的檔案，做範圍檢查
+
+`base64` 無任何輸出到檔案的旗標，輸出恆為 stdout，故不需 `askFlags`。未知旗標由 `CommandSpec`
+路徑自動 ask。
+
+不宣告 `cwdIndependent`：有路徑操作元時依賴 cwd 解析。
 
 ### test（`src/rules/commands/test.ts`）
 
@@ -256,19 +291,38 @@ val === null → UNKNOWN
 
 ### cygpath（`src/rules/commands/cygpath.ts`）
 
-旗標 allowlist：可安全執行的旗標為求值框架的可求值集合再加上**輸出系統目錄類**——後者雖不可
-靜態求值，但執行本身不寫檔、不執行外部程式，屬唯讀。
+旗標 allowlist，依「是否查詢檔案系統」分為兩類形態，兩類的操作元處理與 cwd 豁免資格不同。
+不分類會產生自相矛盾的契約：既宣告 `cwdIndependent`（跳過中央前置規則一）、又聲稱操作元受規則一
+約束，兩者不可能同時成立。
 
-- allow：`-u`、`-w`、`-m`、`-t <type>`、`-a`、`-C <cp>`、`-i`、`-U`、`-l`、`-r`、`-p`、
-  `-D`、`-H`、`-O`、`-P`、`-S`、`-W`、`-F <id>`、`-A`、`-d`、`-s`、`-M`、`-h`、`-V`
-- ask：`-f`（從檔案／stdin 讀取操作元）、`-o`（從檔案讀取選項）、`-c`（關閉 HANDLE，
-  屬行程管理而非路徑轉換）、任何未知旗標
+注意「可執行 allow」與「可靜態求值」（元件一）是兩個不同的集合，前者是後者的超集：
+`-U`、`-r`、`-p` 不碰檔案系統、執行上安全，但其輸出形式（`/proc/cygdrive/…`、`\\?\…`、
+PATH 列表）無法保證與 `normalizeAbsolute` 等價，故不可用於 cwd 求值。
 
-位置參數不做路徑範圍檢查：cygpath 只做路徑字串轉換，不讀取檔案內容，轉換本身不洩漏路徑以外的
-資訊。（`-s`/`-d`/`-M` 會查詢檔案系統 metadata，但僅回報「能否產生短名」「binary/text」，
-與 `test -e` 同等級，且本規則的操作元仍受中央前置規則一的 cwd 範圍約束。）
+**形態 A — 純字串轉換**（不碰檔案系統）：
+`-u`、`-w`、`-m`、`-t unix|windows|mixed`、`-a`、`-C <cp>`、`-i`、`-U`、`-r`、`-p`、`-h`、`-V`
 
-宣告 `cwdIndependent`：本規則不對操作元做路徑範圍檢查，判定與 cwd 無關。
+- 操作元**不做**路徑範圍檢查：cygpath 在此形態下只做路徑字串的書寫形式轉換，不開檔、不讀內容，
+  也不回報該路徑的任何檔案系統狀態，因此不洩漏「路徑字串本身」以外的資訊——而該字串是使用者
+  自己打進指令的。
+- 宣告 `cwdIndependent`：判定完全不依賴 cwd。
+
+**形態 B — 查詢檔案系統 metadata**：`-d`、`-t dos`、`-s`（8.3 短名，需查檔案系統，
+路徑不存在時 exit 2）、`-l`（長名還原，實測 `cygpath -w -l '/c/PROGRA~1'` → `C:\Program Files`，
+需查檔案系統才能還原；路徑不存在時原樣輸出）、`-M`（回報 binary/text）
+
+- 操作元**必須**做 `resolvePath` 範圍檢查：這些形態會回報專案外路徑的存在性與屬性，
+  與 `test -e` 同等級的資訊洩漏。
+- **不宣告** `cwdIndependent`：相對路徑操作元依賴 cwd 解析。
+
+**形態 C — 輸出系統目錄**（不吃路徑操作元）：`-D`、`-H`、`-O`、`-P`、`-S`、`-W`、`-F <id>`、`-A`
+
+- 輸出與輸入無關，不接受路徑操作元；allow，並宣告 `cwdIndependent`。
+
+**一律 ask**：`-f`（從檔案／stdin 讀取操作元）、`-o`（從檔案讀取選項）、`-c`（關閉 HANDLE，
+屬行程管理而非路徑轉換）、任何未知旗標。
+
+`cwdIndependent` 以述詞形式實作（依本次呼叫的旗標動態判定），形態 B 出現時回 false。
 
 ## 錯誤處理
 
@@ -281,17 +335,25 @@ val === null → UNKNOWN
 
 ## 測試策略
 
-- **求值框架層**（`subst_eval_test.ts`）：混合 word、pipeline／多 statement、重導向、賦值前綴、
-  動態 argv、未註冊指令名、含換行的求值結果——各自回 `null`。
+- **求值框架層**（`subst_eval_test.ts`）：以下各自回 `null`——混合 word
+  （`"$(echo foo)/sub"`、`"pre$(echo foo)"`）、**未加引號的 substitution**（`$(echo foo)`）、
+  pipeline／多 statement、重導向、賦值前綴、動態 argv、未註冊指令名、含換行的求值結果、
+  **空字串求值結果**（`"$(echo -n)"`）。正面案例：`"$(cygpath -u 'D:/proj')"` 求出路徑。
 - **各求值器語義**：依「查證依據」節的實測對照表逐項斷言，含 `cygpath -d`/`-s`/`-t dos` 回 `null`、
   `echo` 操作元含反斜線回 `null`、`printf` 純字面含反斜線回 `null`。
   cygpath 求值器的平台相關斷言用 `Deno.test({ ignore: Deno.build.os !== "windows", … })` 區分。
-- **cwd 層**（`cwd_test.ts`）：`cd "$(cygpath -u '<專案內>')"` 推導出正確 cwd；`cd -`、`cd ~`、
-  `cd ~/x` 的新語義。
+- **cwd 層**（`cwd_test.ts`）：`cd "$(cygpath -u '<專案內>')"` 推導出正確 cwd；
+  `cd -` → unknown；`cd ~`、`cd ~/x` 展開 home（home 未知時 unknown）；
+  `cd "~"` **不**展開、維持 `<cwd>/~`。
 - **classify 層**：unknown cwd → 不可升級 ask（含「`permissions.allow` 命中也不升級」的斷言）。
-- **三條新規則**（`cygpath_test.ts`、`test_test.ts`、`npm_test.ts`）：allow 與 ask 兩面 + 邊界，
-  複製既有 `ctxOf` helper。
-- **base64**：`base64 -w 0 f.txt` 的 `0` 不被當成路徑；`base64 <專案外檔>` → ask。
+- **另三條新規則**（`cygpath_test.ts`、`test_test.ts`、`npm_test.ts`；base64 另列於下）：
+  allow 與 ask 兩面 + 邊界，複製既有 `ctxOf` helper。cygpath 須分別覆蓋形態 A／B／C：
+  形態 B（`-d`/`-s`/`-l`/`-M`/`-t dos`）帶專案外操作元時必須 ask、且不得取得 cwd 豁免。
+- **base64**（`base64_test.ts`）：`base64 -w 0 f.txt` 的 `0` 不被當成路徑；`base64 --wrap=0 f.txt`
+  同理；`base64 <專案外檔>` → ask；未知旗標 → ask。
+- **`-w` 不得外溢的迴歸測試**：`md5sum -c -w /outside/checksums` 必須 ask
+  （`-w` 在 md5sum 是不吃值的 `--warn`，其後的路徑仍是操作元）。此測試釘住「base64 的旗標
+  arity 不影響 `fileReaderRule` 其他成員」這條不變量。
 - **e2e**（`main_test.ts`）：本次四條真實指令。
 - **operational verification**：`deno task build` 後餵 JSON 給 binary，確認安全形式 allow、
   危險形式 ask。
@@ -304,7 +366,8 @@ val === null → UNKNOWN
 ### cygpath（`cygpath (cygwin) 3.6.7`）
 
 輸出完全由輸入字串決定：`-u`（→POSIX）、`-w`（→Windows 反斜線）、`-m`（→Windows 正斜線）、
-`-U`、`-l`、`-r`、`-C CP`、`-a`（以行程 cwd 展開相對路徑）、`-t unix|windows|mixed`。
+`-U`（→`/proc/cygdrive/…`）、`-r`（→`\\?\…`）、`-p`（PATH 列表逐項轉換）、`-C CP`、
+`-a`（以行程 cwd 展開相對路徑）、`-t unix|windows|mixed`。
 
 需查檔案系統或輸出與輸入無關：
 
@@ -312,6 +375,8 @@ val === null → UNKNOWN
   （exit 0）；`cygpath -d '/d/nonexistent-xyz-12345'` → `cygpath: cannot create short name of
   D:\nonexistent-xyz-12345`、**exit 2**。`-t dos` 行為相同。
   （`-d` 的 help 文字為 `print DOS (short) form of NAMEs`，易被誤讀成單純格式轉換。）
+- `-l`：長名還原，需查檔案系統。實測 `cygpath -w -l '/c/PROGRA~1'` → `C:\Program Files`
+  （exit 0）；對不存在的短名樣式 `cygpath -w -l '/c/NOEXIST~1'` → `C:\NOEXIST~1`（原樣、exit 0）。
 - `-M`：報告檔案 mode（binary/text），路徑不存在時不報錯、預設印 `binary`。
 - `-D`/`-H`/`-O`/`-P`/`-S`/`-W`/`-F ID`/`-A`：輸出 Windows 系統目錄，與輸入無關。
 - `-f FILE`/`-o`：從檔案或 stdin 讀取操作元／選項。
@@ -319,6 +384,7 @@ val === null → UNKNOWN
 實測對照：`cygpath -u 'D:/foo'`→`/d/foo`；`cygpath -u 'D:/foo/'`→`/d/foo/`（尾斜線保留）；
 `cygpath -u 'D:\foo\bar'`→`/d/foo/bar`；`cygpath -u 'relative/path'`→`relative/path`（不展開）；
 `cygpath -w /d/foo`→`D:\foo`；`cygpath -m /d/foo`→`D:/foo`；`cygpath -w -r /d/foo`→`\\?\D:\foo`；
+`cygpath -u -U 'D:/proj'`→`/proc/cygdrive/d/proj`；`cygpath -u -p 'D:/proj'`→`/d/proj`；
 `cygpath -u -a 'relative/path'`→`<cwd>/relative/path`。
 
 exit code：成功 0、短名建立失敗 2、用法錯誤 1。輸出格式旗標 `-u`/`-w`/`-m`/`-d`/`-t` 互斥；
@@ -374,7 +440,8 @@ invocation。`test` 與 `[` 皆為純述詞：只讀檔案 metadata 與變數狀
 
 ### npm CLI（11.13.0 / Node.js 24.16.0）
 
-純讀、無本機寫入／不執行 script／不開瀏覽器：`view`(`v`/`info`/`show`)、`ls`(`list`/`la`/`ll`)、
+不寫入專案目錄、不執行 lifecycle script、不開瀏覽器（**但所有 npm 呼叫都會寫入 npm 自身的
+cache 與 debug log，見本節末的實測**）：`view`(`v`/`info`/`show`)、`ls`(`list`/`la`/`ll`)、
 `outdated`、`explain`(`why`)、`ping`、`search`、`root`、`prefix`、`whoami`、`config get`(`get`)、
 `pkg get`、`cache ls`、`org ls`、`team ls`、`profile get`、`owner ls`、`query`、`help-search`、
 `fund`（不帶 `--browser`）、`audit`（不帶 `fix`；會把依賴清單送到 registry）、`diff`（自 registry
@@ -401,6 +468,14 @@ invocation。`test` 與 `[` 皆為純述詞：只讀檔案 metadata 與變數狀
 
 其他：`npm bin` 在 11.x 已移除；`npm why` 是 `npm explain` 的別名。
 官方文件：<https://docs.npmjs.com/cli/v11/commands/>
+
+**npm 自身的 cache 與 log 寫入（實測）**：即使是純查詢子指令，npm 仍會寫入其 cache 目錄
+（`npm config get cache`，本機為 `D:\.npm-cache`）下的 `_cacache` 與 `_logs`。
+實測一次 `npm view markdown-it version`：`_logs` 目錄新增一個 `*-debug-0.log` 檔，
+且檔案總數由 49 降為 11——npm 同時執行了 log 輪替、**刪除了 38 個舊檔**。
+此位置由 npm 的 effective 設定（`.npmrc` 層級疊加）決定，通常在專案之外，且不受
+`--cache` 以外的旗標影響（阻擋 `--cache` 旗標並不會停用已設定的 cache）。
+對應的設計取捨見「Non-goals / Accepted limitations」。
 
 ## Non-goals / Accepted limitations
 
@@ -435,6 +510,22 @@ invocation。`test` 與 `[` 皆為純述詞：只讀檔案 metadata 與變數狀
 **Rationale**：五道護欄的第 (2) 條要求「hook 傳入的 session cwd 在範圍內**且**當前 cwd 由鏈內
 `cd` 產生（`origin === "chain-cd"`）」，這是豁免的信任起點；unknown 無法確立該起點。放寬等於讓
 「把 cd 目標寫成動態」重新成為繞過管道，與本次堵漏的目的直接抵觸。
+
+### npm 對自身 cache 與 debug log 的寫入不納入判定
+
+**Concern**：本工具的契約是「純唯讀且全部落在專案內」，但實測顯示即使 `npm view` 這類純查詢，
+npm 仍會在其 cache 目錄（本機為 `D:\.npm-cache`，位於專案外）寫入 `_cacache` 與新的
+`*-debug-0.log`，並輪替刪除舊 log（實測一次呼叫刪除 38 個舊檔）。允許 npm 查詢即等於允許這些
+專案外的寫入與刪除。
+
+**Decision**：接受，不實作任何對寫入目的地的驗證。
+
+**Rationale**：npm 管理自己的 cache 與 log 屬於工具的內部管家行為——不觸碰專案檔案、不外洩專案
+內容、不執行任意程式，不是本工具要防的威脅。相對地，若要在放行前確認寫入位置，必須讀取並疊加
+`.npmrc` 的專案／使用者／全域／內建四層設定以求出 effective `cache` 與 `logs-dir`，這與本工具
+「純詞法判定、不碰檔案系統」的核心設計直接衝突，成本與風險都遠高於所防的問題。本限制的前提是
+「npm 的 cache/log 位置由使用者自己的 npm 設定決定」；若日後該前提改變（例如設計上開始容許
+由指令參數指定寫入位置），此豁免不自動延用。
 
 ### npm 子指令範圍限於「registry 元資料 + 本機查詢」
 
