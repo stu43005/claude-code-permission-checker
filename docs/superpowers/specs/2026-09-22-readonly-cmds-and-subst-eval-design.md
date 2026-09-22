@@ -163,6 +163,28 @@ substitution 內層：實測 `cd "$(echo ~/"src")"` 的內層 argv[0] 即為該�
 
 home 未知時（環境變數缺失），支援形態同樣退回不可解析，絕不退回「當成相對路徑」。
 
+### shell home 與 settings home 是兩個不同的值
+
+tilde 展開必須用 **bash 的 home**，即 `HOME` 環境變數——不可沿用既有的 `resolveHome`。
+`src/permissions/settings.ts` 的 `resolveHome` 在 Windows 上**優先 `USERPROFILE`**、
+`HOME` 只是 fallback；而 bash 的 tilde expansion 只看 `HOME`。
+
+兩者在典型 Git Bash 環境下正規化後相同（實測本機 `HOME=/c/Users/A35214`、
+`USERPROFILE=C:\Users\A35214`，經 `normalizeAbsolute` 皆為 `C:/Users/A35214`），但這是環境巧合
+而非保證：Git Bash 允許自訂 `HOME`。兩者不同時會產生具體的誤放行——使用者設了
+`Read(~/cache/**)`（其 `~` 由 `resolveHome` 解為 `USERPROFILE/cache`），而指令 `cat ~/cache/x`
+實際讀的是 `HOME/cache/x`；若展開時誤用 `resolveHome`，就會拿「已授權的 USERPROFILE 路徑」
+去核准「未授權的 HOME 路徑」。
+
+因此：
+
+- **shell home**（本設計的 tilde 展開，含 `cd` 目標與路徑操作元）：只讀 `HOME`；
+  未設定或為空 → 不可解析（`cd` → `UNKNOWN`；路徑操作元 → 超出範圍 → ask）
+- **settings home**（`Read(~/…)` 等權限規則、`<home>/.claude` 的定位）：維持既有 `resolveHome`，
+  語義不變
+
+`HOME` 已在 `deno task build` 的 `--allow-env` 清單中，無需調整編譯權限。
+
 ### 註冊成員與各自的求值邊界
 
 各成員的邊界依據見「查證依據」節。設計原則：**只要輸出可能取決於檔案系統狀態、環境變數、
@@ -251,7 +273,8 @@ val === null → UNKNOWN
 `hasUnquotedLeadingTilde`。`cd` 目標套用該述詞的方式為：
 
 - 命中述詞、`parts` 為空（未加引號的純字面 token）、**且形態為「支援展開的 tilde 形態」之一**
-  → 展開（home 未知時 `UNKNOWN`）。`~user`、`~+`、`~-` 等其餘形態 → `UNKNOWN`
+  → 以 **shell home**（`HOME`）展開（未設定時 `UNKNOWN`）。`~user`、`~+`、`~-` 等其餘形態
+  → `UNKNOWN`
 - 命中述詞、但 `parts` 非空（混合引號形態，如 `cd ~/"src"`）→ `UNKNOWN`。開頭未加引號的 `~`
   會被 bash 展開、後段卻是引號內容；正確模擬需逐 part 重建語義，超出本設計範圍，故保守放棄。
 - 未命中述詞（整體被引號包裝、或由 substitution 產生的字面 `~`）→ **維持既有相對路徑語義**
@@ -419,11 +442,12 @@ PATH 列表）無法保證與 `normalizeAbsolute` 等價，故不可用於 cwd �
 `resolvePath(word, …)` 在解析前先套用 tilde 語義：
 
 - word 命中 `hasUnquotedLeadingTilde`：
-  - 形態屬「支援展開的 tilde 形態」且 home 已知 → **展開為絕對路徑**後再做既有的範圍判定。
+  - 形態屬「支援展開的 tilde 形態」且 **shell home**（`HOME`，見上節）已知 → **展開為絕對路徑**
+    後再做既有的範圍判定。
     展開後通常落在專案外 → `out-of-project` → ask；若使用者以 `Read(~/cache/**)` 之類規則
     明示放寬，展開後會正確命中該範圍而放行——這是修復帶來的附帶正確性。
-  - 其餘形態（`~user`/`~+`/`~-`）或 home 未知 → `out-of-project`。**絕不退回「當成相對路徑」**，
-    那正是漏洞本身。
+  - 其餘形態（`~user`/`~+`/`~-`）或 shell home 未知 → `out-of-project`。
+    **絕不退回「當成相對路徑」**，那正是漏洞本身。
 - 未命中述詞（引號包裝的字面 `~`）→ 既有相對路徑行為不變，該行為本就正確。
 
 `resolvePathValue(value: string, …)` 只拿得到字串、沒有 word 結構，無從判斷引號。因此採
@@ -456,8 +480,12 @@ fail-closed：**字串以 `~` 開頭一律視為超出讀取範圍**。代價是
 - **元件五 tilde 漏洞迴歸**（`scope_test.ts` + e2e）：`cat ~/secret`、`cat ~/.ssh/id_rsa`、
   `grep x ~/secret`、`head -5 ~/secret`、`test -f ~/secret`、`base64 ~/secret` 全部必須 ask
   （這些目前是 allow）；`cat "~/secret"` 必須維持 allow（引號形態指向 `./~/secret`）；
-  `~user`/`~+`/`~-` 形態必須 ask；home 未知時 `~/x` 必須 ask。
+  `~user`/`~+`/`~-` 形態必須 ask；`HOME` 未設定時 `~/x` 必須 ask。
   另驗證附帶正確性：設定 `Read(~/cache/**)` 後 `cat ~/cache/x` 應 allow。
+- **shell home 與 settings home 分離的迴歸測試**：令 `HOME` 與 `USERPROFILE` 指向**不同**目錄、
+  且只有 `USERPROFILE` 那條路徑被 `Read(...)` 允許，則 `cat ~/cache/x` 必須 ask
+  （展開須用 `HOME`）；同一情境下 `Read(~/cache/**)` 規則本身仍須以 `resolveHome`
+  （`USERPROFILE`）解析，語義不變。
 - **各求值器語義**：依「查證依據」節的實測對照表逐項斷言，含 `cygpath -d`/`-s`/`-t dos` 回 `null`、
   `echo` 操作元含反斜線回 `null`、`printf` 純字面含反斜線回 `null`。
   cygpath 求值器的平台相關斷言用 `Deno.test({ ignore: Deno.build.os !== "windows", … })` 區分。
