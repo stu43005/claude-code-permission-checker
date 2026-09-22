@@ -203,6 +203,22 @@ POSIX 路徑，兩者不可混同）。
 `applyPath` 隨即呼叫 `normalizeAbsolute`，`D:/x`、`D:\x`、`/d/x` 在 Windows 上會正規化成同一字串，
 故不需實作實際的字元轉換。`-a` 額外要求 cwd 為 known（相對路徑以 cwd 展開）。
 
+**但這個等價只對磁碟形式路徑成立。** cygpath 會套用 MSYS2 的 mount 表，把虛擬路徑對映到實際
+安裝位置——實測 `cygpath -m /usr/bin` → `C:/Program Files/Git/usr/bin`、
+`cygpath -m /mingw64/bin` → `C:/Program Files/Git/mingw64/bin`，而 `normalizeAbsolute` 不懂
+mount 表。因此操作元必須是下列形態之一，否則回 `null`：
+
+- Windows 磁碟絕對路徑（`X:/…` 或 `X:\…`）
+- MSYS 磁碟形式絕對路徑（`/x` 或 `/x/…`，頂層段恰為單一字母）
+- 相對路徑（實測 `cygpath -u 'relative/path'` → `relative/path` 不變）
+
+其餘以 `/` 開頭者（`/usr`、`/mingw64`、`/tmp`、`/proc/…`）與以 `\` 開頭者
+（Windows 的「當前磁碟機根」語義，與 `applyPath` 的相對路徑處理不符）一律不可求值。
+
+另需拒絕「cygpath 本身會報錯、不輸出路徑」的呼叫：同時給多個互斥的輸出格式旗標
+（`-u`/`-w`/`-m`/`-t` 取多），或 `-C` 的值不是 `ANSI`/`OEM`/`UTF8`。這類情形若照樣回傳操作元，
+等於憑空造出一個實際不存在的 cd 目標。
+
 不可求值旗標（回 `null`）：
 
 - 查檔案系統：`-d`、`-t dos`、`-s`（DOS 8.3 短名）、`-l`（長名還原）、`-M`（binary/text）
@@ -227,6 +243,10 @@ POSIX 路徑，兩者不可混同）。
 可求值形態：`dirname <NAME>`（恰一操作元、無旗標）、`basename <NAME>`、
 `basename <NAME> <SUFFIX>`、`basename -s <SUFFIX> <NAME>`。多操作元（含 `-a`/`--multiple`）與
 `-z`/`--zero`（以 NUL 分隔）一律回 `null`。
+
+**含反斜線的操作元一律回 `null`**：GNU coreutils 在 Windows / Cygwin 上也把 `\` 視為路徑分隔符
+（`dirname 'C:\Windows\System32'` → `C:\Windows`），只處理 `/` 會算成 `.`——而那個錯誤結果會被
+當成 known cwd 用於後續範圍判定。與其算錯，不如放棄。
 
 #### pwd
 
