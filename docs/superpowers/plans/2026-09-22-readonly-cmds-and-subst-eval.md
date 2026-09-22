@@ -190,7 +190,7 @@ git commit -m "feat(engine): add tilde predicate and expansion as a single sourc
 - Modify: `src/engine/scope.ts`（`ScopeConfig`、`buildScopeConfig`、`rootScope`、`resolvePathValue`、`resolvePath`）
 - Modify: `src/engine/evaluate.ts`、`src/engine/classify.ts`（傳遞 `shellHome`）
 - Modify: `src/main.ts`（新增 `shellHomeDir`）
-- Test: `src/engine/scope_test.ts`（追加）
+- Test: `src/engine/scope_test.ts`（追加）、`src/main_test.ts`（追加 `shellHomeDir` 測試）
 
 - [ ] **Step 1: 寫失敗測試**
 
@@ -445,7 +445,8 @@ export function shellHomeDir(env: EnvReader): string | null {
 import { isAbsolute, normalizeAbsolute } from "./engine/scope.ts";
 ```
 
-並在 `src/main_test.ts` 追加直接針對它的測試：
+並在 `src/main_test.ts` 追加直接針對它的測試。該檔目前只 import 了 `homeDir`，
+需改為 `import { homeDir, shellHomeDir } from "./main.ts";`：
 
 ```ts
 Deno.test("shellHomeDir: 只接受絕對路徑的 HOME", () => {
@@ -535,7 +536,7 @@ Expected: PASS。
 Run: `deno task check && deno task lint`
 
 ```bash
-git add src/engine/scope.ts src/engine/scope_test.ts src/engine/evaluate.ts src/engine/classify.ts src/main.ts
+git add src/engine/scope.ts src/engine/scope_test.ts src/engine/evaluate.ts src/engine/classify.ts src/main.ts src/main_test.ts
 git commit -m "fix(engine): expand unquoted leading tilde before scope checks"
 ```
 
@@ -976,11 +977,15 @@ Deno.test("framework: 內層加引號的字面 ~ 可求值（引號抑制展開�
   assertEquals(evalSubstitutionWord(wordOf(`cd "$(echo '~')"`), CWD), "~");
 });
 
-Deno.test("dirname / basename: 含反斜線的操作元不求值", () => {
+Deno.test("dirname / basename: 反斜線與磁碟前綴的操作元不求值", () => {
   // GNU coreutils 在 Windows / Cygwin 上也把 `\` 當分隔符，本實作只處理 `/`；
   // 算錯會把一個錯誤的路徑當成 known cwd 交給後續範圍判定，故寧可放棄求值
   assertEquals(evalSubstitutionWord(wordOf(String.raw`cd "$(dirname 'C:\Windows\System32')"`), CWD), null);
   assertEquals(evalSubstitutionWord(wordOf(String.raw`cd "$(basename 'C:\Windows\System32')"`), CWD), null);
+  // 磁碟前綴：GNU 會保留前綴並禁止從磁碟根移除後綴（`basename C: :` → `C:`），
+  // 而 `/`-only 的字串切法會得到 `C`，被當成專案內的相對目錄
+  assertEquals(evalSubstitutionWord(wordOf(`cd "$(basename 'C:' ':')"`), CWD), null);
+  assertEquals(evalSubstitutionWord(wordOf(`cd "$(dirname 'C:/Windows')"`), CWD), null);
 });
 
 Deno.test("framework: 求值結果含換行 → null（經由真實求值器）", () => {
@@ -1045,12 +1050,16 @@ function basenameOf(value: string, suffix?: string): string {
 }
 
 /**
- * 本實作只處理 `/` 分隔符。GNU coreutils 在 Windows / Cygwin 上也把 `\` 當分隔符
- * （`dirname 'C:\Windows\System32'` → `C:\Windows`），照 `/`-only 邏輯會算成 `.`——
- * 那個錯誤結果會被當成 known cwd 用於後續範圍判定，故含 `\` 的操作元一律放棄求值。
+ * 本實作只處理 POSIX 形態的路徑。兩類操作元一律放棄求值，因為算錯的結果會被當成
+ * known cwd 用於後續範圍判定：
+ *
+ *  1. 含 `\`：GNU coreutils 在 Windows / Cygwin 上也把 `\` 當分隔符
+ *     （`dirname 'C:\Windows\System32'` → `C:\Windows`），照 `/`-only 邏輯會算成 `.`。
+ *  2. 含磁碟前綴（`C:` / `C:/…`）：GNU 在支援磁碟機的平台上會保留該前綴並禁止從磁碟根
+ *     移除後綴（`basename C: :` → `C:`），而 `/`-only 的字串切法會得到 `C`。
  */
-function hasBackslash(value: string): boolean {
-  return value.includes("\\");
+function isUnsupportedPathForm(value: string): boolean {
+  return value.includes("\\") || /^[A-Za-z]:/.test(value);
 }
 
 const dirnameEvaluator: SubstEvaluator = {
@@ -1059,7 +1068,7 @@ const dirnameEvaluator: SubstEvaluator = {
     // 旗標（含 -z/--zero）與多操作元一律放棄：-z 改用 NUL 分隔、多操作元逐行輸出
     if (argv.length !== 1) return null;
     if (argv[0].startsWith("-")) return null;
-    if (hasBackslash(argv[0])) return null;
+    if (isUnsupportedPathForm(argv[0])) return null;
     return dirnameOf(argv[0]);
   },
 };
@@ -1067,7 +1076,7 @@ const dirnameEvaluator: SubstEvaluator = {
 const basenameEvaluator: SubstEvaluator = {
   names: ["basename"],
   evaluate(argv) {
-    if (argv.some(hasBackslash)) return null;
+    if (argv.some(isUnsupportedPathForm)) return null;
     // `basename -s SUFFIX NAME`
     if (argv.length === 3 && argv[0] === "-s") {
       if (argv[2].startsWith("-")) return null;
@@ -2367,11 +2376,18 @@ Deno.test("npm: 版本後綴也必須合法（否則是本地目錄 spec）", ()
   assertEquals(npmRule.evaluate(ctxOf('npm view "pkg@^1.2.3"')).kind, "allow");
   assertEquals(npmRule.evaluate(ctxOf('npm view "pkg@>=1.0.0 <2.0.0"')).kind, "allow");
   assertEquals(npmRule.evaluate(ctxOf('npm view "pkg@1.0.0 - 2.0.0"')).kind, "allow");
+  // 底線與中段的 `..` 都是合法 tag 字元
+  assertEquals(npmRule.evaluate(ctxOf("npm view pkg@release_candidate")).kind, "allow");
+  assertEquals(npmRule.evaluate(ctxOf("npm view pkg@release..candidate")).kind, "allow");
 });
 
-Deno.test("npm: 布林旗標後接 true/false 會吃掉操作元 → ask", () => {
+Deno.test("npm: 旗標後接被 npm 吃掉的值會使操作元消失 → ask", () => {
   assertEquals(npmRule.evaluate(ctxOf("npm view --json true")).kind, "ask");
   assertEquals(npmRule.evaluate(ctxOf("npm view --offline false")).kind, "ask");
+  assertEquals(npmRule.evaluate(ctxOf("npm view --color always")).kind, "ask");
+  assertEquals(npmRule.evaluate(ctxOf("npm view --no-color always")).kind, "ask");
+  assertEquals(npmRule.evaluate(ctxOf("npm view --version false")).kind, "ask");
+  assertEquals(npmRule.evaluate(ctxOf("npm view -v false")).kind, "ask");
   assertEquals(npmRule.evaluate(ctxOf("npm view markdown-it --json")).kind, "allow");
 });
 
@@ -2435,6 +2451,11 @@ const SAFE_VALUELESS_FLAGS = new Set([
 const SAFE_VALUE_FLAGS = new Set(["--otp"]);
 /** 無子指令時允許的單獨旗標。 */
 const VERSION_FLAGS = new Set(["--version", "-v"]);
+/**
+ * 會被 npm 的解析器當成「前一個旗標的值」而吃掉的 token。
+ * 布林旗標吃 `true`/`false`；`--color`/`--no-color` 另外吃 `always`。
+ */
+const FLAG_VALUE_WORDS = new Set(["true", "false", "always"]);
 
 /**
  * registry package spec 形態。npm 以 npm-package-arg 解析操作元，除 registry spec 外
@@ -2453,7 +2474,7 @@ const PKG_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
  * **不得含 `/`、`\`、`:`，也不得含獨立的 `.` 或 `..` 段**——`pkg@..` 會被
  * npm-package-arg 解析成指向上層目錄的本地 spec。
  */
-const PKG_SUFFIX = /^[A-Za-z0-9.\-+^~><=*| ]+$/;
+const PKG_SUFFIX = /^[A-Za-z0-9._\-+^~><=*| ]+$/;
 
 function isValidSuffix(suffix: string): boolean {
   if (suffix === "") return false;
@@ -2461,9 +2482,9 @@ function isValidSuffix(suffix: string): boolean {
   // 但 `pkg@. ` 這種靠尾隨空白偽裝的形態必須擋下。
   if (suffix !== suffix.trim()) return false;
   // 以 `.` 開頭一律拒絕：npm-package-arg 會把 `pkg@.`、`pkg@..`、`pkg@.hidden`
-  // 一併解析成本地目錄 spec，而非 registry 上的版本
+  // 一併解析成本地目錄 spec，而非 registry 上的版本。
+  // 中段的 `.` 與 `..` 不受影響（`pkg@release..candidate` 是合法 tag）。
   if (suffix.startsWith(".")) return false;
-  if (suffix.includes("..")) return false;
   return PKG_SUFFIX.test(suffix);
 }
 
@@ -2512,16 +2533,23 @@ export const npmRule: CommandRule = {
     for (let i = 0; i < tokens.length; i++) {
       const t = tokens[i];
       if (t.startsWith("-") && t !== "-") {
-        if (VERSION_FLAGS.has(t)) continue;
+        if (VERSION_FLAGS.has(t)) {
+          // --version / -v 同樣是布林旗標，會吃掉其後的 true/false
+          if (FLAG_VALUE_WORDS.has(tokens[i + 1])) {
+            return ask(`npm：${t} 後接旗標值，操作元數量無法靜態判定`);
+          }
+          continue;
+        }
         const eq = t.indexOf("=");
         const name = eq === -1 ? t : t.slice(0, eq);
         if (SAFE_VALUELESS_FLAGS.has(name)) {
           if (eq !== -1) return ask(`npm：未列入安全集合的旗標形式 ${t}`);
-          // npm 的解析器會讓布林旗標吃掉其後的 `true` / `false`。若這裡照樣把該 token 當成
-          // 位置參數，`npm view --json true` 會被誤認為「有操作元」，實際上 npm 收到的是
-          // 零操作元、於是改查當前專案——正是本規則要擋的形態。
-          if (tokens[i + 1] === "true" || tokens[i + 1] === "false") {
-            return ask(`npm：${name} 後接布林值，操作元數量無法靜態判定`);
+          // npm 的解析器會讓這些旗標吃掉其後的值（布林旗標吃 true/false，
+          // --color/--no-color 另外吃 always）。若這裡照樣把該 token 當成位置參數，
+          // `npm view --json true`、`npm view --color always` 會被誤認為「有操作元」，
+          // 實際上 npm 收到的是零操作元、於是改查當前專案——正是本規則要擋的形態。
+          if (FLAG_VALUE_WORDS.has(tokens[i + 1])) {
+            return ask(`npm：${name} 後接旗標值，操作元數量無法靜態判定`);
           }
           continue;
         }
@@ -2668,12 +2696,20 @@ Deno.test("e2e: 本次的真實指令改為自動放行", async () => {
   const proj = await projWithAllow([]);
   try {
     await Deno.writeTextFile(`${proj}/deno.json`, "{}");
-    assertEquals(await decisionOf("base64 -d deno.json | head -40", proj), "allow");
+    // 觸發本次設計的四條真實指令（第一條是完整的原始 pipeline）
+    assertEquals(
+      await decisionOf(
+        `gh api repos/o/r/contents/README.md --template='{{.content}}' | base64 -d 2>&1 | grep -A 20 "x" | head -40`,
+        proj,
+      ),
+      "allow",
+    );
     assertEquals(await decisionOf("test -f deno.json && cat deno.json | head -100", proj), "allow");
     assertEquals(
       await decisionOf("npm view markdown-it version && npm view marked version", proj),
       "allow",
     );
+    assertEquals(await decisionOf("base64 -w 0 deno.json", proj), "allow");
   } finally {
     await Deno.remove(proj, { recursive: true });
   }
