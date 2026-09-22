@@ -951,15 +951,18 @@ Deno.test("pwd: 回當前 cwd；帶旗標或 cwd unknown 不求值", () => {
   assertEquals(evalSubstitutionWord(wordOf('cd "$(pwd)"'), { kind: "unknown" }), null);
 });
 
-Deno.test("echo: 無旗標或僅 -n、操作元不含反斜線才求值", () => {
+Deno.test("echo: 無旗標且操作元不含反斜線才求值", () => {
   assertEquals(evalSubstitutionWord(wordOf('cd "$(echo /a/b)"'), CWD), "/a/b");
-  assertEquals(evalSubstitutionWord(wordOf('cd "$(echo -n /a/b)"'), CWD), "/a/b");
   assertEquals(evalSubstitutionWord(wordOf('cd "$(echo a b)"'), CWD), "a b");
 });
 
-Deno.test("echo: -e 與含反斜線的操作元不求值", () => {
-  // xpg_echo shopt 為 on 時 bash 預設就解釋反斜線，該狀態靜態不可知
+Deno.test("echo: 任何以 - 開頭的 token 與含反斜線的操作元都不求值", () => {
+  // -n 在 POSIX mode + xpg_echo 下會被當成操作元輸出（`echo -n x` → `-n x`），
+  // 兩個 shell 選項都是執行期狀態，靜態無從區分它是旗標還是字面
+  assertEquals(evalSubstitutionWord(wordOf('cd "$(echo -n /a/b)"'), CWD), null);
   assertEquals(evalSubstitutionWord(wordOf(String.raw`cd "$(echo -e /a/b)"`), CWD), null);
+  assertEquals(evalSubstitutionWord(wordOf('cd "$(echo -- /a/b)"'), CWD), null);
+  // xpg_echo 為 on 時 bash 預設就解釋反斜線，該狀態同樣靜態不可知
   assertEquals(evalSubstitutionWord(wordOf(String.raw`cd "$(echo '/a\tb')"`), CWD), null);
 });
 
@@ -1103,14 +1106,14 @@ const pwdEvaluator: SubstEvaluator = {
 const echoEvaluator: SubstEvaluator = {
   names: ["echo"],
   evaluate(argv) {
-    let i = 0;
-    if (argv[i] === "-n") i++; // -n 只影響尾端換行，而 $(...) 本就剝除尾端換行
-    const operands = argv.slice(i);
+    // 連 `-n` 都不接受。bash 在 POSIX mode 且 `xpg_echo` 為 on 時會把 `-n` 當成**操作元**
+    // 輸出（`echo -n x` → `-n x`），而這兩個 shell 選項都是執行期狀態、靜態不可知。
+    // 求值器的契約是「輸出可能取決於執行期 shell 選項就回 null」，故只接受無旗標形態。
+    const operands = argv;
     if (operands.length === 0) return null;
     for (const o of operands) {
-      // 任一以 `-` 開頭的操作元一律放棄。這比必要的更嚴——`--` 在 echo 不是選項終止符
-      // （實測 `echo -- foo` 印出 `-- foo`），照理可以求值——但把「是旗標」與「長得像旗標的
-      // 操作元」分開處理沒有實際需求，而多問一次是安全方向。
+      // 任一以 `-` 開頭的 token 一律放棄：它可能是旗標（`-e` 會改變跳脫處理），
+      // 也可能因 shell 選項而變成字面操作元。兩種解讀的輸出不同，靜態無從區分。
       if (o.startsWith("-")) return null;
       // 含反斜線時，輸出取決於執行期的 xpg_echo shopt（靜態不可知）→ 放棄
       if (o.includes("\\")) return null;
@@ -2813,15 +2816,15 @@ Deno.test({
   name: "e2e: HOME 與 USERPROFILE 分歧時，settings 的 ~ 走 USERPROFILE、指令的 ~ 走 HOME",
   async fn() {
     const proj = await projWithAllow(["Read(~/cache/**)"]);
+    const env = { HOME: "/bash-home", USERPROFILE: "/settings-home" };
     try {
       // 授權的是 USERPROFILE/cache，實際讀的是 HOME/cache → 不一致 → ask
-      assertEquals(
-        await decisionWithEnv("cat ~/cache/x", proj, {
-          HOME: "/bash-home",
-          USERPROFILE: "/settings-home",
-        }),
-        "ask",
-      );
+      assertEquals(await decisionWithEnv("cat ~/cache/x", proj, env), "ask");
+      // 同一環境下，該規則**仍然**授權 USERPROFILE 底下的位置——證明它被正確解析、
+      // 而不是被丟棄或解析到別處（沒有這條，上面的 ask 也可能來自「規則根本沒生效」）
+      assertEquals(await decisionWithEnv("cat /settings-home/cache/x", proj, env), "allow");
+      // 而 HOME 底下的同名位置未被授權
+      assertEquals(await decisionWithEnv("cat /bash-home/cache/x", proj, env), "ask");
     } finally {
       await Deno.remove(proj, { recursive: true });
     }
@@ -2888,9 +2891,16 @@ fi
 Expected：標示 allow 的回 `permissionDecision: "allow"`、標示 ask 的回 `"ask"`，
 且 `failures` 為 0（hook 必須永遠 exit 0）。
 
-> ⚠️ 若某條 builtin 應為 ask 的指令回了 allow 且 reason 提到「命中 permissions.allow」，
-> 那是 settings.json 的合法升級、不是 bug（見 CLAUDE.md 的說明）。但若回 allow 的是
-> **寫入重導向／賦值前綴／範圍外 `<`／cwd 超範圍**，那就是 regression，必須修。
+> ⚠️ 判讀 allow 時的兩個既有例外，不要誤判為 regression：
+>
+> 1. builtin 應為 ask 的指令回 allow 且 reason 提到「命中 permissions.allow」→ 那是
+>    settings.json 的合法升級（見 CLAUDE.md）。
+> 2. **cwd 超範圍時的 allow 不必然是 regression**：宣告 `cwdIndependent` 的規則在五道護欄
+>    全部成立時可合法跳過中央前置規則一（例如 `cd /outside && gh api …`）。判斷依據是該指令
+>    是否宣告了豁免且護欄成立，不是「cwd 在不在範圍內」。
+>
+> 真正的 regression 是：**寫入重導向／賦值前綴／範圍外 `<`** 回 allow，或**未宣告豁免**的指令
+> 在 cwd 超範圍時回 allow。
 
 - [ ] **Step 7: 更新 CLAUDE.md**
 

@@ -244,9 +244,16 @@ mount 表。因此操作元必須是下列形態之一，否則回 `null`：
 `basename <NAME> <SUFFIX>`、`basename -s <SUFFIX> <NAME>`。多操作元（含 `-a`/`--multiple`）與
 `-z`/`--zero`（以 NUL 分隔）一律回 `null`。
 
-**含反斜線的操作元一律回 `null`**：GNU coreutils 在 Windows / Cygwin 上也把 `\` 視為路徑分隔符
-（`dirname 'C:\Windows\System32'` → `C:\Windows`），只處理 `/` 會算成 `.`——而那個錯誤結果會被
-當成 known cwd 用於後續範圍判定。與其算錯，不如放棄。
+**含反斜線、或帶磁碟前綴（`C:`／`C:/…`）的操作元一律回 `null`，且不分平台**：
+
+- GNU coreutils 在 Windows / Cygwin 上把 `\` 視為路徑分隔符（`dirname 'C:\Windows\System32'`
+  → `C:\Windows`），只處理 `/` 會算成 `.`。
+- 在支援磁碟機的平台上，GNU 會保留磁碟前綴，並禁止從磁碟根移除後綴（`basename C: :` → `C:`），
+  而 `/`-only 的字串切法會得到 `C`。
+
+不分平台一律拒絕，是因為求值器不該依執行平台給出不同結果——同一份規則在 Windows 與 Linux 上
+判定分歧，會讓行為更難推理，而這兩種形態在 POSIX 平台上本就罕見。錯誤的結果會被當成 known cwd
+用於後續範圍判定，與其算錯，不如放棄。
 
 #### pwd
 
@@ -254,18 +261,19 @@ mount 表。因此操作元必須是下列形態之一，否則回 `null`：
 
 #### echo
 
-可求值形態：無旗標、或僅帶 `-n`；**所有操作元皆不含反斜線字元，且皆不以 `-` 開頭**。
+可求值形態：**無任何旗標**，且所有 token 皆不以 `-` 開頭、皆不含反斜線字元。
 輸出為操作元以單一空格 join。
 
-「不以 `-` 開頭」比嚴格必要的更保守：`--` 在 echo 不是選項終止符（實測 `echo -- foo` 輸出
-`-- foo`），照理可以求值。但把「旗標」與「長得像旗標的操作元」分開處理沒有實際需求，
-多問一次是安全方向。
+兩項限制都源自同一條契約——輸出可能取決於執行期 shell 選項時一律放棄：
 
-反斜線的限制是必要的：bash 的 `xpg_echo` shopt 若為 on，builtin `echo` 預設就會解釋反斜線跳脫，
-而該 shopt 是執行期 shell 狀態、靜態不可知。操作元不含反斜線時兩種狀態結果一致，才可安全求值。
-帶 `-e`（明確啟用跳脫）一律回 `null`。
+- **不接受 `-` 開頭的 token（含 `-n`）**：bash 在 POSIX mode 且 `xpg_echo` 為 on 時，會把 `-n`
+  當成**操作元**輸出（`echo -n x` → `-n x`），而非旗標。這兩個 shell 選項都是執行期狀態，
+  靜態無從區分該 token 是旗標還是字面。`-e` 更會直接改變跳脫處理。
+- **操作元不含反斜線**：`xpg_echo` 為 on 時 builtin `echo` 預設就會解釋反斜線跳脫。
+  操作元不含反斜線時兩種狀態結果一致，才可安全求值。
 
-`-n` 不影響求值結果：command substitution 本就會剝除尾端換行。
+（`-n` 若真被當成旗標，其效果只是不補尾端換行，而 command substitution 本就會剝除尾端換行——
+但既然無法確定它是否被當成旗標，仍須放棄。）
 
 #### printf
 
@@ -417,6 +425,15 @@ package.json 的內容**（name、version、description 等），構成呼叫者
 
 不符者一律 ask，不嘗試對其做 `resolvePath`——本規則的立場是「只認得套件名」，路徑形態交給使用者
 確認。動態 token 一律 ask（不臆測其展開結果）。
+
+**操作元的角色分工**：`npm view <pkg> [<field>…]` 的第一個操作元是 package spec，其餘是輸出
+欄位選擇器（如 `npm view markdown-it version` 的 `version`）。因此**只有第一個操作元**套用上述
+registry spec 文法；後續欄位選擇器不是路徑、也不會被 npm 當成檔案讀取，故不做路徑判定。
+
+此外，npm 的旗標解析會吃掉某些緊接在後的 token 當成旗標值——布林旗標吃 `true`/`false`，
+`--color`/`--no-color` 另外吃 `always`。若把被吃掉的 token 誤算成操作元，
+`npm view --json true` 會被判成「有操作元」，而 npm 實際收到的是**零操作元**、於是改查當前專案。
+故安全旗標之後緊接這些值時一律 ask。
 
 ### cygpath（`src/rules/commands/cygpath.ts`）
 
