@@ -231,13 +231,42 @@ Deno.test("resolvePathValue: 以 ~ 開頭的字串值 fail-closed", () => {
   // 字串值沒有 word 結構，無從判斷引號 → 一律視為超出範圍
   assertEquals(resolvePathValue("~/x", cwd, scope), "out-of-project");
 });
+
+Deno.test("shell home 與 settings home 分離：授權的是 settings home 時，指令的 ~ 仍以 HOME 展開", () => {
+  const cwd: CwdState = { kind: "known", path: "/proj" };
+  // Read(~/cache/**) 由 settings home 解析 → 授權的是 /settings-home/cache
+  const scope: ScopeConfig = {
+    ...rootScope("/proj"),
+    home: "/settings-home",
+    shellHome: "/bash-home",
+    allow: { roots: ["/settings-home/cache"], files: [] },
+  };
+  // 但指令中的 ~/cache/x 依 bash 語義展開為 /bash-home/cache/x —— 未被授權
+  assertEquals(resolvePath(wordOf("cat ~/cache/x"), cwd, scope), "out-of-project");
+});
+
+Deno.test("shell home 展開後命中 allow 範圍 → in-project", () => {
+  const cwd: CwdState = { kind: "known", path: "/proj" };
+  const scope: ScopeConfig = {
+    ...rootScope("/proj"),
+    home: "/bash-home",
+    shellHome: "/bash-home",
+    allow: { roots: ["/bash-home/cache"], files: [] },
+  };
+  assertEquals(resolvePath(wordOf("cat ~/cache/x"), cwd, scope), "in-project");
+});
 ```
 
-在該檔案上方（既有 helper 附近）加入：
+> 這兩個測試需要 `ScopeConfig` 型別；若該測試檔尚未 import，請一併補上
+> `import type { ScopeConfig } from "./scope.ts";`。
+
+在該檔案上方（既有 helper 附近）加入 import 與 helper。注意 `resolvePath` / `resolvePathValue`
+可能尚未被該測試檔 import，一併補上：
 
 ```ts
 import { parse } from "../deps.ts";
 import type { Command, Word } from "../deps.ts";
+import { resolvePath, resolvePathValue } from "./scope.ts";
 
 /** 取出指令的第一個 argv Word。 */
 function wordOf(src: string): Word {
@@ -309,15 +338,14 @@ export function rootScope(root: string): ScopeConfig {
 }
 ```
 
-`resolvePathValue` 開頭加 fail-closed：
+把原本 `resolvePathValue` 的本體抽成一個**不含 tilde 判斷**的內部函式，讓兩個公開入口各自套用
+自己的 tilde 語義。這是必要的：`resolvePath` 對引號形態（`cat "~/secret"`）拿到的
+`staticValue` 是 `"~/secret"`——引號資訊已被抹除——若直接轉呼叫帶字串 tilde 檢查的
+`resolvePathValue`，會把**應該維持相對語義**的引號形態也擋成 `out-of-project`。
 
 ```ts
-export function resolvePathValue(value: string | null, cwd: CwdState, scope: ScopeConfig): PathScope {
-  if (value === null) return "dynamic";
-  // fail-closed：字串值沒有 word 結構，無從判斷開頭的 `~` 是否被引號保護。
-  // 未加引號時 bash 展開為 $HOME（專案外），加引號時是 ./~（專案內）——無法區分就取安全的一邊。
-  // 代價是 `--flag="~/x"` 這類引號形態會被誤 ask；此形態罕見，方向安全。
-  if (value.startsWith("~")) return "out-of-project";
+/** 絕對／相對路徑的範圍判定本體；呼叫端負責先處理 tilde 語義。 */
+function resolveResolvedValue(value: string, cwd: CwdState, scope: ScopeConfig): PathScope {
   let abs: string;
   if (isAbsolute(value)) {
     abs = normalizeAbsolute(value);
@@ -327,25 +355,63 @@ export function resolvePathValue(value: string | null, cwd: CwdState, scope: Sco
   }
   return isReadScoped(abs, scope) ? "in-project" : "out-of-project";
 }
-```
 
-`resolvePath` 改為先套用 tilde 語義：
+/**
+ * 對「已取得的字串路徑值」做範圍檢查（三態）。
+ *
+ * 字串值沒有 word 結構，無從判斷開頭的 `~` 是否被引號保護：未加引號時 bash 展開為 $HOME
+ * （專案外），加引號時是 `./~`（專案內）。無法區分就取安全的一邊 → fail-closed。
+ * 代價是 `--flag="~/x"` 這類引號形態會被誤 ask；此形態罕見，方向安全。
+ */
+export function resolvePathValue(value: string | null, cwd: CwdState, scope: ScopeConfig): PathScope {
+  if (value === null) return "dynamic";
+  if (value.startsWith("~")) return "out-of-project";
+  return resolveResolvedValue(value, cwd, scope);
+}
 
-```ts
-/** 解析單一參數對專案根的範圍（三態）。未加引號的 leading tilde 先展開再判定。 */
+/**
+ * 解析單一參數對專案根的範圍（三態）。
+ *
+ * 有 word 結構可用，因此能精確區分兩種 tilde：
+ *   未加引號（`~/x`、`~/"x"`）→ bash 會展開 → 以 shellHome 展開後判定，不可解析則超出範圍
+ *   引號包裝（`"~/x"`）      → bash 不展開，指向 `./~/x` → 走一般相對路徑語義（維持既有行為）
+ */
 export function resolvePath(arg: Word, cwd: CwdState, scope: ScopeConfig): PathScope {
+  const v = staticValue(arg);
+  if (v === null) return "dynamic";
   if (hasUnquotedLeadingTilde(arg)) {
-    const v = staticValue(arg);
-    if (v === null) return "dynamic";
     const expanded = expandTilde(v, scope.shellHome);
     // 不支援的 tilde 形態（~user / ~+ / ~-）或 shellHome 未知 → 絕不退回相對路徑語義，
     // 那正是本次要修的漏洞（`cat ~/.ssh/id_rsa` 被判成 <project>/~/.ssh/id_rsa）。
     if (expanded === null) return "out-of-project";
-    return resolvePathValue(expanded, cwd, scope);
+    return resolveResolvedValue(expanded, cwd, scope);
   }
-  return resolvePathValue(staticValue(arg), cwd, scope);
+  // 引號形態的 `~` 走到這裡：不經 resolvePathValue 的字串 tilde 檢查，維持相對語義。
+  return resolveResolvedValue(v, cwd, scope);
 }
 ```
+
+同時更新 `src/engine/scope_test.ts:115` 既有的 `scopeWith` helper——`shellHome` 是必要欄位，
+不補會讓型別檢查失敗：
+
+```ts
+function scopeWith(
+  allowRoots: string[] = [],
+  denyRoots: string[] = [],
+  askRoots: string[] = [],
+): ScopeConfig {
+  return {
+    ...rootScope("/srv/pkg"),
+    shellHome: null,
+    allow: { roots: allowRoots, files: [] },
+    deny: { roots: denyRoots, files: [] },
+    ask: { roots: askRoots, files: [] },
+  };
+}
+```
+
+> 上面是示意形狀：實作時保留該 helper 既有的參數與回傳結構，只確保 `shellHome` 有值
+> （`rootScope` 已含 `shellHome: null`，若該 helper 改用展開 `rootScope(...)` 即可自動滿足）。
 
 - [ ] **Step 4: 執行測試確認通過**
 
@@ -426,7 +492,16 @@ export function classify(
 - [ ] **Step 6: 執行全部測試，確認沒有既有測試回歸**
 
 Run: `deno task test`
-Expected: PASS。若有既有測試斷言「`~/…` 路徑 allow」，那正是本次要修掉的錯誤行為——把該測試的期望改成 `ask`，並在測試名稱補上 `（tilde 展開後在專案外）`。
+Expected: PASS。
+
+既有測試若失敗，只有兩種合法情形，其餘一律視為本次改動的 bug：
+
+1. **斷言「未加引號的 `~/…` 路徑 allow / in-project」** → 那正是本次要修掉的錯誤行為。把期望改成
+   `ask` / `out-of-project`，並在測試名稱補上「（tilde 展開後在專案外）」。
+2. **`ScopeConfig` 物件字面缺 `shellHome`** → 補上 `shellHome: null`，或改成展開 `rootScope(...)`。
+
+**不可**修改的既有斷言：引號形態（`"~/x"`）維持 in-project、`dangerousRoot` 對字面 `~` / `~/`
+的既有判定。這兩者本次行為不變，若它們失敗代表實作有誤。
 
 - [ ] **Step 7: 驗證與提交**
 
@@ -451,38 +526,70 @@ git commit -m "fix(engine): expand unquoted leading tilde before scope checks"
 
 - [ ] **Step 1: 寫失敗測試**
 
-追加到 `src/engine/classify_test.ts`（沿用該檔既有的 invocation 建構方式；若該檔以 `parse` + `walk` 建 invocation，照既有 helper 寫）：
+追加到 `src/engine/classify_test.ts`。該檔已有 `rulesOf({ allow: [...] })` helper（`classify_test.ts:15`，
+接受 `Bash(...)` 形式的字串）以及既有的 invocation 建構方式——直接沿用，不要自行拼 `PermissionRules`。
+
+`cat` 與 `git log` 在 known 且在範圍內的 cwd 下本來就 allow，正好當對照組；**不要用裸 `git`**，
+`gitRule` 對無子指令的 `git` 本就回 ask，那樣測不到新守衛。
 
 ```ts
-Deno.test("central rule 1: cwd unknown → 不可升級 ask", () => {
+Deno.test("central rule 1: cwd known 且在範圍內 → 維持 allow（對照組）", () => {
   const inv: CommandInvocation = {
     name: "git",
-    argv: [],
+    argv: [wordOfArg("log")],
+    assignments: [],
+    redirects: [],
+    cwd: { kind: "known", path: "/proj" },
+  };
+  assertEquals(classify(inv, "/proj").kind, "allow");
+});
+
+Deno.test("central rule 1: cwd unknown → ask", () => {
+  const inv: CommandInvocation = {
+    name: "git",
+    argv: [wordOfArg("log")],
     assignments: [],
     redirects: [],
     cwd: { kind: "unknown" },
   };
-  const v = classify(inv, "/proj");
-  assertEquals(v.kind, "ask");
+  assertEquals(classify(inv, "/proj").kind, "ask");
 });
 
 Deno.test("central rule 1: cwd unknown 不可由 permissions.allow 升級", () => {
   const inv: CommandInvocation = {
     name: "git",
-    argv: [],
+    argv: [wordOfArg("log")],
     assignments: [],
     redirects: [],
     cwd: { kind: "unknown" },
   };
-  const rules: PermissionRules = {
-    ...EMPTY_RULES,
-    bash: { allow: ["git *"], deny: [], ask: [] },
+  assertEquals(classify(inv, "/proj", rulesOf({ allow: ["Bash(git *)"] })).kind, "ask");
+});
+
+Deno.test("central rule 1: cwdIndependent 的指令在 unknown cwd 下也不得豁免", () => {
+  // gh api 有宣告 cwdIndependent，但五道護欄的第 (2) 條要求 cwd 為 known 且 origin 為 chain-cd
+  const inv: CommandInvocation = {
+    name: "gh",
+    argv: [wordOfArg("api"), wordOfArg("repos/o/r")],
+    assignments: [],
+    redirects: [],
+    cwd: { kind: "unknown" },
   };
-  assertEquals(classify(inv, "/proj", rules).kind, "ask");
+  assertEquals(classify(inv, "/proj", undefined, null, [], true).kind, "ask");
 });
 ```
 
-> 註：第二個測試的 `rules` 物件請照 `src/permissions/settings.ts` 的 `PermissionRules` 實際形狀建構（本專案既有測試已有寫法可複製）；重點是斷言「即使命中 allow 仍為 ask」。
+在該檔 helper 區加入（若尚未存在）：
+
+```ts
+/** 由單一 token 建出 argv 用的 Word。 */
+function wordOfArg(token: string): Word {
+  const cmd = parse(`x ${token}`).commands[0].command as Command;
+  return cmd.suffix[0];
+}
+```
+
+並確認檔首已 import `CommandInvocation`（`../types.ts`）、`Word` / `Command` / `parse`（`../deps.ts`）。
 
 - [ ] **Step 2: 執行測試確認失敗**
 
@@ -519,7 +626,13 @@ Expected: PASS
 - [ ] **Step 5: 全量測試**
 
 Run: `deno task test`
-Expected: PASS。既有測試若有「動態 cd 後仍 allow」的斷言，改為 `ask`（這是刻意的收緊）。
+Expected: PASS。
+
+既有測試若失敗，唯一合法情形是「斷言 unknown cwd 下的指令 allow」——那正是本次要堵的繞道，
+改為 `ask` 並在測試名稱補上「（unknown cwd 不再放行）」。其餘失敗一律視為實作有誤。
+
+**注意**：Task 7 之後會有「可求值 substitution 推導出 known cwd」的正面案例，那些是 `known`
+不是 `unknown`，不受本守衛影響；不要因為本 Task 而把它們一併改成 ask。
 
 - [ ] **Step 6: 驗證與提交**
 
@@ -570,42 +683,66 @@ function wordOf(src: string): Word {
 }
 
 Deno.test("framework: 未註冊的指令名不求值", () => {
-  assertEquals(evalSubstitutionWord(wordOf('cd "$(uname -a)"'), CWD, null), null);
+  assertEquals(evalSubstitutionWord(wordOf('cd "$(uname -a)"'), CWD), null);
 });
 
 Deno.test("framework: 未加引號的 substitution 一律不求值", () => {
   // bash 對未加引號的展開做 word splitting 與空值移除，語義與單一字串不同
-  assertEquals(evalSubstitutionWord(wordOf("cd $(echo foo)"), CWD, null), null);
-  assertEquals(evalSubstitutionWord(wordOf("cd $(echo -n)"), CWD, null), null);
+  assertEquals(evalSubstitutionWord(wordOf("cd $(echo foo)"), CWD), null);
+  assertEquals(evalSubstitutionWord(wordOf("cd $(echo -n)"), CWD), null);
 });
 
 Deno.test("framework: 混合 word 不求值", () => {
-  assertEquals(evalSubstitutionWord(wordOf('cd "$(echo foo)/sub"'), CWD, null), null);
-  assertEquals(evalSubstitutionWord(wordOf('cd "pre$(echo foo)"'), CWD, null), null);
+  assertEquals(evalSubstitutionWord(wordOf('cd "$(echo foo)/sub"'), CWD), null);
+  assertEquals(evalSubstitutionWord(wordOf('cd "pre$(echo foo)"'), CWD), null);
 });
 
 Deno.test("framework: 內層有 pipeline / 多 statement / 重導向 / 賦值前綴皆不求值", () => {
-  assertEquals(evalSubstitutionWord(wordOf('cd "$(echo a | tr a b)"'), CWD, null), null);
-  assertEquals(evalSubstitutionWord(wordOf('cd "$(echo a; echo b)"'), CWD, null), null);
-  assertEquals(evalSubstitutionWord(wordOf('cd "$(echo a > /tmp/x)"'), CWD, null), null);
-  assertEquals(evalSubstitutionWord(wordOf('cd "$(FOO=1 echo a)"'), CWD, null), null);
+  assertEquals(evalSubstitutionWord(wordOf('cd "$(echo a | tr a b)"'), CWD), null);
+  assertEquals(evalSubstitutionWord(wordOf('cd "$(echo a; echo b)"'), CWD), null);
+  assertEquals(evalSubstitutionWord(wordOf('cd "$(echo a > /tmp/x)"'), CWD), null);
+  assertEquals(evalSubstitutionWord(wordOf('cd "$(FOO=1 echo a)"'), CWD), null);
 });
 
 Deno.test("framework: 動態 argv 不求值", () => {
-  assertEquals(evalSubstitutionWord(wordOf('cd "$(echo $X)"'), CWD, null), null);
+  assertEquals(evalSubstitutionWord(wordOf('cd "$(echo $X)"'), CWD), null);
 });
 
 Deno.test("framework: argv 含未加引號 tilde 不求值", () => {
   // 外層 substitution 的雙引號不會抑制內層的 tilde expansion
-  assertEquals(evalSubstitutionWord(wordOf('cd "$(echo ~)"'), CWD, null), null);
-  assertEquals(evalSubstitutionWord(wordOf('cd "$(echo ~/x)"'), CWD, null), null);
-  assertEquals(evalSubstitutionWord(wordOf('cd "$(echo ~/"src")"'), CWD, null), null);
+  assertEquals(evalSubstitutionWord(wordOf('cd "$(echo ~)"'), CWD), null);
+  assertEquals(evalSubstitutionWord(wordOf('cd "$(echo ~/x)"'), CWD), null);
+  assertEquals(evalSubstitutionWord(wordOf('cd "$(echo ~/"src")"'), CWD), null);
 });
 
 Deno.test("framework: 非 substitution 的 word 回 null", () => {
-  assertEquals(evalSubstitutionWord(wordOf("cd /proj/src"), CWD, null), null);
+  assertEquals(evalSubstitutionWord(wordOf("cd /proj/src"), CWD), null);
 });
 ```
+
+> 下列三個案例需要已註冊的求值器才能真正走到「結果過濾」那一段，因此放在 Task 5 實作
+> `echo` 求值器之後才會轉綠。先寫進來，Task 5 Step 4 會一併驗證：
+
+```ts
+Deno.test("framework: 加引號但求值為空字串 → null", () => {
+  // 與上面未加引號的 `cd $(echo -n)` 不同：這個通過了引號檢查，真正測到空結果過濾
+  assertEquals(evalSubstitutionWord(wordOf('cd "$(echo -n)"'), CWD), null);
+});
+
+Deno.test("framework: 內層加引號的字面 ~ 可求值（引號抑制展開）", () => {
+  assertEquals(evalSubstitutionWord(wordOf(`cd "$(echo '~')"`), CWD), "~");
+});
+
+Deno.test("framework: 結果過濾述詞", () => {
+  // 現有求值器本身都不產生換行，故直接對述詞斷言，確保這兩條過濾規則有被執行到
+  assertEquals(resultIsUsable("/proj/src"), true);
+  assertEquals(resultIsUsable(""), false);
+  assertEquals(resultIsUsable("a\nb"), false);
+  assertEquals(resultIsUsable("a\r\nb"), false);
+});
+```
+
+該測試需要 `import { evalSubstitutionWord, resultIsUsable } from "./subst_eval.ts";`。
 
 - [ ] **Step 2: 執行測試確認失敗**
 
@@ -630,13 +767,12 @@ export interface SubstEvaluator {
   names: string[];
   /**
    * @param argv 呼叫端已確認全部靜態、且無未加引號 tilde 的引數字串
-   * @param cwd  該指令執行時的 cwd（unknown 時多數求值器應回 null）
-   * @param shellHome bash 的 $HOME；目前成員皆不需要，保留供未來擴充
+   * @param cwd  該指令執行時的 cwd（unknown 時需要 cwd 的求值器應回 null）
    */
-  evaluate(argv: string[], cwd: CwdState, shellHome: string | null): string | null;
+  evaluate(argv: string[], cwd: CwdState): string | null;
 }
 
-/** 成員於 Task 5 / 6 填入。 */
+/** 已註冊的求值器。指令名重複註冊會在載入時丟錯。 */
 const EVALUATORS: SubstEvaluator[] = [];
 
 const INDEX = new Map<string, SubstEvaluator>();
@@ -668,11 +804,7 @@ function loneSimpleCommand(script: Script | undefined): Command | null {
  * 空值移除，語義與「求值成單一字串」不同——`cd $(echo -n)` 展開後是零個參數，
  * 實際執行 `cd`（→ $HOME），而非 cd 到空字串。
  */
-export function evalSubstitutionWord(
-  word: Word,
-  cwd: CwdState,
-  shellHome: string | null,
-): string | null {
+export function evalSubstitutionWord(word: Word, cwd: CwdState): string | null {
   const parts = word.parts;
   // 資格 1 + 2：恰一個 DoubleQuoted，其內恰一個 CommandExpansion
   if (!parts || parts.length !== 1) return null;
@@ -703,26 +835,41 @@ export function evalSubstitutionWord(
   }
 
   // 資格 6～8
-  const out = evaluator.evaluate(argv, cwd, shellHome);
+  const out = evaluator.evaluate(argv, cwd);
   if (out === null) return null;
-  if (out.includes("\n") || out.includes("\r")) return null; // 多行輸出作為 cd 目標無意義
-  if (out === "") return null; // 空字串沒有安全的解釋：bash 語義依引號與否而異
-  return out;
+  return resultIsUsable(out) ? out : null;
+}
+
+/**
+ * 求值結果是否可用。
+ * 空字串沒有安全的解釋（bash 語義依引號與否而異：加引號是 cd 到空字串、未加引號是 cd 到 $HOME）；
+ * 含換行的多行輸出作為 cd 目標無意義。兩者一律放棄。
+ */
+export function resultIsUsable(out: string): boolean {
+  if (out === "") return false;
+  return !out.includes("\n") && !out.includes("\r");
 }
 ```
 
 - [ ] **Step 4: 執行測試確認通過**
 
-Run: `deno test --allow-env src/engine/subst_eval_test.ts`
-Expected: PASS（此時註冊表為空，所有案例都回 null，正是預期）
+Run: `deno test --allow-env src/engine/subst_eval_test.ts --filter "framework"`
+Expected: 除了「內層加引號的字面 ~ 可求值」一條之外全部 PASS。該條期望 `"~"`，但註冊表此時為空、
+`echo` 尚未註冊，故必然回 `null`——它會在下一個 Task 註冊 `echo` 求值器後轉綠。
+其餘負面案例在空註冊表下本來就該回 `null`，`resultIsUsable` 的斷言也不依賴任何求值器。
 
 - [ ] **Step 5: 驗證與提交**
 
 Run: `deno task check && deno task lint`
 
+> 此時 `deno task test` 會有一條已知失敗（上述字面 `~` 案例），下一個 Task 的 Step 4 會轉綠。
+> 提交時把它記進 commit message，避免後續誤判為回歸。
+
 ```bash
 git add src/engine/subst_eval.ts src/engine/subst_eval_test.ts
-git commit -m "feat(engine): add command substitution evaluation framework"
+git commit -m "feat(engine): add command substitution evaluation framework
+
+The quoted-literal-tilde case stays red until the echo evaluator lands."
 ```
 
 ---
@@ -746,66 +893,67 @@ git commit -m "feat(engine): add command substitution evaluation framework"
 
 ```ts
 Deno.test("dirname: 邊界語義", () => {
-  assertEquals(evalSubstitutionWord(wordOf('cd "$(dirname /a/b)"'), CWD, null), "/a");
-  assertEquals(evalSubstitutionWord(wordOf('cd "$(dirname /a/b/)"'), CWD, null), "/a");
-  assertEquals(evalSubstitutionWord(wordOf('cd "$(dirname /a//b)"'), CWD, null), "/a");
-  assertEquals(evalSubstitutionWord(wordOf('cd "$(dirname /a)"'), CWD, null), "/");
-  assertEquals(evalSubstitutionWord(wordOf('cd "$(dirname /)"'), CWD, null), "/");
-  assertEquals(evalSubstitutionWord(wordOf('cd "$(dirname a)"'), CWD, null), ".");
-  assertEquals(evalSubstitutionWord(wordOf('cd "$(dirname ./a)"'), CWD, null), ".");
+  assertEquals(evalSubstitutionWord(wordOf('cd "$(dirname /a/b)"'), CWD), "/a");
+  assertEquals(evalSubstitutionWord(wordOf('cd "$(dirname /a/b/)"'), CWD), "/a");
+  assertEquals(evalSubstitutionWord(wordOf('cd "$(dirname /a//b)"'), CWD), "/a");
+  assertEquals(evalSubstitutionWord(wordOf('cd "$(dirname /a)"'), CWD), "/");
+  assertEquals(evalSubstitutionWord(wordOf('cd "$(dirname /)"'), CWD), "/");
+  assertEquals(evalSubstitutionWord(wordOf('cd "$(dirname a)"'), CWD), ".");
+  assertEquals(evalSubstitutionWord(wordOf('cd "$(dirname ./a)"'), CWD), ".");
+  assertEquals(evalSubstitutionWord(wordOf(`cd "$(dirname '')"`), CWD), ".");
 });
 
 Deno.test("dirname: 多操作元與旗標不求值", () => {
-  assertEquals(evalSubstitutionWord(wordOf('cd "$(dirname /a/b /c/d)"'), CWD, null), null);
-  assertEquals(evalSubstitutionWord(wordOf('cd "$(dirname -z /a/b)"'), CWD, null), null);
-  assertEquals(evalSubstitutionWord(wordOf('cd "$(dirname)"'), CWD, null), null);
+  assertEquals(evalSubstitutionWord(wordOf('cd "$(dirname /a/b /c/d)"'), CWD), null);
+  assertEquals(evalSubstitutionWord(wordOf('cd "$(dirname -z /a/b)"'), CWD), null);
+  assertEquals(evalSubstitutionWord(wordOf('cd "$(dirname)"'), CWD), null);
 });
 
 Deno.test("basename: 邊界語義與後綴", () => {
-  assertEquals(evalSubstitutionWord(wordOf('cd "$(basename /a/b)"'), CWD, null), "b");
-  assertEquals(evalSubstitutionWord(wordOf('cd "$(basename /a/b/)"'), CWD, null), "b");
-  assertEquals(evalSubstitutionWord(wordOf('cd "$(basename a)"'), CWD, null), "a");
-  assertEquals(evalSubstitutionWord(wordOf('cd "$(basename /)"'), CWD, null), "/");
-  assertEquals(evalSubstitutionWord(wordOf('cd "$(basename /a/b.txt .txt)"'), CWD, null), "b");
-  assertEquals(evalSubstitutionWord(wordOf('cd "$(basename -s .txt /a/b.txt)"'), CWD, null), "b");
+  assertEquals(evalSubstitutionWord(wordOf('cd "$(basename /a/b)"'), CWD), "b");
+  assertEquals(evalSubstitutionWord(wordOf('cd "$(basename /a/b/)"'), CWD), "b");
+  assertEquals(evalSubstitutionWord(wordOf('cd "$(basename a)"'), CWD), "a");
+  assertEquals(evalSubstitutionWord(wordOf('cd "$(basename /)"'), CWD), "/");
+  assertEquals(evalSubstitutionWord(wordOf('cd "$(basename /a/b.txt .txt)"'), CWD), "b");
+  assertEquals(evalSubstitutionWord(wordOf('cd "$(basename -s .txt /a/b.txt)"'), CWD), "b");
 });
 
 Deno.test("basename: -a / -z / 操作元過多不求值", () => {
-  assertEquals(evalSubstitutionWord(wordOf('cd "$(basename -a /a/b /c/d)"'), CWD, null), null);
-  assertEquals(evalSubstitutionWord(wordOf('cd "$(basename -z /a/b)"'), CWD, null), null);
-  assertEquals(evalSubstitutionWord(wordOf('cd "$(basename /a/b .b extra)"'), CWD, null), null);
+  assertEquals(evalSubstitutionWord(wordOf('cd "$(basename -a /a/b /c/d)"'), CWD), null);
+  assertEquals(evalSubstitutionWord(wordOf('cd "$(basename -z /a/b)"'), CWD), null);
+  assertEquals(evalSubstitutionWord(wordOf('cd "$(basename /a/b .b extra)"'), CWD), null);
 });
 
 Deno.test("pwd: 回當前 cwd；帶旗標或 cwd unknown 不求值", () => {
-  assertEquals(evalSubstitutionWord(wordOf('cd "$(pwd)"'), CWD, null), "/proj");
-  assertEquals(evalSubstitutionWord(wordOf('cd "$(pwd -P)"'), CWD, null), null);
-  assertEquals(evalSubstitutionWord(wordOf('cd "$(pwd)"'), { kind: "unknown" }, null), null);
+  assertEquals(evalSubstitutionWord(wordOf('cd "$(pwd)"'), CWD), "/proj");
+  assertEquals(evalSubstitutionWord(wordOf('cd "$(pwd -P)"'), CWD), null);
+  assertEquals(evalSubstitutionWord(wordOf('cd "$(pwd)"'), { kind: "unknown" }), null);
 });
 
 Deno.test("echo: 無旗標或僅 -n、操作元不含反斜線才求值", () => {
-  assertEquals(evalSubstitutionWord(wordOf('cd "$(echo /a/b)"'), CWD, null), "/a/b");
-  assertEquals(evalSubstitutionWord(wordOf('cd "$(echo -n /a/b)"'), CWD, null), "/a/b");
-  assertEquals(evalSubstitutionWord(wordOf('cd "$(echo a b)"'), CWD, null), "a b");
+  assertEquals(evalSubstitutionWord(wordOf('cd "$(echo /a/b)"'), CWD), "/a/b");
+  assertEquals(evalSubstitutionWord(wordOf('cd "$(echo -n /a/b)"'), CWD), "/a/b");
+  assertEquals(evalSubstitutionWord(wordOf('cd "$(echo a b)"'), CWD), "a b");
 });
 
 Deno.test("echo: -e 與含反斜線的操作元不求值", () => {
   // xpg_echo shopt 為 on 時 bash 預設就解釋反斜線，該狀態靜態不可知
-  assertEquals(evalSubstitutionWord(wordOf(String.raw`cd "$(echo -e /a/b)"`), CWD, null), null);
-  assertEquals(evalSubstitutionWord(wordOf(String.raw`cd "$(echo '/a\tb')"`), CWD, null), null);
+  assertEquals(evalSubstitutionWord(wordOf(String.raw`cd "$(echo -e /a/b)"`), CWD), null);
+  assertEquals(evalSubstitutionWord(wordOf(String.raw`cd "$(echo '/a\tb')"`), CWD), null);
 });
 
 Deno.test("printf: 只求值 '%s' 單一操作元與無 % 無反斜線的純字面", () => {
-  assertEquals(evalSubstitutionWord(wordOf(`cd "$(printf '%s' /a/b)"`), CWD, null), "/a/b");
-  assertEquals(evalSubstitutionWord(wordOf(`cd "$(printf /a/b)"`), CWD, null), "/a/b");
+  assertEquals(evalSubstitutionWord(wordOf(`cd "$(printf '%s' /a/b)"`), CWD), "/a/b");
+  assertEquals(evalSubstitutionWord(wordOf(`cd "$(printf /a/b)"`), CWD), "/a/b");
 });
 
 Deno.test("printf: 其餘形態不求值", () => {
   // 格式字串永遠解釋反斜線，即使不含 %
-  assertEquals(evalSubstitutionWord(wordOf(String.raw`cd "$(printf '/a\tb')"`), CWD, null), null);
-  assertEquals(evalSubstitutionWord(wordOf(String.raw`cd "$(printf '%s\n' /a/b)"`), CWD, null), null);
-  assertEquals(evalSubstitutionWord(wordOf(`cd "$(printf '%s' a b)"`), CWD, null), null);
-  assertEquals(evalSubstitutionWord(wordOf(`cd "$(printf '%b' a)"`), CWD, null), null);
-  assertEquals(evalSubstitutionWord(wordOf(`cd "$(printf -v x '%s' a)"`), CWD, null), null);
+  assertEquals(evalSubstitutionWord(wordOf(String.raw`cd "$(printf '/a\tb')"`), CWD), null);
+  assertEquals(evalSubstitutionWord(wordOf(String.raw`cd "$(printf '%s\n' /a/b)"`), CWD), null);
+  assertEquals(evalSubstitutionWord(wordOf(`cd "$(printf '%s' a b)"`), CWD), null);
+  assertEquals(evalSubstitutionWord(wordOf(`cd "$(printf '%b' a)"`), CWD), null);
+  assertEquals(evalSubstitutionWord(wordOf(`cd "$(printf -v x '%s' a)"`), CWD), null);
 });
 ```
 
@@ -955,7 +1103,26 @@ git commit -m "feat(engine): add string-only substitution evaluators"
 
 **只在 Windows 啟用**，非 Windows 一律回 `null`：cygpath 是 Cygwin/MSYS2 工具，在 Linux/macOS 不存在；而求值所依賴的「`/d/x` 與 `D:/x` 等價」正是 `scope.ts` 的 `normalizeAbsolute` 僅在 Windows 套用的磁碟機正規化。
 
-可求值旗標（實測 cygpath 3.6.7 確認輸出完全由輸入字串決定）：`-u`、`-w`、`-m`、`-t unix|windows|mixed`、`-a`、`-C <cp>`、`-i`。求值結果即「操作元路徑原樣」——`-u`/`-w`/`-m` 只改變磁碟機與斜線的書寫形式，而 `applyPath` 隨即呼叫 `normalizeAbsolute`，`D:/x`、`D:\x`、`/d/x` 在 Windows 上會正規化成同一字串。
+可求值旗標（實測 cygpath 3.6.7 確認輸出完全由輸入字串決定）：`-u`、`-w`、`-m`、`-t unix|windows|mixed`、`-a`、`-C <cp>`、`-i`。
+
+**但「回操作元原樣」只對磁碟形式路徑成立。** cygpath 會套用 MSYS2 的 mount 表，把虛擬路徑對映到
+實際安裝位置——實測：
+
+```
+cygpath -m /d/proj        → D:/proj                          （磁碟形式，等價）
+cygpath -u 'D:/proj'      → /d/proj                          （磁碟形式，等價）
+cygpath -m /mingw64/bin   → C:/Program Files/Git/mingw64/bin  （mount 對映，**不等價**）
+cygpath -m /usr/bin       → C:/Program Files/Git/usr/bin      （mount 對映，**不等價**）
+```
+
+`normalizeAbsolute` 只做磁碟機正規化（`/d/x` ↔ `D:/x`），不懂 mount 表。若對 `/usr/bin` 回原樣，
+後續範圍檢查會用錯誤的 cwd。因此**操作元必須是下列形態之一，否則回 `null`**：
+
+- Windows 磁碟絕對路徑：`X:/…` 或 `X:\…`
+- MSYS 磁碟形式絕對路徑：`/x/…` 或 `/x`（頂層段恰為單一字母）
+- 相對路徑（不以 `/` 開頭；實測 `cygpath -u 'relative/path'` → `relative/path` 不變）
+
+其餘以 `/` 開頭的絕對路徑（`/usr`、`/mingw64`、`/tmp`、`/proc/…`）一律不可求值。
 
 不可求值：`-d`、`-t dos`、`-s`、`-l`（皆需查檔案系統；實測 `cygpath -d '/d/nonexistent'` → `cannot create short name`、exit 2；`cygpath -w -l '/c/PROGRA~1'` → `C:\Program Files`）、`-M`、`-D`/`-H`/`-O`/`-P`/`-S`/`-W`/`-F`/`-A`（輸出系統目錄）、`-f`/`-o`（讀檔）、`-U`/`-r`/`-p`（輸出形式與 `normalizeAbsolute` 不保證等價）。
 
@@ -974,11 +1141,11 @@ Deno.test({
   ...WIN_ONLY,
   name: "cygpath: 純轉換旗標求值為操作元原樣",
   fn() {
-    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -u 'D:/proj')"`), CWD, null), "D:/proj");
-    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -m /d/proj)"`), CWD, null), "/d/proj");
-    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -w /d/proj)"`), CWD, null), "/d/proj");
-    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -t unix 'D:/proj')"`), CWD, null), "D:/proj");
-    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath 'D:/proj')"`), CWD, null), "D:/proj");
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -u 'D:/proj')"`), CWD), "D:/proj");
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -m /d/proj)"`), CWD), "/d/proj");
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -w /d/proj)"`), CWD), "/d/proj");
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -t unix 'D:/proj')"`), CWD), "D:/proj");
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath 'D:/proj')"`), CWD), "D:/proj");
   },
 });
 
@@ -987,11 +1154,11 @@ Deno.test({
   name: "cygpath: 查檔案系統的旗標不求值",
   fn() {
     // -d / -t dos / -s 都是 DOS 8.3 短名，-l 是長名還原，皆需查檔案系統
-    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -d 'D:/proj')"`), CWD, null), null);
-    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -t dos 'D:/proj')"`), CWD, null), null);
-    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -w -s 'D:/proj')"`), CWD, null), null);
-    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -w -l 'D:/proj')"`), CWD, null), null);
-    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -M 'D:/proj')"`), CWD, null), null);
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -d 'D:/proj')"`), CWD), null);
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -t dos 'D:/proj')"`), CWD), null);
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -w -s 'D:/proj')"`), CWD), null);
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -w -l 'D:/proj')"`), CWD), null);
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -M 'D:/proj')"`), CWD), null);
   },
 });
 
@@ -999,13 +1166,13 @@ Deno.test({
   ...WIN_ONLY,
   name: "cygpath: 系統目錄旗標與讀檔旗標不求值",
   fn() {
-    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -D)"`), CWD, null), null);
-    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -S)"`), CWD, null), null);
-    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -f list.txt)"`), CWD, null), null);
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -D)"`), CWD), null);
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -S)"`), CWD), null);
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -f list.txt)"`), CWD), null);
     // 輸出形式與 normalizeAbsolute 不保證等價
-    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -U 'D:/proj')"`), CWD, null), null);
-    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -w -r /d/proj)"`), CWD, null), null);
-    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -p /a:/b)"`), CWD, null), null);
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -U 'D:/proj')"`), CWD), null);
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -w -r /d/proj)"`), CWD), null);
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -p /a:/b)"`), CWD), null);
   },
 });
 
@@ -1013,10 +1180,37 @@ Deno.test({
   ...WIN_ONLY,
   name: "cygpath: -a 需要 known cwd；操作元必須恰一個",
   fn() {
-    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -a sub)"`), CWD, null), "sub");
-    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -a sub)"`), { kind: "unknown" }, null), null);
-    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -u a b)"`), CWD, null), null);
-    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -u)"`), CWD, null), null);
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -a sub)"`), CWD), "sub");
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -a sub)"`), { kind: "unknown" }), null);
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -u a b)"`), CWD), null);
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -u)"`), CWD), null);
+  },
+});
+
+Deno.test({
+  ...WIN_ONLY,
+  name: "cygpath: 只有磁碟形式與相對路徑可求值（mount 對映不等價）",
+  fn() {
+    // 磁碟形式：normalizeAbsolute 認得，等價
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -m /d/proj)"`), CWD), "/d/proj");
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -w 'C:\\proj')"`), CWD), "C:\\proj");
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -u sub/dir)"`), CWD), "sub/dir");
+    // 非磁碟形式的絕對路徑由 MSYS2 mount 表決定實際位置
+    // （實測 cygpath -m /usr/bin → C:/Program Files/Git/usr/bin）
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -m /usr/bin)"`), CWD), null);
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -m /mingw64/bin)"`), CWD), null);
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -u /tmp)"`), CWD), null);
+  },
+});
+
+Deno.test({
+  ...WIN_ONLY,
+  name: "cygpath: -C / -i 可求值；吃值旗標缺值 → null",
+  fn() {
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -C UTF8 -m /d/proj)"`), CWD), "/d/proj");
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -i -u /d/proj)"`), CWD), "/d/proj");
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -m /d/proj -C)"`), CWD), null);
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -m /d/proj -t)"`), CWD), null);
   },
 });
 
@@ -1024,7 +1218,7 @@ Deno.test({
   ...WIN_ONLY,
   name: "cygpath: 未知旗標不求值",
   fn() {
-    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -Z 'D:/proj')"`), CWD, null), null);
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -Z 'D:/proj')"`), CWD), null);
   },
 });
 
@@ -1032,7 +1226,7 @@ Deno.test({
   ignore: Deno.build.os === "windows",
   name: "cygpath: 非 Windows 平台一律不求值",
   fn() {
-    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -u 'D:/proj')"`), CWD, null), null);
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -u 'D:/proj')"`), CWD), null);
   },
 });
 ```
@@ -1094,14 +1288,40 @@ const cygpathEvaluator: SubstEvaluator = {
 
     if (operands.length !== 1) return null;
     if (needsKnownCwd && cwd.kind !== "known") return null;
-    // -u/-w/-m 只改變磁碟機與斜線的書寫形式；呼叫端的 applyPath 隨即 normalizeAbsolute，
-    // 在 Windows 上 D:/x、D:\x、/d/x 會正規化成同一字串，故回操作元原樣即可。
+    // 只有磁碟形式與相對路徑可回原樣：-u/-w/-m 對它們只改變磁碟機與斜線的書寫形式，
+    // 而呼叫端的 applyPath 隨即 normalizeAbsolute，D:/x、D:\x、/d/x 會正規化成同一字串。
+    // 其餘絕對路徑會經 MSYS2 mount 表對映（實測 `cygpath -m /usr/bin` →
+    // `C:/Program Files/Git/usr/bin`），normalizeAbsolute 不懂 mount 表 → 必須放棄。
+    if (!isNormalizationEquivalent(operands[0])) return null;
     return operands[0];
   },
 };
+
+/**
+ * 該路徑經 cygpath 轉換後，是否與 normalizeAbsolute 的語義等價。
+ * 成立的三種形態：Windows 磁碟絕對（X:/ 或 X:\）、MSYS 磁碟形式（/x 或 /x/…）、相對路徑。
+ * 其餘以 `/` 開頭者由 MSYS2 mount 表決定實際位置，不等價。
+ */
+function isNormalizationEquivalent(p: string): boolean {
+  if (/^[A-Za-z]:[/\\]/.test(p)) return true; // X:/… 或 X:\…
+  if (!p.startsWith("/")) return true; // 相對路徑
+  return /^\/[A-Za-z](\/|$)/.test(p); // /x 或 /x/…
+}
 ```
 
-把 `cygpathEvaluator` 加進 `EVALUATORS` 陣列。
+把 `cygpathEvaluator` 加進 `EVALUATORS`（**保留前一個 Task 註冊的五個成員**，並確保
+`cygpathEvaluator` 的 `const` 宣告位於 `EVALUATORS` 初始化之前）：
+
+```ts
+const EVALUATORS: SubstEvaluator[] = [
+  dirnameEvaluator,
+  basenameEvaluator,
+  pwdEvaluator,
+  echoEvaluator,
+  printfEvaluator,
+  cygpathEvaluator,
+];
+```
 
 - [ ] **Step 4: 執行測試確認通過**
 
@@ -1125,63 +1345,87 @@ git commit -m "feat(engine): add cygpath substitution evaluator (Windows only)"
 
 同時修兩個既有缺陷：`staticValue` 對 `-` 與 `~` 分別回字面 `"-"`、`"~"`，被 `applyPath` 當成相對路徑接成 `<cwd>/-`、`<cwd>/~`，於是 cwd 被判定成一個**專案內的錯誤路徑**而放行。
 
+**`applyCd` 的簽名不變（兩個參數）。** 展開 `cd ~` 需要 bash 的 `$HOME`，而把它送到 `applyCd`
+必須穿過 `walk` → `walkSequence` → `walkNode` 的整條遍歷（`walkNode` 內約 15 處遞迴、
+`walkSequence` 約 12 處），且 `src/engine/print_only.ts:230` 也是 `applyCd` 的呼叫端。
+相對地，展開後的 home 幾乎必然落在專案外 → 中央前置規則一照樣 `ask`，與「不展開即 UNKNOWN」
+在結果上等價，而後者更保守。因此 `cd ~` / `cd ~/x` 一律 `UNKNOWN`，不引入新參數，
+既有兩個呼叫端與既有測試都不必改。
+
+（這仍落在 spec 元件二的字面範圍內：spec 規定「home 未知 → `UNKNOWN`」，而 cd 路徑上的
+shell home 依本決策永遠不可得。路徑操作元的 tilde 展開不受影響——那條路徑走 `ScopeConfig.shellHome`，
+已在 Task 2 完成。）
+
 **Files:**
 - Modify: `src/engine/cwd.ts`（`applyCd`）
-- Modify: `src/engine/walk.ts`（`applyCd` 呼叫點需傳 `shellHome`）
 - Test: `src/engine/cwd_test.ts`（追加）
 
 - [ ] **Step 1: 寫失敗測試**
 
-追加到 `src/engine/cwd_test.ts`（沿用該檔既有的 helper 取得 `Command`）：
+追加到 `src/engine/cwd_test.ts`（沿用該檔既有的 `cmdOf` helper）：
 
 ```ts
 Deno.test("applyCd: cd - 靜態不可知 → unknown", () => {
-  assertEquals(applyCd(cmdOf("cd -"), { kind: "known", path: "/proj" }, null).kind, "unknown");
+  assertEquals(applyCd(cmdOf("cd -"), { kind: "known", path: "/proj" }).kind, "unknown");
 });
 
-Deno.test("applyCd: cd ~ 以 shellHome 展開", () => {
-  const r = applyCd(cmdOf("cd ~"), { kind: "known", path: "/proj" }, "/home/u");
-  assertEquals(r, { kind: "known", path: "/home/u", origin: "chain-cd" });
-  const r2 = applyCd(cmdOf("cd ~/src"), { kind: "known", path: "/proj" }, "/home/u");
-  assertEquals(r2, { kind: "known", path: "/home/u/src", origin: "chain-cd" });
-});
-
-Deno.test("applyCd: cd ~ 在 shellHome 未知時 unknown", () => {
-  assertEquals(applyCd(cmdOf("cd ~"), { kind: "known", path: "/proj" }, null).kind, "unknown");
+Deno.test("applyCd: cd ~ 與 cd ~/x 一律 unknown（不展開）", () => {
+  assertEquals(applyCd(cmdOf("cd ~"), { kind: "known", path: "/proj" }).kind, "unknown");
+  assertEquals(applyCd(cmdOf("cd ~/src"), { kind: "known", path: "/proj" }).kind, "unknown");
+  assertEquals(applyCd(cmdOf("cd ~user/x"), { kind: "known", path: "/proj" }).kind, "unknown");
 });
 
 Deno.test('applyCd: cd "~" 引號抑制展開，維持相對語義', () => {
-  const r = applyCd(cmdOf('cd "~"'), { kind: "known", path: "/proj" }, "/home/u");
+  const r = applyCd(cmdOf('cd "~"'), { kind: "known", path: "/proj" });
   assertEquals(r, { kind: "known", path: "/proj/~", origin: "chain-cd" });
 });
 
 Deno.test("applyCd: 混合引號 tilde 形態 → unknown", () => {
   // `cd ~/"src"` 的開頭 ~ 仍會展開，但後段是引號內容；不臆測混合展開結果
-  assertEquals(applyCd(cmdOf('cd ~/"src"'), { kind: "known", path: "/proj" }, "/home/u").kind, "unknown");
+  assertEquals(applyCd(cmdOf('cd ~/"src"'), { kind: "known", path: "/proj" }).kind, "unknown");
 });
 
 Deno.test("applyCd: 可求值的 substitution 推導出具體 cwd", () => {
-  const r = applyCd(cmdOf('cd "$(dirname /proj/src/a.ts)"'), { kind: "known", path: "/proj" }, null);
+  const r = applyCd(cmdOf('cd "$(dirname /proj/src/a.ts)"'), { kind: "known", path: "/proj" });
   assertEquals(r, { kind: "known", path: "/proj/src", origin: "chain-cd" });
 });
 
 Deno.test("applyCd: 不可求值的 substitution 仍為 unknown", () => {
-  assertEquals(applyCd(cmdOf('cd "$(uname -a)"'), { kind: "known", path: "/proj" }, null).kind, "unknown");
-  assertEquals(applyCd(cmdOf("cd $(dirname /a/b)"), { kind: "known", path: "/proj" }, null).kind, "unknown");
+  assertEquals(applyCd(cmdOf('cd "$(uname -a)"'), { kind: "known", path: "/proj" }).kind, "unknown");
+  assertEquals(applyCd(cmdOf("cd $(dirname /a/b)"), { kind: "known", path: "/proj" }).kind, "unknown");
+});
+
+Deno.test("applyCd: 求值結果為 - 或 ~ 形態時也要擋下", () => {
+  // basename ./- → "-"；bash 會把它當成 cd -（回上一個工作目錄），不是相對路徑 "./-"
+  assertEquals(applyCd(cmdOf(`cd "$(basename ./-)"`), { kind: "known", path: "/proj" }).kind, "unknown");
+  assertEquals(applyCd(cmdOf(`cd "$(printf '%s' -)"`), { kind: "known", path: "/proj" }).kind, "unknown");
+  // 求值出的字面 ~ 由 bash 視為普通字元（展開早於 substitution），故維持相對語義
+  const r = applyCd(cmdOf(`cd "$(echo '~')"`), { kind: "known", path: "/proj" });
+  assertEquals(r, { kind: "known", path: "/proj/~", origin: "chain-cd" });
+});
+
+Deno.test({
+  ignore: Deno.build.os !== "windows",
+  name: "applyCd: cygpath 推導出專案內 cwd（本次的主要需求）",
+  fn() {
+    const r = applyCd(cmdOf(`cd "$(cygpath -u 'D:/proj/src')"`), { kind: "known", path: "D:/proj" });
+    assertEquals(r, { kind: "known", path: "D:/proj/src", origin: "chain-cd" });
+  },
 });
 ```
 
 - [ ] **Step 2: 執行測試確認失敗**
 
 Run: `deno test --allow-env src/engine/cwd_test.ts`
-Expected: FAIL（`applyCd` 目前只有兩個參數，型別檢查即失敗）
+Expected: FAIL。`cd -` 目前被當成相對路徑接成 `/proj/-`、`cd ~` 接成 `/proj/~`，
+substitution 形態則全部回 unknown。
 
 - [ ] **Step 3: 實作 cwd.ts**
 
 `src/engine/cwd.ts` 的 import 加入：
 
 ```ts
-import { expandTilde, hasUnquotedLeadingTilde } from "./tilde.ts";
+import { hasUnquotedLeadingTilde } from "./tilde.ts";
 import { evalSubstitutionWord } from "./subst_eval.ts";
 ```
 
@@ -1192,79 +1436,60 @@ import { evalSubstitutionWord } from "./subst_eval.ts";
  * `cd` 之後的新 threaded cwd。無參數（=$HOME）、動態參數、或不可解析的形態 → unknown。
  *
  * 取值順序：
- *   1. 未加引號的 leading tilde → 僅 `~` / `~/<rest>` 形態可展開（需 shellHome）；
- *      混合引號形態（`~/"src"`）與 `~user` / `~+` / `~-` 一律 unknown。
+ *   1. 未加引號的 leading tilde（`~`、`~/x`、`~user`、`~/"src"`）→ unknown。
+ *      展開需要 bash 的 $HOME，而把它送到這裡必須穿過整條 walk 遍歷與 print_only 的呼叫端；
+ *      展開後的 home 幾乎必然落在專案外、結果同為 ask，故直接取更保守的一邊。
  *   2. `cd -`（回上一個工作目錄）靜態不可知 → unknown。
  *   3. 靜態 token → 直接使用。
- *   4. 單一 `"$(…)"` 且內層可靜態求值 → 用求值結果。
+ *   4. 單一 `"$(…)"` 且內層可靜態求值 → 用求值結果，並對結果再跑一次步驟 2 的檢查。
  */
-export function applyCd(cmd: Command, cwd: CwdState, shellHome: string | null): CwdState {
+export function applyCd(cmd: Command, cwd: CwdState): CwdState {
   if (cmd.suffix.length === 0) return UNKNOWN; // cd 無參數 = $HOME
   const target = cmd.suffix[0];
 
-  if (hasUnquotedLeadingTilde(target)) {
-    const v = staticValue(target);
-    if (v === null) return UNKNOWN;
-    // parts 非空 = 混合引號形態（如 ~/"src"）：開頭 ~ 會展開、後段是引號內容，
-    // 正確模擬需逐 part 重建語義 → 保守放棄。
-    if (target.parts && target.parts.length > 0) return UNKNOWN;
-    const expanded = expandTilde(v, shellHome);
-    if (expanded === null) return UNKNOWN;
-    return applyPath(cwd, expanded);
-  }
+  // 未加引號的 leading tilde：一律不展開（含 `~`、`~/x`、`~user`、混合引號的 `~/"src"`）。
+  // 引號包裝的 `"~"` 不命中此述詞，維持 <cwd>/~ 的相對語義——那對它是正確的。
+  if (hasUnquotedLeadingTilde(target)) return UNKNOWN;
 
   const val = staticValue(target);
-  if (val === "-") return UNKNOWN; // cd - 回上一個工作目錄，靜態不可知
-  if (val !== null) return applyPath(cwd, val);
+  if (val !== null) return applyTarget(cwd, val);
 
-  const evaluated = evalSubstitutionWord(target, cwd, shellHome);
+  const evaluated = evalSubstitutionWord(target, cwd);
   if (evaluated === null) return UNKNOWN;
-  return applyPath(cwd, evaluated);
+  return applyTarget(cwd, evaluated);
+}
+
+/**
+ * 把已取得的 cd 目標字串接上 cwd。`-` 需在這裡擋，而不是只擋原始 token——
+ * 求值結果同樣可能是 `-`（`basename ./-`、`printf '%s' -`），而 bash 對 `cd -` 的解讀
+ * 是「回上一個工作目錄」，不是相對路徑 `./-`。
+ */
+function applyTarget(cwd: CwdState, value: string): CwdState {
+  if (value === "-") return UNKNOWN;
+  return applyPath(cwd, value);
 }
 ```
 
-- [ ] **Step 4: 更新 walk.ts 的呼叫點**
+> 求值出的字面 `~`（`cd "$(echo '~')"`）**不**需要擋：bash 的 tilde expansion 早於
+> command substitution，展開結果中的 `~` 只是普通字元，相對語義 `<cwd>/~` 是正確的。
 
-`src/engine/walk.ts` 需要把 `shellHome` 一路傳到 `applyCd`。`walk` 的簽名加一個選填參數，並在 `walkNode` 之間傳遞：
-
-```ts
-export function walk(
-  script: Script,
-  initialCwd: CwdState,
-  root: string,
-  shellHome: string | null = null,
-): CommandInvocation[] {
-```
-
-`walkNode` 同樣加參數，並把 `case "Command"` 內的呼叫改為：
-
-```ts
-      if (persistent && isCd(node)) return applyCd(node, cwd, shellHome);
-```
-
-> 實作提示：`walkNode` 在檔內有多處遞迴呼叫，逐一補上新參數即可；`deno task check`
-> 會指出任何遺漏的呼叫點。
-
-`src/engine/evaluate.ts` 的 `walk` 呼叫改為：
-
-```ts
-    const invocations = walk(script, initialCwd, root, shellHome);
-```
-
-- [ ] **Step 5: 執行測試確認通過**
+- [ ] **Step 4: 執行測試確認通過**
 
 Run: `deno test --allow-env src/engine/cwd_test.ts`
 Expected: PASS
 
-- [ ] **Step 6: 全量測試與驗證**
+- [ ] **Step 5: 全量測試與驗證**
 
 Run: `deno task check && deno task lint && deno task test`
-Expected: 全綠
+Expected: 全綠。Task 4 留下的「內層加引號的字面 ~ 可求值」在上一個 Task 註冊 `echo` 後已轉綠。
 
-- [ ] **Step 7: 提交**
+`src/engine/walk.ts`、`src/engine/print_only.ts` 與既有 `cwd_test.ts` 的 `applyCd` 呼叫**都不需修改**
+（簽名未變）。若 `deno task check` 指出這些檔案有錯，代表實作誤改了簽名。
+
+- [ ] **Step 6: 提交**
 
 ```bash
-git add src/engine/cwd.ts src/engine/cwd_test.ts src/engine/walk.ts src/engine/evaluate.ts
+git add src/engine/cwd.ts src/engine/cwd_test.ts
 git commit -m "feat(engine): derive cd targets from evaluable substitutions; fix cd - and cd ~"
 ```
 
@@ -1321,6 +1546,9 @@ Deno.test("base64: -w 吃值，其值不得被當成路徑", () => {
   assertEquals(base64Rule.evaluate(ctxOf("base64 -w 0 src/a.ts")).kind, "allow");
   assertEquals(base64Rule.evaluate(ctxOf("base64 --wrap=0 src/a.ts")).kind, "allow");
   assertEquals(base64Rule.evaluate(ctxOf("base64 -w 0")).kind, "allow");
+  // 關鍵斷言：`0` 若被誤當成路徑操作元，它本身會解析成專案內的 /proj/0 而測不出錯。
+  // 改用一個「當成路徑就會超出範圍」的值，才真正釘住 -w 吃值這件事。
+  assertEquals(base64Rule.evaluate(ctxOf("base64 -w /etc/passwd src/a.ts")).kind, "allow");
 });
 
 Deno.test("base64: 專案外檔案 → ask", () => {
@@ -1382,11 +1610,7 @@ export const base64Rule: CommandRule = flagGatedReader({
 - [ ] **Step 4: 執行測試確認通過**
 
 Run: `deno test --allow-env src/rules/commands/base64_test.ts`
-Expected: FAIL —— `base64Rule` 尚未註冊到 allowlist 不影響本測試，但若失敗訊息顯示
-`lookupRule` 相關錯誤，請確認測試直接呼叫 `base64Rule.evaluate`（不經 allowlist）。
-
-Run 再次: `deno test --allow-env src/rules/commands/base64_test.ts`
-Expected: PASS
+Expected: PASS（測試直接呼叫 `base64Rule.evaluate`，不經 allowlist，故不需先註冊）
 
 - [ ] **Step 5: 驗證與提交**
 
@@ -1456,6 +1680,13 @@ Deno.test("test: 一元檔案測試 + 專案內路徑 → allow", () => {
 
 Deno.test("test: 專案外路徑 → ask", () => {
   assertEquals(testRule.evaluate(ctxOf("test -f /etc/passwd")).kind, "ask");
+});
+
+Deno.test("test: tilde 操作元依引號與否分流", () => {
+  // 未加引號 → bash 展開為 $HOME（專案外）。ctxOf 的 rootScope 未設 shellHome → 不可解析 → ask
+  assertEquals(testRule.evaluate(ctxOf("test -f ~/secret")).kind, "ask");
+  // 加引號 → bash 不展開，指向 /proj/~/secret（專案內）→ allow
+  assertEquals(testRule.evaluate(ctxOf('test -f "~/secret"')).kind, "allow");
 });
 
 Deno.test("test: 雙重語義的 -a / -o 一律 ask", () => {
@@ -1634,6 +1865,34 @@ Deno.test("cygpath 形態 C：輸出系統目錄，無操作元", () => {
   assertEquals(cygpathRule.evaluate(ctxOf("cygpath -D")).kind, "allow");
   assertEquals(cygpathRule.evaluate(ctxOf("cygpath -S")).kind, "allow");
   assertEquals(cygpathRule.evaluate(ctxOf("cygpath -F 0")).kind, "allow");
+  assertEquals(cygpathRule.cwdIndependent?.(ctxOf("cygpath -D")), true);
+});
+
+Deno.test("cygpath 形態 C：帶路徑操作元 → ask", () => {
+  assertEquals(cygpathRule.evaluate(ctxOf("cygpath -D /outside/x")).kind, "ask");
+  assertEquals(cygpathRule.evaluate(ctxOf("cygpath -F 0 /outside/x")).kind, "ask");
+});
+
+Deno.test("cygpath：-t 未知值 → ask", () => {
+  assertEquals(cygpathRule.evaluate(ctxOf("cygpath -t nonsense src/a.ts")).kind, "ask");
+});
+
+Deno.test("cygpath：-p 與查檔案系統的旗標併用 → ask", () => {
+  // -p 的操作元是 PATH 列表，整串丟給 resolvePath 會被當成單一路徑而誤判
+  assertEquals(cygpathRule.evaluate(ctxOf("cygpath -w -s -p src:/c/Windows")).kind, "ask");
+  // 但 -p 單用（純字串轉換）仍 allow
+  assertEquals(cygpathRule.evaluate(ctxOf("cygpath -p /a:/b")).kind, "allow");
+});
+
+Deno.test("cygpath：形態 B 的每個旗標都不得取得 cwd 豁免", () => {
+  for (const flag of ["-d", "-s", "-l", "-M"]) {
+    assertEquals(
+      cygpathRule.cwdIndependent?.(ctxOf(`cygpath ${flag} src/a.ts`)),
+      false,
+      `${flag} 不應豁免`,
+    );
+  }
+  assertEquals(cygpathRule.cwdIndependent?.(ctxOf("cygpath -t dos src/a.ts")), false);
 });
 
 Deno.test("cygpath：讀檔旗標與未知旗標 → ask", () => {
@@ -1680,6 +1939,10 @@ const ASK_FLAGS = new Set(["-f", "-o", "-c"]);
 interface Scan {
   /** 出現任何形態 B 旗標（含 -t dos）。 */
   queriesFs: boolean;
+  /** 出現任何形態 C（輸出系統目錄）旗標。 */
+  systemDir: boolean;
+  /** 出現 -p（操作元是 PATH 列表，不是單一路徑）。 */
+  pathList: boolean;
   /** 需要 ask 的理由；null 表示通過。 */
   askReason: string | null;
   operands: Word[];
@@ -1698,41 +1961,51 @@ function scan(ctx: RuleContext): Scan {
 
 function doScan(ctx: RuleContext): Scan {
   let queriesFs = false;
+  let systemDir = false;
+  let pathList = false;
   const operands: Word[] = [];
   const argv = ctx.argv;
+  const fail = (reason: string): Scan => ({ queriesFs, systemDir, pathList, askReason: reason, operands });
+
   for (let i = 0; i < argv.length; i++) {
     const t = staticValue(argv[i]);
-    if (t === null) {
-      return { queriesFs, askReason: "cygpath：含動態 token，無法靜態判定", operands };
-    }
+    if (t === null) return fail("cygpath：含動態 token，無法靜態判定");
     if (!t.startsWith("-") || t === "-") {
       operands.push(argv[i]);
       continue;
     }
     if (ASK_FLAGS.has(t)) {
-      return { queriesFs, askReason: `cygpath：${t} 會從檔案讀取操作元／選項或操作行程`, operands };
+      return fail(`cygpath：${t} 會從檔案讀取操作元／選項或操作行程`);
     }
     if (SHAPE_B.has(t)) {
       queriesFs = true;
       continue;
     }
-    if (SHAPE_A_VALUELESS.has(t) || SHAPE_C_VALUELESS.has(t)) continue;
-    if (SHAPE_A_WITH_VALUE.has(t) || SHAPE_C_WITH_VALUE.has(t)) {
-      i++;
-      if (i >= argv.length) {
-        return { queriesFs, askReason: `cygpath：${t} 缺少值`, operands };
-      }
-      const v = staticValue(argv[i]);
-      if (v === null) {
-        return { queriesFs, askReason: "cygpath：旗標值為動態 token", operands };
-      }
-      // -t dos 等同 -d（DOS 8.3 短名，需查檔案系統）
-      if (t === "-t" && !SAFE_TYPES.has(v)) queriesFs = true;
+    if (t === "-p") {
+      pathList = true;
       continue;
     }
-    return { queriesFs, askReason: `cygpath：未列入安全集合的旗標 ${t}`, operands };
+    if (SHAPE_C_VALUELESS.has(t)) {
+      systemDir = true;
+      continue;
+    }
+    if (SHAPE_A_VALUELESS.has(t)) continue;
+    if (SHAPE_A_WITH_VALUE.has(t) || SHAPE_C_WITH_VALUE.has(t)) {
+      if (SHAPE_C_WITH_VALUE.has(t)) systemDir = true;
+      i++;
+      if (i >= argv.length) return fail(`cygpath：${t} 缺少值`);
+      const v = staticValue(argv[i]);
+      if (v === null) return fail("cygpath：旗標值為動態 token");
+      if (t === "-t") {
+        // -t dos 等同 -d（DOS 8.3 短名，需查檔案系統）；其餘未知值不在 allowlist 內
+        if (v === "dos") queriesFs = true;
+        else if (!SAFE_TYPES.has(v)) return fail(`cygpath：未列入安全集合的 -t 值 ${v}`);
+      }
+      continue;
+    }
+    return fail(`cygpath：未列入安全集合的旗標 ${t}`);
   }
-  return { queriesFs, askReason: null, operands };
+  return { queriesFs, systemDir, pathList, askReason: null, operands };
 }
 
 /**
@@ -1751,7 +2024,16 @@ export const cygpathRule: CommandRule = {
   evaluate(ctx: RuleContext): RuleVerdict {
     const s = scan(ctx);
     if (s.askReason !== null) return ask(s.askReason);
+    // 形態 C 不接受路徑操作元：輸出與輸入無關，給了操作元代表意圖不明
+    if (s.systemDir && s.operands.length > 0) {
+      return ask("cygpath：輸出系統目錄的形態不接受路徑操作元");
+    }
     if (s.queriesFs) {
+      // -p 的操作元是以 : / ; 分隔的 PATH 列表，cygpath 會逐項查詢。
+      // 整串丟給 resolvePath 會被當成單一路徑而誤判，故與查檔案系統的形態併用時一律 ask。
+      if (s.pathList) {
+        return ask("cygpath：-p 的操作元是 PATH 列表，無法逐項做範圍檢查");
+      }
       for (const op of s.operands) {
         if (ctx.resolvePath(op) !== "in-project") {
           return ask(`cygpath：查詢檔案系統的形態，路徑超出專案範圍（${op.value}）`);
@@ -1884,6 +2166,24 @@ Deno.test("npm: 帶 tarball 副檔名的裸名會被當成本地檔 → ask", ()
   assertEquals(npmRule.evaluate(ctxOf("npm view archive.tar")).kind, "ask");
 });
 
+Deno.test("npm: 版本後綴也必須合法（否則是本地目錄 spec）", () => {
+  // npm-package-arg 把 `pkg@..` 解析成指向上層目錄的本地 spec
+  assertEquals(npmRule.evaluate(ctxOf("npm view pkg@..")).kind, "ask");
+  assertEquals(npmRule.evaluate(ctxOf("npm view pkg@.")).kind, "ask");
+  assertEquals(npmRule.evaluate(ctxOf("npm view pkg@")).kind, "ask");
+  assertEquals(npmRule.evaluate(ctxOf("npm view pkg@@bad")).kind, "ask");
+  assertEquals(npmRule.evaluate(ctxOf('npm view "not a package"')).kind, "ask");
+  // 合法的 range / tag 仍放行
+  assertEquals(npmRule.evaluate(ctxOf("npm view pkg@latest")).kind, "allow");
+  assertEquals(npmRule.evaluate(ctxOf('npm view "pkg@^1.2.3"')).kind, "allow");
+});
+
+Deno.test("npm: 安全吃值旗標缺值或空值 → ask", () => {
+  assertEquals(npmRule.evaluate(ctxOf("npm view markdown-it --otp")).kind, "ask");
+  assertEquals(npmRule.evaluate(ctxOf("npm view markdown-it --otp=")).kind, "ask");
+  assertEquals(npmRule.evaluate(ctxOf("npm view markdown-it --otp 123456")).kind, "allow");
+});
+
 Deno.test("npm: 危險旗標 → ask", () => {
   assertEquals(npmRule.evaluate(ctxOf("npm view markdown-it --prefix /outside")).kind, "ask");
   assertEquals(npmRule.evaluate(ctxOf("npm view markdown-it --userconfig /outside/.npmrc")).kind, "ask");
@@ -1946,6 +2246,24 @@ const VERSION_FLAGS = new Set(["--version", "-v"]);
  */
 const TARBALL_SUFFIXES = [".tgz", ".tar", ".tar.gz"];
 
+/** 套件名：字母數字開頭，其後允許 . _ - 與字母數字。 */
+const PKG_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+/**
+ * 版本／range／tag 後綴：允許字母數字與常見 range 符號（. - + ^ ~ > < = * | 空白）。
+ * **不得含 `/`、`\`、`:`，也不得含獨立的 `.` 或 `..` 段**——`pkg@..` 會被
+ * npm-package-arg 解析成指向上層目錄的本地 spec。
+ */
+const PKG_SUFFIX = /^[A-Za-z0-9.\-+^~><=*| ]+$/;
+
+function isValidSuffix(suffix: string): boolean {
+  if (suffix === "") return false;
+  if (!PKG_SUFFIX.test(suffix)) return false;
+  // 排除純由 . 組成的形態（`.`、`..`、`...`）與含 `..` 者
+  if (/^\.+$/.test(suffix)) return false;
+  if (suffix.includes("..")) return false;
+  return true;
+}
+
 function isRegistrySpec(value: string): boolean {
   if (value === "") return false;
   if (/^[.~/\-]/.test(value)) return false;
@@ -1958,22 +2276,23 @@ function isRegistrySpec(value: string): boolean {
     const slash = rest.indexOf("/");
     if (slash === -1) return false; // `@foo` 不是合法 scope spec
     const scope = rest.slice(1, slash);
-    if (scope === "" || scope.includes("@")) return false;
+    if (!PKG_NAME.test(scope)) return false;
     rest = rest.slice(slash + 1);
   }
   if (rest === "" || rest.includes("/")) return false;
-  // 版本後綴：取第一個 `@` 之前為套件名
   const at = rest.indexOf("@");
-  const name = at === -1 ? rest : rest.slice(0, at);
-  return name !== "" && !name.startsWith(".");
+  if (at === -1) return PKG_NAME.test(rest);
+  // 有版本後綴：名稱與後綴都必須合法。只驗名稱會放過 `pkg@..`（本地目錄 spec）。
+  return PKG_NAME.test(rest.slice(0, at)) && isValidSuffix(rest.slice(at + 1));
 }
 
 /**
  * npm：子指令 + 操作元雙層 allowlist。
  *
- * 注意本規則**管不到**的事：所有 npm 呼叫都會在 dispatch 子指令前載入設定，沿目錄樹
- * 向上找 local prefix 並讀取該處 `.npmrc`（實測祖先的 `.npmrc` 可重導 logs-dir）。
- * 該限制記在 spec 的「Non-goals / Accepted limitations」，不由本規則處理。
+ * 注意本規則**管不到**的事：所有 npm 呼叫都會在 dispatch 子指令前載入設定，沿目錄樹向上找
+ * local prefix 並讀取該處 `.npmrc`——實測在祖先目錄放 package.json 與設定 logs-dir 的 .npmrc，
+ * `npm view` 的 debug log 就會寫進該處。同一機制亦可重導 cache 與 registry。這是 npm 的既有
+ * 設定模型，無法靠挑選子指令規避，也不由本規則處理；放行 npm 即等於接受這層行為。
  */
 export const npmRule: CommandRule = {
   names: ["npm"],
@@ -1998,7 +2317,12 @@ export const npmRule: CommandRule = {
           continue;
         }
         if (SAFE_VALUE_FLAGS.has(name)) {
-          if (eq === -1) i++; // 吃掉值
+          if (eq !== -1) {
+            if (t.slice(eq + 1) === "") return ask(`npm：${name} 的值為空`);
+            continue;
+          }
+          i++; // 吃掉下一個 token 當值
+          if (i >= tokens.length) return ask(`npm：${name} 缺少值`);
           continue;
         }
         // 未列入安全集合者一律 ask——同時涵蓋 --prefix/--userconfig/--globalconfig/
@@ -2090,43 +2414,110 @@ Expected: PASS。若拋出 `duplicate rule for command: …`，表示該指令�
 
 - [ ] **Step 3: 寫 e2e 測試**
 
-追加到 `src/main_test.ts`（沿用該檔既有的子行程執行 helper）：
+既有 helper 的簽名是 `runHook(payload: unknown, projectDir: string): Promise<string>`——
+**接受 hook payload 物件、回傳 stdout 字串**，不是指令字串、也不是解析後的物件。
+另有 `runHookWithEnv(...)`（`src/main_test.ts:159`）供需要注入環境變數的案例使用。
+追加到 `src/main_test.ts`，沿用該檔既有的 payload 建構與專案目錄取得方式：
 
 ```ts
-Deno.test("e2e: 本次四條真實指令", async () => {
-  // gh api … | base64 -d | grep … | head -40 —— base64 不再是卡點
-  assertEquals(
-    (await runHook("base64 -d src/a.ts | head -40", PROJ)).permissionDecision,
-    "allow",
+/** 由指令字串組出 hook payload，並取出決策。 */
+async function decisionOf(command: string, projectDir: string): Promise<string> {
+  const out = await runHook(
+    { tool_name: "Bash", tool_input: { command }, cwd: projectDir },
+    projectDir,
   );
+  return JSON.parse(out).hookSpecificOutput.permissionDecision;
+}
+
+Deno.test("e2e: 本次的真實指令改為自動放行", async () => {
+  const proj = await makeProjectDir(); // 沿用既有測試建立暫時專案目錄的方式
+  assertEquals(await decisionOf("base64 -d deno.json | head -40", proj), "allow");
+  assertEquals(await decisionOf("test -f deno.json && cat deno.json | head -100", proj), "allow");
   assertEquals(
-    (await runHook("test -f node_modules/tarn/README.md && cat node_modules/tarn/README.md | head -100", PROJ))
-      .permissionDecision,
-    "allow",
-  );
-  assertEquals(
-    (await runHook("npm view markdown-it version && npm view marked version", PROJ)).permissionDecision,
+    await decisionOf("npm view markdown-it version && npm view marked version", proj),
     "allow",
   );
 });
 
-Deno.test("e2e: tilde 漏洞已堵上", async () => {
-  assertEquals((await runHook("cat ~/.ssh/id_rsa", PROJ)).permissionDecision, "ask");
-  assertEquals((await runHook("grep x ~/secret", PROJ)).permissionDecision, "ask");
-  assertEquals((await runHook("test -f ~/secret", PROJ)).permissionDecision, "ask");
-  assertEquals((await runHook("base64 ~/secret", PROJ)).permissionDecision, "ask");
+Deno.test("e2e: tilde 漏洞已堵上（未加引號展開為 HOME）", async () => {
+  const proj = await makeProjectDir();
+  for (const cmd of ["cat ~/secret", "cat ~/.ssh/id_rsa", "grep x ~/secret", "head -5 ~/secret", "test -f ~/secret", "base64 ~/secret"]) {
+    assertEquals(await decisionOf(cmd, proj), "ask", cmd);
+  }
+  // 不支援的 tilde 形態同樣 ask
+  assertEquals(await decisionOf("cat ~user/secret", proj), "ask");
+  assertEquals(await decisionOf("cat ~+/secret", proj), "ask");
+});
+
+Deno.test("e2e: 引號形態的 ~ 指向專案內，維持 allow", async () => {
+  const proj = await makeProjectDir();
+  assertEquals(await decisionOf('cat "~/secret"', proj), "allow");
 });
 
 Deno.test("e2e: 動態 cd 目標不再繞過 cwd 檢查", async () => {
-  assertEquals(
-    (await runHook('cd "$(uname -a)" && git log --oneline -3', PROJ)).permissionDecision,
-    "ask",
-  );
+  const proj = await makeProjectDir();
+  assertEquals(await decisionOf('cd "$(uname -a)" && git log --oneline -3', proj), "ask");
+});
+
+Deno.test({
+  ignore: Deno.build.os !== "windows",
+  name: "e2e: cygpath 推導 cwd 後，相對路徑讀取被正確判定（本次主要需求）",
+  async fn() {
+    const proj = await makeProjectDir();
+    // 專案內：推導出的 cwd 在範圍內 → 相對路徑可解析 → allow
+    assertEquals(
+      await decisionOf(`cd "$(cygpath -u '${proj}')" && cat deno.json`, proj),
+      "allow",
+    );
+    // 專案外：推導出的 cwd 落在範圍外 → 中央前置規則一 → ask
+    assertEquals(
+      await decisionOf(`cd "$(cygpath -u 'C:/Windows')" && cat deno.json`, proj),
+      "ask",
+    );
+  },
 });
 ```
 
-> 註：`runHook` / `PROJ` 請沿用 `src/main_test.ts` 既有的 helper 名稱與簽名；
-> 若既有 helper 只接受指令字串，照既有形式呼叫即可。
+環境敏感的案例用 `runHookWithEnv`，不要改動既有 `runHook` 的契約：
+
+```ts
+Deno.test("e2e: HOME 與 USERPROFILE 不同時，指令的 ~ 依 HOME 展開", async () => {
+  const proj = await makeProjectDir();
+  // 只授權 USERPROFILE 底下的 cache，但指令的 ~ 應以 HOME 展開 → 仍 ask
+  await writeSettings(proj, { permissions: { allow: ["Read(//settings-home/cache/**)"] } });
+  const out = await runHookWithEnv(
+    { tool_name: "Bash", tool_input: { command: "cat ~/cache/x" }, cwd: proj },
+    proj,
+    { HOME: "/bash-home", USERPROFILE: "/settings-home" },
+  );
+  assertEquals(JSON.parse(out).hookSpecificOutput.permissionDecision, "ask");
+});
+
+Deno.test("e2e: HOME 底下的路徑被明確授權時 → allow", async () => {
+  const proj = await makeProjectDir();
+  await writeSettings(proj, { permissions: { allow: ["Read(//bash-home/cache/**)"] } });
+  const out = await runHookWithEnv(
+    { tool_name: "Bash", tool_input: { command: "cat ~/cache/x" }, cwd: proj },
+    proj,
+    { HOME: "/bash-home", USERPROFILE: "/bash-home" },
+  );
+  assertEquals(JSON.parse(out).hookSpecificOutput.permissionDecision, "allow");
+});
+
+Deno.test("e2e: HOME 未設定時，~ 形態一律 ask", async () => {
+  const proj = await makeProjectDir();
+  const out = await runHookWithEnv(
+    { tool_name: "Bash", tool_input: { command: "cat ~/x" }, cwd: proj },
+    proj,
+    { USERPROFILE: "/settings-home" }, // 刻意不給 HOME
+  );
+  assertEquals(JSON.parse(out).hookSpecificOutput.permissionDecision, "ask");
+});
+```
+
+> `makeProjectDir` / `writeSettings` 是示意名稱——請沿用 `src/main_test.ts` 既有的
+> 暫時專案目錄建立與 settings 寫入方式（該檔已有對應 helper，直接複用，不要新增平行實作）。
+> `runHookWithEnv` 的第三個參數請照該 helper 的實際簽名傳入環境變數。
 
 - [ ] **Step 4: 執行 e2e 測試**
 
@@ -2147,8 +2538,14 @@ Expected: 產出 `dist/permission-checker.exe`
 
 ```bash
 cd /d/claude-code-permission-checker
-run() { echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":$1},\"cwd\":\"D:/claude-code-permission-checker\"}" \
-  | CLAUDE_PROJECT_DIR="D:/claude-code-permission-checker" ./dist/permission-checker.exe; echo; }
+# 逐條印出決策並斷言 exit 0——不可讓 echo 蓋掉 binary 的離開碼
+run() {
+  out=$(echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":$1},\"cwd\":\"D:/claude-code-permission-checker\"}" \
+    | CLAUDE_PROJECT_DIR="D:/claude-code-permission-checker" ./dist/permission-checker.exe)
+  rc=$?
+  printf '%s\n  [exit=%s]\n' "$out" "$rc"
+  [ "$rc" -eq 0 ] || echo "  !!! 違反不變量：hook 必須永遠 exit 0"
+}
 
 # 期望 allow
 run '"npm view markdown-it version && npm view marked version"'
@@ -2178,11 +2575,25 @@ Expected：前四條 `permissionDecision: "allow"`、後五條 `"ask"`，且**�
    `subst_eval.ts` 的求值框架，以及 `cd -` / `cd ~` 的語義。
 2. 新增 `src/engine/tilde.ts` 與 `src/engine/subst_eval.ts` 的職責說明。
 3. 「四條中央前置規則」的規則一：補上 `cwd.kind === "unknown"` 也 ask，並說明初始 cwd 恆為 known。
-4. 「⚠️ 不要再犯的問題」新增一則：`resolvePath` 對未加引號的 leading tilde 必須先展開
-   （shell home 用 `HOME`，不可用 `resolveHome`——後者在 Windows 優先 `USERPROFILE`），
-   `resolvePathValue` 對以 `~` 開頭的字串 fail-closed。
+4. 「⚠️ 不要再犯的問題」新增三則：
+   - `resolvePath` 對未加引號的 leading tilde 必須先展開（shell home 用 `HOME`，不可用
+     `resolveHome`——後者在 Windows 優先 `USERPROFILE`），`resolvePathValue` 對以 `~` 開頭的
+     字串 fail-closed；引號形態（`"~/x"`）必須維持相對語義，不可一併擋掉。
+   - cygpath 的「回操作元原樣」只對磁碟形式與相對路徑成立：`cygpath -m /usr/bin` 會經 MSYS2
+     mount 表變成 `C:/Program Files/Git/usr/bin`，而 `normalizeAbsolute` 不懂 mount 表。
+   - `base64` 的 `-w` 吃值，但 `md5sum`/`sha256sum` 的 `-w` 是不吃值的 `--warn`——旗標 arity
+     不可跨指令共用，否則會讓 checksum 工具的路徑操作元被當成旗標值而漏檢。
 
-同時在 `rules/` 段落補上新增的四條規則檔。
+5. 「已接受 over-deny / 已接受繞道」區塊補上本次的兩條**已接受限制**（spec 已裁決，文件需同步）：
+   - **`cd` 一律視為成功**：目標目錄不存在時 bash 會留在原地，後續相對路徑解析到別處。
+     已知的兩個純詞法收緊方案（只信任 `&&` 之後的 cd、或要求 cd 前後兩個 cwd 都通過檢查）
+     因誤殺與改動面被擱置，不是無解。
+   - **npm 的設定探索與寫入位置不納入判定**：所有 npm 呼叫都在 dispatch 前沿目錄樹向上讀
+     `.npmrc`，該檔可重導 `cache` / `logs-dir` / `registry`；npm 也會寫入並輪替刪除自己的
+     debug log。放行 `npm view`/`ping`/`whoami` 即等於接受這層行為。
+
+同時在 `rules/` 段落補上新增的四條規則檔，並在「架構」段落補上 `src/engine/tilde.ts`
+與 `src/engine/subst_eval.ts`。
 
 - [ ] **Step 8: 最終提交**
 
