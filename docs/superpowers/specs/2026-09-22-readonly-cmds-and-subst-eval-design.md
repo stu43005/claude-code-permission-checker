@@ -108,7 +108,11 @@ export function evalSubstitutionWord(word: Word, cwd: CwdState): string | null;
 3. 內層 `Script` 恰含一個 `Statement`、其 `command` 為單一 `Command`；有 pipeline、`&&`/`;`、
    控制流、重導向或賦值前綴一律不求值。
 4. 指令名靜態且命中註冊表。
-5. 所有 argv 皆靜態（`staticValue` 非 null）。
+5. 所有 argv 皆靜態（`staticValue` 非 null），**且無任何 argv 是「`parts` 為空且以 `~` 開頭」
+   的 token**。後者是必要的獨立條件：`staticValue` 對未加引號的 `~` 回字面 `"~"`，但 bash 會把它
+   展開成 `$HOME`。實測 `cd "$(echo ~)"` 的內層 argv[0] `value` 為 `"~"`、`parts` 為空——
+   外層 substitution 的雙引號**不會**抑制內層的 tilde expansion，實際 cwd 是 `$HOME`
+   而非 `<cwd>/~`。此條件對所有求值器一體適用，不由個別求值器各自處理。
 6. 註冊的求值器回非 null。
 7. 求值結果不含換行字元（多行輸出用作 cd 目標無意義，保守放棄）。
 8. 求值結果非空字串。空字串沒有任何安全的解釋：`applyPath` 會把它接成「cwd 不變」，
@@ -204,9 +208,13 @@ val === null → UNKNOWN
 `parts` 為 `["DoubleQuoted"]`。兩者字串相同但 bash 語義相反——引號會抑制 tilde expansion，
 `cd "~"` 是進入名為 `~` 的相對子目錄。因此：
 
-- **僅當 `parts` 為空**（未加引號的純字面 token）時才展開 `~`
-- `parts` 非空（引號包裝、或由 substitution 產生的字面 `~`）時**維持既有相對路徑語義**
-  （`<cwd>/~`），該行為對這些情形本就是正確的
+- **`parts` 為空**（未加引號的純字面 token）→ 展開 `~`
+- **`parts` 非空、且第一個 part 是以 `~` 開頭的 `Literal`** → `UNKNOWN`。這是混合引號形態，
+  實測 `cd ~/"src"` 的 `parts` 為 `["Literal(~/)", "DoubleQuoted"]`、`value` 為 `"~/src"`：
+  開頭未加引號的 `~` 仍會被 bash 展開，但後段是引號內容。把它當成 `<cwd>/~/src` 會誤判成
+  專案內路徑；而正確模擬混合展開需逐 part 重建語義，超出本設計範圍，故保守回 `UNKNOWN`。
+- **其餘 `parts` 非空**（整體被引號包裝、或由 substitution 產生的字面 `~`）→ **維持既有相對
+  路徑語義**（`<cwd>/~`），該行為對這些情形本就是正確的（引號抑制 tilde expansion）
 
 （`cd` 無參數已是 `UNKNOWN`，不變。）
 
@@ -284,10 +292,21 @@ value-flag 的值而跳過，失去唯一的路徑操作元、在專案內 cwd �
 `--globalconfig`、`--cache`、`--script-shell`、`--node-options`、`--editor`、`-g`/`--global`、
 `--foreground-scripts`、`--registry`。
 
-**位置參數不做路徑範圍檢查**：`npm view <pkg>` 的操作元是套件名（可含 `@scope/name@version`），
-不是檔案路徑；對它做 `resolvePath` 會誤殺。此處與 `grep` 的 PATTERN 操作元同理。
+**位置參數必須是 registry package spec，否則 ask**。不可無條件豁免路徑檢查：npm 以
+`npm-package-arg` 解析操作元，除 registry spec 外也接受目錄、檔案、tarball、URL 與 git spec，
+並會實際讀取本機目標。實測 `npm view <含 package.json 的任意目錄>` 會**讀取並印出該目錄
+package.json 的內容**（name、version、description 等），構成呼叫者指定的專案外讀取——這超出
+「npm 自身 cache/log」的已接受例外。
 
-動態 token 一律 ask（不臆測其展開結果）。
+因此操作元必須匹配嚴格的 registry package spec 形態才 allow：
+
+- 可選的 scope 前綴 `@<scope>/`，其後一個套件名
+- 可選的 `@<version|range|tag>` 後綴
+- **不得**以 `.`、`/`、`~`、`-` 開頭；不得含 `\`、`:`（排除 `file:`、`http(s):`、`git+ssh:`、
+  磁碟機字母如 `C:`）；除 scope 的那一個 `/` 外不得再含 `/`
+
+不符者一律 ask，不嘗試對其做 `resolvePath`——本規則的立場是「只認得套件名」，路徑形態交給使用者
+確認。動態 token 一律 ask（不臆測其展開結果）。
 
 ### cygpath（`src/rules/commands/cygpath.ts`）
 
@@ -338,17 +357,22 @@ PATH 列表）無法保證與 `normalizeAbsolute` 等價，故不可用於 cwd �
 - **求值框架層**（`subst_eval_test.ts`）：以下各自回 `null`——混合 word
   （`"$(echo foo)/sub"`、`"pre$(echo foo)"`）、**未加引號的 substitution**（`$(echo foo)`）、
   pipeline／多 statement、重導向、賦值前綴、動態 argv、未註冊指令名、含換行的求值結果、
-  **空字串求值結果**（`"$(echo -n)"`）。正面案例：`"$(cygpath -u 'D:/proj')"` 求出路徑。
+  **空字串求值結果**（`"$(echo -n)"`）、**argv 含未加引號 tilde**（`"$(echo ~)"`、
+  `"$(echo ~/x)"`）。正面案例：`"$(cygpath -u 'D:/proj')"` 求出路徑；
+  `"$(echo '~')"`（內層加引號）可求值為字面 `~`。
 - **各求值器語義**：依「查證依據」節的實測對照表逐項斷言，含 `cygpath -d`/`-s`/`-t dos` 回 `null`、
   `echo` 操作元含反斜線回 `null`、`printf` 純字面含反斜線回 `null`。
   cygpath 求值器的平台相關斷言用 `Deno.test({ ignore: Deno.build.os !== "windows", … })` 區分。
 - **cwd 層**（`cwd_test.ts`）：`cd "$(cygpath -u '<專案內>')"` 推導出正確 cwd；
   `cd -` → unknown；`cd ~`、`cd ~/x` 展開 home（home 未知時 unknown）；
-  `cd "~"` **不**展開、維持 `<cwd>/~`。
+  `cd "~"` **不**展開、維持 `<cwd>/~`；`cd ~/"src"`（混合引號）→ unknown。
 - **classify 層**：unknown cwd → 不可升級 ask（含「`permissions.allow` 命中也不升級」的斷言）。
 - **另三條新規則**（`cygpath_test.ts`、`test_test.ts`、`npm_test.ts`；base64 另列於下）：
   allow 與 ask 兩面 + 邊界，複製既有 `ctxOf` helper。cygpath 須分別覆蓋形態 A／B／C：
   形態 B（`-d`/`-s`/`-l`/`-M`/`-t dos`）帶專案外操作元時必須 ask、且不得取得 cwd 豁免。
+  npm 須覆蓋操作元文法：`npm view markdown-it`、`npm view @scope/pkg@1.2.3` → allow；
+  `npm view /outside/dir`、`npm view ./x`、`npm view ../x`、`npm view file:./x`、
+  `npm view https://example.com/x.tgz`、`npm view C:/x`、`npm view ~/x` → ask。
 - **base64**（`base64_test.ts`）：`base64 -w 0 f.txt` 的 `0` 不被當成路徑；`base64 --wrap=0 f.txt`
   同理；`base64 <專案外檔>` → ask；未知旗標 → ask。
 - **`-w` 不得外溢的迴歸測試**：`md5sum -c -w /outside/checksums` 必須 ask
@@ -510,6 +534,22 @@ cache 與 debug log，見本節末的實測**）：`view`(`v`/`info`/`show`)、`
 **Rationale**：五道護欄的第 (2) 條要求「hook 傳入的 session cwd 在範圍內**且**當前 cwd 由鏈內
 `cd` 產生（`origin === "chain-cd"`）」，這是豁免的信任起點；unknown 無法確立該起點。放寬等於讓
 「把 cd 目標寫成動態」重新成為繞過管道，與本次堵漏的目的直接抵觸。
+
+### `cd` 一律視為成功
+
+**Concern**：`walk.ts` 把 `cd X` 當成必定成功並據此推導後續 cwd。若 X 不存在，bash 會留在原地，
+後續相對路徑解析到完全不同的位置。實測 `cd missing/sub; cat ../../secret` 目前就把 `cat` 的 cwd
+推成 `D:/proj/missing/sub`，於是 `../../secret` 算成專案內的 `D:/proj/secret` 而可能放行；
+實際 cd 失敗時 bash 讀的是 `D:/secret`（專案外）。本次的求值框架會讓更多形態進入這條路徑
+（原本 `cd "$(…)"` 一律 unknown）。
+
+**Decision**：接受，維持「cd 視為成功」，不追蹤成功／失敗／短路三態。
+
+**Rationale**：「cd 是否成功」取決於目標目錄是否存在，屬檔案系統狀態；要正確建模就得在判定時
+查檔案系統，與本工具「純詞法判定、不碰檔案系統」的核心設計直接衝突，並需在分支匯合點保留多重
+可能 cwd，複雜度遠高於所防的問題。此為既有行為（靜態 `cd` 早已如此），本次不擴大也不收緊其
+既有語義。本限制的前提是「cwd 推導僅供範圍判定、不作為執行保證」；若日後改為依 cwd 推導做更強
+的放行決策，此豁免不自動延用。
 
 ### npm 對自身 cache 與 debug log 的寫入不納入判定
 
