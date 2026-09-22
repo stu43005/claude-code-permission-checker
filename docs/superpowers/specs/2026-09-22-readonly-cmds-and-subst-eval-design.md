@@ -43,6 +43,8 @@ cwd 解析缺口。
 1. `base64`、`test`、`npm`（唯讀子指令）、`cygpath` 四者的安全唯讀形式自動放行。
 2. `cd "$(<可靜態求值的指令>)"` 能推導出具體 cwd，使鏈內後續指令的相對路徑正常解析。
 3. 堵住「動態 cd 目標繞過中央前置規則一」的 under-ask 缺口。
+4. 修復既有的 tilde 漏洞：未加引號的 `~/…` 路徑操作元目前被當成專案內相對路徑而放行
+   （實測 `cat ~/.ssh/id_rsa` → allow），見元件五。
 
 ## 非目標
 
@@ -75,6 +77,7 @@ parse → walk ─┬─ applyCd ── 新增：staticValue 失敗時改試 eva
 |---|---|
 | `src/engine/cwd.ts` | `applyCd` 取值改為「先 `staticValue`，失敗再試 `evalSubstitutionWord`」；`cd -` / `cd ~` 語義修正 |
 | `src/engine/classify.ts` | `centralPreflightAsk` 規則一擴充 `unknown` 分支 |
+| `src/engine/scope.ts` | `resolvePath`／`resolvePathValue` 套用 tilde 展開語義（修既有漏洞，見元件五） |
 | `src/rules/allowlist.ts` | 註冊四條新規則（`coreutils.ts` 不動） |
 | `CLAUDE.md` | 同步管線、不變量與已接受限制 |
 
@@ -139,6 +142,26 @@ hasUnquotedLeadingTilde(word) :=
 第三列是混合形態，第一個 part 未加引號，因此述詞的第二個分支不可省略。此形態同樣會出現在
 substitution 內層：實測 `cd "$(echo ~/"src")"` 的內層 argv[0] 即為該結構、`staticValue` 回
 `~/src`；外層 substitution 的雙引號**不會**抑制內層的 tilde expansion。
+
+### 支援展開的 tilde 形態
+
+述詞命中只代表「這個 token 會被 bash 做 tilde expansion」，**不代表本設計知道它展開成什麼**。
+僅以下兩種形態有明確、可靜態決定的展開結果：
+
+- `~`（整個 token 就是 `~`）→ home
+- `~/<rest>` → home + `/<rest>`
+
+其餘一切形態一律視為**不可解析**（`cd` → `UNKNOWN`；路徑操作元 → 超出讀取範圍 → ask），
+包括：
+
+- `~<username>`（展開為該使用者的 home，本工具無從得知其他使用者的 home 路徑）
+- `~+`（展開為 `$PWD`）、`~-`（展開為 `$OLDPWD`，靜態不可知）
+- `~+<N>` / `~-<N>` / `~<N>`（directory stack 項目）
+
+實作上必須明確列出這兩種支援形態並對其餘回退，不可寫成「以 `~` 開頭就當 home」——那會把
+`~otheruser/x` 錯誤地映射到當前使用者的 home，並據此做出範圍判定。
+
+home 未知時（環境變數缺失），支援形態同樣退回不可解析，絕不退回「當成相對路徑」。
 
 ### 註冊成員與各自的求值邊界
 
@@ -227,7 +250,8 @@ val === null → UNKNOWN
 **tilde 展開必須依 word 結構判定，不能只看結果字串**，依據與對照表見元件一的
 `hasUnquotedLeadingTilde`。`cd` 目標套用該述詞的方式為：
 
-- 命中述詞、且 `parts` 為空（未加引號的純字面 token）→ 展開 `~`（home 未知時 `UNKNOWN`）
+- 命中述詞、`parts` 為空（未加引號的純字面 token）、**且形態為「支援展開的 tilde 形態」之一**
+  → 展開（home 未知時 `UNKNOWN`）。`~user`、`~+`、`~-` 等其餘形態 → `UNKNOWN`
 - 命中述詞、但 `parts` 非空（混合引號形態，如 `cd ~/"src"`）→ `UNKNOWN`。開頭未加引號的 `~`
   會被 bash 展開、後段卻是引號內容；正確模擬需逐 part 重建語義，超出本設計範圍，故保守放棄。
 - 未命中述詞（整體被引號包裝、或由 substitution 產生的字面 `~`）→ **維持既有相對路徑語義**
@@ -360,6 +384,44 @@ PATH 列表）無法保證與 `normalizeAbsolute` 等價，故不可用於 cwd �
 
 `cwdIndependent` 以述詞形式實作（依本次呼叫的旗標動態判定），形態 B 出現時回 false。
 
+## 元件五：路徑操作元的 tilde 展開（`src/engine/scope.ts`）
+
+### 這修的是一個既有漏洞
+
+`resolvePath` 目前對未加引號的 `~/…` 走 `staticValue` 取回字面字串 `~/…`，再當成**相對路徑**
+接到 cwd 上，於是判定為專案內而放行；bash 實際讀的卻是 `$HOME/…`。實測當前 binary：
+
+| 指令 | 目前決策 |
+|---|---|
+| `cat ~/secret` | **allow** |
+| `cat ~/.ssh/id_rsa` | **allow** |
+| `grep x ~/secret` | **allow** |
+| `head -5 ~/secret` | **allow** |
+| `cat "~/secret"` | allow（**正確**：引號抑制展開，實際讀 `./~/secret`，確實在專案內） |
+
+影響所有 allowlist 內接受路徑操作元的規則，不限本次新增者。本次納入修復，因為：設計已為了 cd
+與求值器建立 tilde 語義與述詞，複用成本極低；且若不修，新增的 `test` 與 `base64` 規則會把同一個
+漏洞擴大到更多指令（`test -f ~/.ssh/id_rsa`、`base64 ~/.ssh/id_rsa`）。
+
+### 行為
+
+`resolvePath(word, …)` 在解析前先套用 tilde 語義：
+
+- word 命中 `hasUnquotedLeadingTilde`：
+  - 形態屬「支援展開的 tilde 形態」且 home 已知 → **展開為絕對路徑**後再做既有的範圍判定。
+    展開後通常落在專案外 → `out-of-project` → ask；若使用者以 `Read(~/cache/**)` 之類規則
+    明示放寬，展開後會正確命中該範圍而放行——這是修復帶來的附帶正確性。
+  - 其餘形態（`~user`/`~+`/`~-`）或 home 未知 → `out-of-project`。**絕不退回「當成相對路徑」**，
+    那正是漏洞本身。
+- 未命中述詞（引號包裝的字面 `~`）→ 既有相對路徑行為不變，該行為本就正確。
+
+`resolvePathValue(value: string, …)` 只拿得到字串、沒有 word 結構，無從判斷引號。因此採
+fail-closed：**字串以 `~` 開頭一律視為超出讀取範圍**。代價是引號形態的 `--flag="~/x"`
+（真正指向 `./~/x`）會被誤 ask；此形態罕見，且方向安全。
+
+此修復與既有的 `dangerousRoot`（已把字面 `~`/`~/` 視為危險根、用於遞迴指令 deny）語義一致，
+兩者不衝突：`dangerousRoot` 管遞迴掃描的 deny，本元件管一般路徑操作元的範圍判定。
+
 ## 錯誤處理
 
 沿用既有 fail-safe 契約，不新增例外路徑：
@@ -378,8 +440,13 @@ PATH 列表）無法保證與 `normalizeAbsolute` 等價，故不可用於 cwd �
   含 `parts` 為空形態（`"$(echo ~)"`、`"$(echo ~/x)"`）與**混合引號形態**
   （`"$(echo ~/"src")"`）。正面案例：`"$(cygpath -u 'D:/proj')"` 求出路徑；
   `"$(echo '~')"`（內層整體加引號）可求值為字面 `~`。
-- **`hasUnquotedLeadingTilde` 單元測試**：依元件一的三列對照表逐項斷言，確保 `cd` 目標與求值器
-  argv 兩處共用同一述詞、不各自漂移。
+- **`hasUnquotedLeadingTilde` 單元測試**：依元件一的三列對照表逐項斷言，確保 `cd` 目標、求值器
+  argv、路徑操作元三處共用同一述詞、不各自漂移。
+- **元件五 tilde 漏洞迴歸**（`scope_test.ts` + e2e）：`cat ~/secret`、`cat ~/.ssh/id_rsa`、
+  `grep x ~/secret`、`head -5 ~/secret`、`test -f ~/secret`、`base64 ~/secret` 全部必須 ask
+  （這些目前是 allow）；`cat "~/secret"` 必須維持 allow（引號形態指向 `./~/secret`）；
+  `~user`/`~+`/`~-` 形態必須 ask；home 未知時 `~/x` 必須 ask。
+  另驗證附帶正確性：設定 `Read(~/cache/**)` 後 `cat ~/cache/x` 應 allow。
 - **各求值器語義**：依「查證依據」節的實測對照表逐項斷言，含 `cygpath -d`/`-s`/`-t dos` 回 `null`、
   `echo` 操作元含反斜線回 `null`、`printf` 純字面含反斜線回 `null`。
   cygpath 求值器的平台相關斷言用 `Deno.test({ ignore: Deno.build.os !== "windows", … })` 區分。
