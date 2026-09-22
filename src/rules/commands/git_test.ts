@@ -1,4 +1,4 @@
-import { assertEquals } from "@std/assert";
+import { assertEquals, assertStringIncludes } from "@std/assert";
 import { parse } from "../../deps.ts";
 import type { Command } from "../../deps.ts";
 import { gitRule } from "./git.ts";
@@ -185,4 +185,193 @@ Deno.test("git -C /tmp status asks (out-of-project path, via full pipeline)", ()
   // Use the full evaluate() pipeline to confirm end-to-end behavior.
   const cwd = { kind: "known" as const, path: "/proj" };
   assertEquals(evaluate("git -C /tmp status", "/proj", cwd).verdict, "ask");
+});
+
+// ── 本次新增：子指令後動態 token 收緊 ──────────────────────────────────────
+
+Deno.test("dynamic token after subcommand asks", () => {
+  assertEquals(v("git log $ref"), "ask");
+  assertEquals(v("git diff $BRANCH HEAD"), "ask");
+  assertEquals(v("git diff $(git merge-base HEAD main)"), "ask");
+  assertEquals(v("git log *.md"), "ask"); // 未引號 glob 亦屬動態
+});
+
+Deno.test("dynamic token after -- still allows (pathspec cannot become a flag)", () => {
+  assertEquals(v("git diff HEAD -- $FILE"), "allow");
+});
+
+Deno.test("static tokens that look exotic are still static", () => {
+  // @{upstream} 不含逗號 / .. ，未被解析為 BraceExpansion → 靜態
+  assertEquals(v("git rev-parse --abbrev-ref @{upstream}"), "allow");
+  assertEquals(v("git log HEAD~1"), "allow");
+});
+
+// ── 本次新增：-O orderfile 範圍檢查 ───────────────────────────────────────
+
+Deno.test("-O orderfile attached form: in-project allows, outside asks", () => {
+  assertEquals(v("git diff -Osrc/order.txt HEAD"), "allow");
+  assertEquals(v("git diff -O/etc/passwd HEAD"), "ask");
+  assertEquals(v("git log -O../outside.txt"), "ask");
+});
+
+Deno.test("-O orderfile space form: in-project allows, outside asks", () => {
+  assertEquals(v("git diff -O src/order.txt HEAD"), "allow");
+  assertEquals(v("git diff -O /etc/passwd HEAD"), "ask");
+  assertEquals(v("git show -O /tmp/x HEAD"), "ask");
+});
+
+Deno.test("-O edge cases ask", () => {
+  assertEquals(v("git diff HEAD -O"), "ask"); // 末尾缺值
+  assertEquals(v('git diff -O "$F" HEAD'), "ask"); // 值為動態
+});
+
+Deno.test("-O after -- is a pathspec, not a flag", () => {
+  assertEquals(v("git diff HEAD -- -O/etc/passwd"), "allow");
+});
+
+// ── 本次新增：--help 封堵 ─────────────────────────────────────────────────
+
+Deno.test("--help paths ask (equivalent to the excluded help subcommand)", () => {
+  assertEquals(v("git --help log"), "ask"); // 全域位置
+  assertEquals(v("git log --help"), "ask"); // 子指令之後
+  assertEquals(v("git help log"), "ask"); // 既有
+  assertEquals(v("git --help"), "ask"); // 無子指令（over-ask，可接受）
+});
+
+Deno.test("-h prints usage only and still allows", () => {
+  assertEquals(v("git log -h"), "allow");
+  assertEquals(v("git status -h"), "allow");
+});
+
+Deno.test("--help after -- is a pathspec, not a flag", () => {
+  assertEquals(v("git diff HEAD -- --help"), "allow");
+  assertEquals(v("git log -- --help"), "allow");
+});
+
+// ── 本次新增：純唯讀子指令擴充 ──────────────────────────────────────────────
+
+Deno.test("newly added read-only subcommands allow", () => {
+  assertEquals(v("git merge-base HEAD main"), "allow");
+  assertEquals(v("git rev-list --count HEAD"), "allow");
+  assertEquals(v("git name-rev HEAD"), "allow");
+  assertEquals(v("git whatchanged -1"), "allow");
+  assertEquals(v("git range-diff a..b c..d"), "allow");
+  assertEquals(v("git cherry origin/main"), "allow");
+  assertEquals(v("git diff-tree -r HEAD"), "allow");
+  assertEquals(v("git diff-files -p"), "allow");
+  assertEquals(v("git diff-index --cached HEAD"), "allow");
+  assertEquals(v("git check-ignore src/x.ts"), "allow");
+  assertEquals(v("git check-attr diff src/x.ts"), "allow");
+  assertEquals(v("git check-ref-format refs/heads/x"), "allow");
+  assertEquals(v("git count-objects -v"), "allow");
+  assertEquals(v("git var GIT_AUTHOR_IDENT"), "allow");
+  assertEquals(v("git annotate README.md"), "allow");
+  assertEquals(v("git version"), "allow");
+});
+
+Deno.test("excluded subcommands still ask", () => {
+  assertEquals(v("git ls-remote origin"), "ask"); // 網路存取
+  assertEquals(v("git help log"), "ask"); // spawn man / browser
+  assertEquals(v("git verify-commit HEAD"), "ask"); // spawn gpg
+  assertEquals(v("git verify-tag v1"), "ask"); // spawn gpg
+  assertEquals(v("git symbolic-ref HEAD"), "ask"); // 有寫入形式
+  assertEquals(v("git worktree list"), "ask");
+  assertEquals(v("git submodule status"), "ask");
+  assertEquals(v("git notes list"), "ask");
+  assertEquals(v("git bisect log"), "ask");
+  assertEquals(v("git merge-tree a b"), "ask");
+});
+
+Deno.test("both guards also cover the newly added subcommands", () => {
+  // -O orderfile 範圍檢查
+  assertEquals(v("git diff-index -Osrc/order.txt HEAD"), "allow");
+  assertEquals(v("git diff-tree -O/etc/passwd HEAD"), "ask");
+  assertEquals(v("git range-diff -O /tmp/x a..b c..d"), "ask");
+  // --help man viewer 封堵
+  assertEquals(v("git --help merge-base"), "ask");
+  assertEquals(v("git merge-base --help"), "ask");
+  assertEquals(v("git merge-base -h"), "allow"); // -h 只印用法，不受影響
+});
+
+// ── 修補：blame / annotate 吃路徑值旗標範圍檢查 ─────────────────────────────
+
+Deno.test("blame / annotate path-valued flags are scope-checked", () => {
+  // --contents reads AND prints the file's contents
+  assertEquals(v("git annotate --contents /etc/passwd -- README.md"), "ask");
+  assertEquals(v("git blame --contents /etc/passwd -- README.md"), "ask");
+  assertEquals(v("git blame --contents=/etc/passwd -- README.md"), "ask");
+  assertEquals(v("git blame --contents src/x.ts -- README.md"), "allow");
+  // -S <revs-file>, both forms
+  assertEquals(v("git blame -S /etc/passwd README.md"), "ask");
+  assertEquals(v("git blame -S/etc/passwd README.md"), "ask");
+  // --ignore-revs-file, both forms
+  assertEquals(v("git blame --ignore-revs-file /etc/passwd README.md"), "ask");
+  assertEquals(v("git blame --ignore-revs-file=/etc/passwd README.md"), "ask");
+  // plain in-project blame unaffected
+  assertEquals(v("git blame README.md"), "allow");
+  assertEquals(v("git annotate README.md"), "allow");
+});
+
+Deno.test("log -S is a pickaxe string, not a path (must not be scope-checked)", () => {
+  assertEquals(v("git log -SREAD_SUBCOMMANDS"), "allow");
+  assertEquals(v("git log -S pattern"), "allow");
+});
+
+// ── 修補：顯式 --textconv 執行外部轉換程式 ─────────────────────────────────
+
+Deno.test("explicit --textconv asks (runs a configured external program)", () => {
+  assertEquals(v("git diff-tree --textconv -p HEAD"), "ask");
+  assertEquals(v("git diff --textconv HEAD"), "ask");
+  assertEquals(v("git log --textconv -p"), "ask");
+});
+
+Deno.test("--no-textconv disables the behavior and stays allowed", () => {
+  assertEquals(v("git log --no-textconv -p"), "allow");
+  assertEquals(v("git diff --no-textconv HEAD"), "allow");
+});
+
+// ── 修補：blame / annotate 唯一前綴縮寫繞道 ─────────────────────────────────
+
+Deno.test("abbreviated blame path flags are also scope-checked", () => {
+  // git expands unique prefixes: --cont / --con ≡ --contents
+  assertEquals(v("git annotate --cont /etc/passwd -- README.md"), "ask");
+  assertEquals(v("git blame --con /etc/passwd -- README.md"), "ask");
+  assertEquals(v("git blame --cont=/etc/passwd -- README.md"), "ask");
+  assertEquals(v("git blame --ignore-revs /etc/passwd README.md"), "ask");
+  // in-project values still allow through the abbreviated form
+  assertEquals(v("git blame --cont src/x.ts -- README.md"), "allow");
+});
+
+Deno.test("ordinary blame flags are not mistaken for path-valued ones", () => {
+  assertEquals(v("git blame -w README.md"), "allow");
+  assertEquals(v("git blame --line-porcelain README.md"), "allow");
+  assertEquals(v("git blame -L 1,10 README.md"), "allow");
+  assertEquals(v("git blame --color-lines README.md"), "allow");
+});
+
+// ── 本次新增：交叉與回歸 ──────────────────────────────────────────────────
+
+Deno.test("git grep -O keeps its pager reason (new scan must not preempt)", () => {
+  const r = gitRule.evaluate(ctxOf("git grep -O pager foo"));
+  assertEquals(r.kind, "ask");
+  assertStringIncludes(r.kind === "ask" ? r.reason : "", "pager");
+});
+
+Deno.test("switch-gated subcommands are also covered by the new scan", () => {
+  assertEquals(v("git branch $NAME"), "ask"); // 動態 token，掃描先於 switch
+  assertEquals(v("git stash list"), "allow"); // 既有 allow 形式不被誤殺
+  assertEquals(v("git remote -v"), "allow");
+  assertEquals(v("git branch"), "allow");
+});
+
+Deno.test("global gates still apply to newly added subcommands", () => {
+  assertEquals(v("git -c core.pager=cat merge-base HEAD main"), "ask");
+  assertEquals(v("git --exec-path=/tmp rev-list HEAD"), "ask");
+  assertEquals(v("git --unknown-global merge-base HEAD main"), "ask");
+  assertEquals(v("git --config-env=core.pager=EVIL diff-tree HEAD"), "ask");
+});
+
+Deno.test("newly added diff-family subcommands still honor existing rest gates", () => {
+  assertEquals(v("git diff-tree --ext-diff HEAD"), "ask");
+  assertEquals(v("git range-diff --output=x a..b c..d"), "ask");
 });

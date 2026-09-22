@@ -168,6 +168,13 @@ parse.ts (unbash) → walk.ts → 閘① sleep → 閘② 名稱重定義 → no
   只是對未知新形式多問一次（安全方向）。這是本工具的根本取捨——**誤 ask 可接受，誤 allow 不可接受**。
 - **子指令型**（git / gh）：維護「唯讀子指令集合」，集合內才 allow、其餘 ask（見 `git.ts` / `gh.ts`）。
   全域選項同理：未知全域選項一律 ask（見 `git.ts` 的全域選項 allowlist）。
+  `git.ts` 的 `READ_SUBCOMMANDS` 現含 30 個子指令（porcelain 15 + plumbing 15），涵蓋
+  `merge-base` / `rev-list` / `name-rev` / `var` / `diff-tree`·`diff-files`·`diff-index` /
+  `check-ignore`·`check-attr`·`check-ref-format` / `whatchanged` / `range-diff` / `cherry` /
+  `count-objects` / `annotate` / `version` 等。**刻意排除**（維持 ask）：`ls-remote`（發網路請求、
+  可接任意 URL，不受 curl domain allowlist 管轄）、`help` 與 `verify-commit`·`verify-tag`
+  （spawn man / browser / gpg）、以及有寫入形式需個案 gate 的 `symbolic-ref` / `worktree` /
+  `submodule` / `notes` / `bisect` / `merge-tree`。
 - **旗標型**：用 `factory.ts` 的 `flagGatedReader`。`askFlags` 兩條路徑都先套用；其餘分成兩種：
   - **有提供 `spec`（CommandSpec）者**：argv 分類**完全由 spec 決定**，`valueFlags` /
     `pathValueFlags` 一律不參與。旗標的路徑值靠 `FlagSpec.valueIsPath` 宣告；位置參數是不是路徑
@@ -213,8 +220,23 @@ parse.ts (unbash) → walk.ts → 閘① sleep → 閘② 名稱重定義 → no
 
 - **git / gh 全域選項是攻擊面**：別用 denylist 逐一擋。`git.ts` 已改為**安全 allowlist**——子指令前
   未知的全域選項一律 ask；危險者（`-c <非安全config 如 diff.external/core.pager/*.textconv>`、
-  `--exec-path`、`--config-env`、讀取子指令的 `--output=`、`git grep -O`、`--ext-diff`）明確 ask。
-  新增 git/gh 形式時沿用 allowlist 思維。
+  `--exec-path`、`--config-env`、讀取子指令的 `--output=`、`git grep -O`、`--ext-diff`、`--help`、
+  `--textconv`）明確 ask。新增 git/gh 形式時沿用 allowlist 思維。
+- **git 子指令後的引數也是攻擊面**：`git.ts` 的 `scanRestArgs` 走訪子指令之後、`--` 之前的引數。
+  動態 token（`git log $ref`）一律 ask——靜態分析無法排除它展開成旗標，放行等於讓旗標檢查可被單一
+  變數繞過；`-O <file>` / `-O<file>`（orderfile）會被 git 實際開啟讀取，須 `resolvePathValue`
+  範圍檢查。此掃描刻意置於 `git grep -O`（語意是 pager，不是 orderfile）檢查之後、`switch` 之前。
+- **`--help` / `--textconv` 等同顯式要求執行外部程式**：`--help` 無論在全域位置（`git --help log`）
+  或子指令之後（`git log --help`）都會 spawn man viewer，而 `GIT_MAN_VIEWER` 可指定任意程式 →
+  兩處都要 ask（前者靠把 `--help` 排除在 `SAFE_VALUELESS_GLOBAL` 之外，後者靠 `evaluate` 的 rest
+  層檢查，且該檢查只看 `--` 之前的旗標區）。顯式 `--textconv` 會執行 config 設定的轉換程式（實測
+  `git diff-tree --textconv -p` 會跑、不帶旗標則不會）→ ask，與 `--ext-diff` 同性質；`-h` 只印用法、
+  `--no-textconv` 是關閉，兩者皆不受影響。
+- **`git blame` / `annotate` 有三個吃路徑值的旗標**：`--contents <file>`（會讀取該檔並把內容**印進
+  blame 輸出**）、`-S <file>`（revs-file）、`--ignore-revs-file <file>`，空格與黏寫形式皆須
+  `resolvePathValue` 範圍檢查。**長選項要用前綴比對**——git 接受唯一前綴縮寫（實測 `--cont` / `--con`
+  ≡ `--contents`、`--ignore-revs` ≡ `--ignore-revs-file`），只比對完整拼寫會被縮寫繞過。此檢查
+  **僅限 blame / annotate**：`git log -S<string>` 是 pickaxe 搜尋字串、不是路徑，套用到其他子指令會誤殺。
 - **gh 已改為旗標 allowlist**：未知旗標一律 ask（同時免疫 gh 版本漂移）。本機副作用旗標
   `-w`/`--web`（開瀏覽器）與 `--cache`（寫本機快取）對所有子指令一律 ask。非 GET 方法與寫入 body
   的偵測在 `gh.ts` 的 `parseGh` 內以**旗標感知解析**進行（不再是獨立的 `ghApiMutates`），群集寫法

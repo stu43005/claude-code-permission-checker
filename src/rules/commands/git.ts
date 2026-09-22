@@ -1,3 +1,4 @@
+import type { Word } from "../../deps.ts";
 import type { CommandRule, RuleContext, RuleVerdict } from "../types.ts";
 import { allow, ask } from "../types.ts";
 import { staticValue } from "../../engine/word.ts";
@@ -39,14 +40,69 @@ const SAFE_VALUELESS_GLOBAL = new Set<string>([
   "--info-path",
   "--no-lazy-fetch",
   "--version",
-  "--help",
+  // 刻意不含 "--help"：`git --help <sub>` 等同 `git help <sub>`，會 spawn man viewer
+  // （可經 GIT_MAN_VIEWER 指定任意程式）。移除後它落入「未知全域旗標」分支 → ask。
 ]);
 
-/** 純讀取子指令（其餘子指令一律 ask）。 */
+/**
+ * 純讀取子指令（其餘子指令一律 ask）。
+ *
+ * 刻意排除（皆維持 ask）：
+ * - `ls-remote`：不改本地狀態，但會發網路請求、可接任意 URL（不受 curl domain allowlist 管轄）。
+ * - `help`、`verify-commit`、`verify-tag`：不改儲存庫狀態，但會 spawn 外部程式（man / browser / gpg）。
+ * - `symbolic-ref`、`worktree`、`submodule`、`notes`、`bisect`、`merge-tree`：有寫入形式，需個案 gate。
+ */
 const READ_SUBCOMMANDS = new Set<string>([
-  "status", "log", "diff", "show", "blame", "rev-parse", "describe",
-  "cat-file", "ls-files", "ls-tree", "for-each-ref", "reflog", "shortlog", "grep",
+  // porcelain
+  "status", "log", "diff", "show", "blame", "annotate", "describe", "shortlog",
+  "grep", "reflog", "whatchanged", "range-diff", "cherry", "count-objects",
+  "version",
+  // plumbing
+  "rev-parse", "rev-list", "merge-base", "name-rev", "var",
+  "cat-file", "ls-files", "ls-tree", "for-each-ref",
+  "diff-tree", "diff-files", "diff-index",
+  "check-ignore", "check-attr", "check-ref-format",
 ]);
+
+/**
+ * `blame` / `annotate` 專屬的吃路徑值旗標——其值會被 git 開啟讀取
+ * （`--contents` 更會把內容直接印進輸出）。
+ *
+ * `-S` 只在 blame / annotate 是 revs-file；在 `git log` 中 `-S<string>` 是 pickaxe
+ * 搜尋字串（非路徑），故本清單**不可**套用到其他子指令。
+ */
+const BLAME_PATH_VALUE_FLAGS = ["--contents", "--ignore-revs-file", "-S"];
+
+/**
+ * 比對空格形式的吃路徑值旗標。長選項採**前綴**比對——git 接受唯一前綴縮寫
+ * （實測 `--cont` / `--con` ≡ `--contents`、`--ignore-revs` ≡ `--ignore-revs-file`）。
+ * 前綴有歧義時 git 自己會報錯，本檢查多 ask 一次無害（安全方向）。
+ */
+function matchBlamePathFlag(t: string): string | null {
+  for (const f of BLAME_PATH_VALUE_FLAGS) {
+    if (f.startsWith("--")) {
+      if (t.length > 2 && f.startsWith(t)) return f;
+    } else if (t === f) {
+      return f;
+    }
+  }
+  return null;
+}
+
+/** 比對黏寫形式：`--cont=<file>`（含縮寫）與 `-S<file>`。 */
+function matchBlamePathFlagAttached(t: string): { flag: string; value: string } | null {
+  const eq = t.indexOf("=");
+  if (eq > 2) {
+    const name = t.slice(0, eq);
+    for (const f of BLAME_PATH_VALUE_FLAGS) {
+      if (f.startsWith("--") && f.startsWith(name)) {
+        return { flag: f, value: t.slice(eq + 1) };
+      }
+    }
+  }
+  if (t.startsWith("-S") && t.length > 2) return { flag: "-S", value: t.slice(2) };
+  return null;
+}
 
 /**
  * 判斷 -c 傳入的 config key 是否安全（不會執行外部程式）。
@@ -68,13 +124,19 @@ function isSafeConfigKey(key: string): boolean {
 /** 取得子指令與其後的引數（跳過全域選項及其值）。 */
 function parseSub(
   argv: RuleContext["argv"],
-): { sub: string | null; rest: string[]; dynamic: boolean; dangerous: string | null } {
+): {
+  sub: string | null;
+  rest: string[];
+  restWords: Word[];
+  dynamic: boolean;
+  dangerous: string | null;
+} {
   let i = 0;
   let dangerous: string | null = null;
 
   while (i < argv.length) {
     const t = staticValue(argv[i]);
-    if (t === null) return { sub: null, rest: [], dynamic: true, dangerous };
+    if (t === null) return { sub: null, rest: [], restWords: [], dynamic: true, dangerous };
     if (!t.startsWith("-")) break; // 非旗標 token → 子指令開始
 
     // 1. -c key=val（空格形式）
@@ -150,25 +212,100 @@ function parseSub(
     continue;
   }
 
-  if (i >= argv.length) return { sub: null, rest: [], dynamic: false, dangerous };
+  if (i >= argv.length) return { sub: null, rest: [], restWords: [], dynamic: false, dangerous };
   const subTok = staticValue(argv[i]);
-  if (subTok === null) return { sub: null, rest: [], dynamic: true, dangerous };
+  if (subTok === null) return { sub: null, rest: [], restWords: [], dynamic: true, dangerous };
   const rest: string[] = [];
+  const restWords: Word[] = [];
   for (let j = i + 1; j < argv.length; j++) {
     const r = staticValue(argv[j]);
-    rest.push(r ?? " "); // 動態值以哨符代表
+    rest.push(r ?? " "); // 動態值以哨符代表（既有 has() / includes() 檢查沿用）
+    restWords.push(argv[j]); // 原始 Word，供 scanRestArgs 精確判定動態
   }
-  return { sub: subTok, rest, dynamic: false, dangerous };
+  return { sub: subTok, rest, restWords, dynamic: false, dangerous };
 }
 
 function has(rest: string[], ...flags: string[]): boolean {
   return rest.some((r) => flags.includes(r));
 }
 
+/**
+ * 走訪子指令之後的引數。
+ *
+ * - 遇 `--` 停止：其後是 pathspec，不再有旗標語義。
+ * - 動態 token → ask：靜態分析無法排除其展開為 `-O` 等旗標，放行等於讓旗標檢查可被單一變數繞過。
+ * - `-O <file>` / `-O<file>`（orderfile）：git 會實際開啟讀取該路徑，故做範圍檢查。
+ *   不處理 bundling（`-rO<file>`）——git 本身即拒絕該形式。
+ *
+ * 回傳 null 代表本掃描無異議（由呼叫端續行既有判定）。
+ */
+function scanRestArgs(
+  sub: string,
+  restWords: Word[],
+  ctx: RuleContext,
+): RuleVerdict | null {
+  const outOfScope = `git ${sub}：-O orderfile 路徑超出專案範圍`;
+  let k = 0;
+  while (k < restWords.length) {
+    const t = staticValue(restWords[k]);
+    if (t === "--") return null; // pathspec 區，停止掃描
+    if (t === null) {
+      return ask(`git ${sub}：子指令引數含動態 token，無法排除其展開為 -O 等旗標`);
+    }
+    // 空格形式：-O <file>
+    if (t === "-O") {
+      const valWord = restWords[k + 1];
+      if (valWord === undefined) return ask(`git ${sub}：-O 缺少 orderfile 值`);
+      const val = staticValue(valWord);
+      if (val === null) {
+        return ask(`git ${sub}：-O 的 orderfile 值為動態，無法判定範圍`);
+      }
+      if (ctx.resolvePathValue(val) !== "in-project") return ask(outOfScope);
+      k += 2;
+      continue;
+    }
+    // 黏寫形式：-O<file>
+    if (t.startsWith("-O") && t.length > 2) {
+      if (ctx.resolvePathValue(t.slice(2)) !== "in-project") return ask(outOfScope);
+      k += 1;
+      continue;
+    }
+    // blame / annotate 的吃路徑值旗標（僅這兩個子指令適用，見常數註解）
+    if (sub === "blame" || sub === "annotate") {
+      // 空格形式（含唯一前綴縮寫）
+      const spaced = matchBlamePathFlag(t);
+      if (spaced !== null) {
+        const valWord = restWords[k + 1];
+        if (valWord === undefined) return ask(`git ${sub}：${spaced} 缺少路徑值`);
+        const val = staticValue(valWord);
+        if (val === null) {
+          return ask(`git ${sub}：${spaced} 的路徑值為動態，無法判定範圍`);
+        }
+        if (ctx.resolvePathValue(val) !== "in-project") {
+          return ask(`git ${sub}：${spaced} 的路徑值超出專案範圍`);
+        }
+        k += 2;
+        continue;
+      }
+      // 黏寫形式（含縮寫）
+      const attached = matchBlamePathFlagAttached(t);
+      if (attached !== null) {
+        if (ctx.resolvePathValue(attached.value) !== "in-project") {
+          return ask(`git ${sub}：${attached.flag} 的路徑值超出專案範圍`);
+        }
+        k += 1;
+        continue;
+      }
+    }
+    k += 1;
+  }
+  return null;
+}
+
 export const gitRule: CommandRule = {
   names: ["git"],
   evaluate(ctx: RuleContext): RuleVerdict {
-    const { sub, rest, dynamic, dangerous } = parseSub(ctx.argv);
+    const { sub, rest, restWords, dynamic, dangerous } = parseSub(ctx.argv);
     if (dynamic) return ask("git：子指令含動態值，無法靜態判定");
     if (sub === null) return ask("git：未指定子指令");
 
@@ -178,6 +315,23 @@ export const gitRule: CommandRule = {
     // --ext-diff 啟用外部 diff driver（在子指令之後的 rest 中）
     if (rest.includes("--ext-diff")) {
       return ask("git：--ext-diff 啟用外部 diff driver（執行外部程式）");
+    }
+
+    // --textconv 顯式要求執行 config 設定的外部轉換程式（與 --ext-diff 同性質）。
+    // 注意：不帶旗標時由 .gitattributes + config 隱含觸發的 textconv 屬 spec 已裁決的
+    // accepted limitation，不在此擋；本檢查只針對顯式旗標。
+    if (rest.includes("--textconv")) {
+      return ask(`git ${sub}：--textconv 會執行 config 設定的外部轉換程式`);
+    }
+
+    // --help 在子指令之後同樣 spawn man viewer（git log --help ≡ git help log）。
+    // 只在旗標區偵測：`--` 之後是 pathspec，名為 --help 的路徑不具旗標語義。
+    const dashDash = rest.indexOf("--");
+    const flagRegion = dashDash === -1 ? rest : rest.slice(0, dashDash);
+    if (flagRegion.includes("--help")) {
+      return ask(
+        `git ${sub}：--help 會 spawn man viewer（可經 GIT_MAN_VIEWER 指定任意程式）`,
+      );
     }
 
     // 讀取子指令的危險 flag：--output= 寫檔；git grep -O 執行任意 pager
@@ -194,6 +348,12 @@ export const gitRule: CommandRule = {
     ) {
       return ask("git grep：-O / --open-files-in-pager 會執行任意 pager 程式");
     }
+
+    // 子指令引數掃描（動態 token / -O orderfile 範圍）。
+    // 刻意置於 grep -O 檢查之後，使 `git grep -O` 維持既有的「執行任意 pager」理由；
+    // 也刻意置於 switch 之前，故 branch / tag / config / stash / remote 同受此掃描。
+    const scanned = scanRestArgs(sub, restWords, ctx);
+    if (scanned) return scanned;
 
     if (READ_SUBCOMMANDS.has(sub)) return allow();
 
