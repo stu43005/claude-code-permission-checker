@@ -108,16 +108,37 @@ export function evalSubstitutionWord(word: Word, cwd: CwdState): string | null;
 3. 內層 `Script` 恰含一個 `Statement`、其 `command` 為單一 `Command`；有 pipeline、`&&`/`;`、
    控制流、重導向或賦值前綴一律不求值。
 4. 指令名靜態且命中註冊表。
-5. 所有 argv 皆靜態（`staticValue` 非 null），**且無任何 argv 是「`parts` 為空且以 `~` 開頭」
-   的 token**。後者是必要的獨立條件：`staticValue` 對未加引號的 `~` 回字面 `"~"`，但 bash 會把它
-   展開成 `$HOME`。實測 `cd "$(echo ~)"` 的內層 argv[0] `value` 為 `"~"`、`parts` 為空——
-   外層 substitution 的雙引號**不會**抑制內層的 tilde expansion，實際 cwd 是 `$HOME`
-   而非 `<cwd>/~`。此條件對所有求值器一體適用，不由個別求值器各自處理。
+5. 所有 argv 皆靜態（`staticValue` 非 null），**且無任何 argv 命中下方的
+   `hasUnquotedLeadingTilde` 述詞**。此條件對所有求值器一體適用，不由個別求值器各自處理。
 6. 註冊的求值器回非 null。
 7. 求值結果不含換行字元（多行輸出用作 cd 目標無意義，保守放棄）。
 8. 求值結果非空字串。空字串沒有任何安全的解釋：`applyPath` 會把它接成「cwd 不變」，
    而 bash 在加引號時是 cd 到空字串（失敗、cwd 不變）、未加引號時是 cd 到 `$HOME`。
    統一回 `null`。
+
+### 共用述詞：`hasUnquotedLeadingTilde(word)`
+
+tilde 展開在本設計中出現在兩個位置——`cd` 的目標 word（元件二）與求值器的 argv（要件 5）——
+語義相同，因此以單一述詞表達，避免兩處判定漂移：
+
+```
+hasUnquotedLeadingTilde(word) :=
+     (word.parts 為空       且 word.value 以 "~" 開頭)
+  || (word.parts 非空       且 word.parts[0] 是 Literal 且其 value 以 "~" 開頭)
+```
+
+**只看 `staticValue` 的結果字串永遠不夠**：引號會抑制 tilde expansion，而 `staticValue` 已把引號
+資訊抹除。實測三種 word 的 `staticValue` 都不足以區分：
+
+| word | `parts` | `staticValue` | bash 實際 |
+|---|---|---|---|
+| `~/src` | `[]` | `~/src` | 展開為 `$HOME/src` |
+| `"~"` | `["DoubleQuoted"]` | `~` | **不**展開，相對子目錄 `./~` |
+| `~/"src"` | `["Literal(~/)", "DoubleQuoted"]` | `~/src` | 開頭 `~` **仍**展開 → `$HOME/src` |
+
+第三列是混合形態，第一個 part 未加引號，因此述詞的第二個分支不可省略。此形態同樣會出現在
+substitution 內層：實測 `cd "$(echo ~/"src")"` 的內層 argv[0] 即為該結構、`staticValue` 回
+`~/src`；外層 substitution 的雙引號**不會**抑制內層的 tilde expansion。
 
 ### 註冊成員與各自的求值邊界
 
@@ -203,18 +224,14 @@ val === null → UNKNOWN
 - `cd -`：回上一個工作目錄，靜態不可知 → `UNKNOWN`
 - `cd ~` / `cd ~/<rest>`：home 已知時解析為 home（或 home + rest），home 未知 → `UNKNOWN`
 
-**tilde 展開必須依 word 結構判定，不能只看結果字串。** 實測本專案解析器：`cd ~` 的 word
-`value` 為 `"~"`、`parts` 為**空陣列**（純字面）；而 `cd "~"` 的 `value` 同樣是 `"~"`、
-`parts` 為 `["DoubleQuoted"]`。兩者字串相同但 bash 語義相反——引號會抑制 tilde expansion，
-`cd "~"` 是進入名為 `~` 的相對子目錄。因此：
+**tilde 展開必須依 word 結構判定，不能只看結果字串**，依據與對照表見元件一的
+`hasUnquotedLeadingTilde`。`cd` 目標套用該述詞的方式為：
 
-- **`parts` 為空**（未加引號的純字面 token）→ 展開 `~`
-- **`parts` 非空、且第一個 part 是以 `~` 開頭的 `Literal`** → `UNKNOWN`。這是混合引號形態，
-  實測 `cd ~/"src"` 的 `parts` 為 `["Literal(~/)", "DoubleQuoted"]`、`value` 為 `"~/src"`：
-  開頭未加引號的 `~` 仍會被 bash 展開，但後段是引號內容。把它當成 `<cwd>/~/src` 會誤判成
-  專案內路徑；而正確模擬混合展開需逐 part 重建語義，超出本設計範圍，故保守回 `UNKNOWN`。
-- **其餘 `parts` 非空**（整體被引號包裝、或由 substitution 產生的字面 `~`）→ **維持既有相對
-  路徑語義**（`<cwd>/~`），該行為對這些情形本就是正確的（引號抑制 tilde expansion）
+- 命中述詞、且 `parts` 為空（未加引號的純字面 token）→ 展開 `~`（home 未知時 `UNKNOWN`）
+- 命中述詞、但 `parts` 非空（混合引號形態，如 `cd ~/"src"`）→ `UNKNOWN`。開頭未加引號的 `~`
+  會被 bash 展開、後段卻是引號內容；正確模擬需逐 part 重建語義，超出本設計範圍，故保守放棄。
+- 未命中述詞（整體被引號包裝、或由 substitution 產生的字面 `~`）→ **維持既有相對路徑語義**
+  （`<cwd>/~`），該行為對這些情形本就是正確的
 
 （`cd` 無參數已是 `UNKNOWN`，不變。）
 
@@ -357,9 +374,12 @@ PATH 列表）無法保證與 `normalizeAbsolute` 等價，故不可用於 cwd �
 - **求值框架層**（`subst_eval_test.ts`）：以下各自回 `null`——混合 word
   （`"$(echo foo)/sub"`、`"pre$(echo foo)"`）、**未加引號的 substitution**（`$(echo foo)`）、
   pipeline／多 statement、重導向、賦值前綴、動態 argv、未註冊指令名、含換行的求值結果、
-  **空字串求值結果**（`"$(echo -n)"`）、**argv 含未加引號 tilde**（`"$(echo ~)"`、
-  `"$(echo ~/x)"`）。正面案例：`"$(cygpath -u 'D:/proj')"` 求出路徑；
-  `"$(echo '~')"`（內層加引號）可求值為字面 `~`。
+  **空字串求值結果**（`"$(echo -n)"`）、**argv 命中 `hasUnquotedLeadingTilde`**——
+  含 `parts` 為空形態（`"$(echo ~)"`、`"$(echo ~/x)"`）與**混合引號形態**
+  （`"$(echo ~/"src")"`）。正面案例：`"$(cygpath -u 'D:/proj')"` 求出路徑；
+  `"$(echo '~')"`（內層整體加引號）可求值為字面 `~`。
+- **`hasUnquotedLeadingTilde` 單元測試**：依元件一的三列對照表逐項斷言，確保 `cd` 目標與求值器
+  argv 兩處共用同一述詞、不各自漂移。
 - **各求值器語義**：依「查證依據」節的實測對照表逐項斷言，含 `cygpath -d`/`-s`/`-t dos` 回 `null`、
   `echo` 操作元含反斜線回 `null`、`printf` 純字面含反斜線回 `null`。
   cygpath 求值器的平台相關斷言用 `Deno.test({ ignore: Deno.build.os !== "windows", … })` 區分。
@@ -545,11 +565,20 @@ cache 與 debug log，見本節末的實測**）：`view`(`v`/`info`/`show`)、`
 
 **Decision**：接受，維持「cd 視為成功」，不追蹤成功／失敗／短路三態。
 
-**Rationale**：「cd 是否成功」取決於目標目錄是否存在，屬檔案系統狀態；要正確建模就得在判定時
-查檔案系統，與本工具「純詞法判定、不碰檔案系統」的核心設計直接衝突，並需在分支匯合點保留多重
-可能 cwd，複雜度遠高於所防的問題。此為既有行為（靜態 `cd` 早已如此），本次不擴大也不收緊其
-既有語義。本限制的前提是「cwd 推導僅供範圍判定、不作為執行保證」；若日後改為依 cwd 推導做更強
-的放行決策，此豁免不自動延用。
+**Rationale**：**精確**判斷 cd 成敗需要知道目標目錄是否存在（檔案系統狀態，本工具不碰），
+但**保守**處理並不需要——這點必須說清楚，以免日後誤以為此限制無解。已知的兩個純詞法方案是：
+
+1. 只信任 `&&` 之後的 cd（`&&` 保證前一指令成功才執行後續），`;` / `||` / 換行分隔後標 unknown；
+2. 非 `&&` 分隔時要求 cd 前與 cd 後兩個 cwd **都**通過範圍檢查。
+
+不採用的理由是取捨而非不可行：方案 1 會讓 `cd src; ls`、`cd src` 後換行接指令這類日常寫法變成
+ask；方案 2 誤殺較少，但 `CwdState` 需能攜帶多個候選，`walk` 與 `classify` 的 cwd 模型都要改，
+改動面大於本次主題。此為既有行為（靜態 `cd` 早已如此），求值框架只是讓更多形態進入同一條既有
+路徑，並未改變其語義。
+
+本限制的前提是「上述誤殺代價不可接受」與「cwd 推導僅供範圍判定」。若日後該代價評估改變
+（例如願意接受 `cd X; …` 一律 ask），或 cwd 推導被用於更強的放行決策，此豁免不自動延用，
+應重走方案 1／2 的評估。
 
 ### npm 對自身 cache 與 debug log 的寫入不納入判定
 
