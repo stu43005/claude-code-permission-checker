@@ -315,19 +315,30 @@ value-flag 的值而跳過，失去唯一的路徑操作元、在專案內 cwd �
 
 比照 `git.ts` 的子指令 allowlist 結構：維護唯讀子指令集合，集合內才 allow、其餘 ask。
 
-**第一層唯讀子指令**：`view`、`info`、`show`、`v`、`ls`、`list`、`la`、`ll`、`outdated`、
-`explain`、`why`、`ping`、`root`、`prefix`、`whoami`。
+**allowlist 的判準是「不探索本機專案」**，比「唯讀」更嚴格。npm 對本機查詢類子指令會沿目錄樹
+**向上**尋找 package.json 決定 effective prefix，並讀取該處的 package.json / .npmrc——那個位置
+可能在允許範圍之外，且沒有任何操作元可供本工具檢查（詳見「查證依據」的實測）。
 
-**兩層結構子指令**（第二層必須是讀取動作，否則 ask）：`config get`、`get`、`pkg get`。
-這類子指令的第一層同名但第二層副作用相反（`config get` vs `config set`、`pkg get` vs `pkg set`），
-必須檢查到第二層。
+**允許的子指令**：
+
+- `view`、`info`、`show`、`v`：**必須帶至少一個操作元**。無操作元時 npm 改為檢視「當前專案」，
+  即觸發上述向上探索，故無操作元形態一律 ask。
+- `ping`：僅測試 registry 連線。
+- `whoami`：輸出登入帳號名（不輸出憑證內容）。
 
 **無子指令形態**：僅 `npm --version` / `npm -v` allow。
 
-**旗標 allowlist**（未知旗標一律 ask，如此亦免疫 npm 版本漂移）：
-`--json`/`-j`、`--long`/`-l`、`--depth <n>`、`--omit <type>`、`--include <type>`、
-`--offline`、`--prefer-offline`、`--prefer-online`、`--unicode`/`--no-unicode`、`--all`、
-`--parseable`/`-p`、`--color`/`--no-color`、`--package-lock-only`、`-w <name>`/`--workspace <name>`。
+其餘一律 ask，包括 `ls`/`list`/`la`/`ll`、`outdated`、`explain`/`why`、`root`、`prefix`、
+`pkg get`、`config get`/`get`——這些都依賴本機專案探索。`config get` 另有獨立風險：它讀取的
+`.npmrc` 層級同樣經向上探索決定，而 `.npmrc` 可能含 registry auth token 設定。
+
+**旗標 allowlist**（未知旗標一律 ask，如此亦免疫 npm 版本漂移）。範圍縮小後只保留對
+`view`/`ping`/`whoami` 有意義者：
+`--json`/`-j`、`--long`/`-l`、`--parseable`/`-p`、`--unicode`/`--no-unicode`、
+`--color`/`--no-color`、`--offline`、`--prefer-offline`、`--prefer-online`、`--otp <code>`。
+
+`--depth`、`--omit`、`--include`、`--all`、`--package-lock-only` 只對已移除的本機查詢子指令有
+意義，不納入；`-w`/`--workspace` 更是直接指向本機專案探索，一律 ask。
 
 明確 ask 的旗標（會改變讀寫位置或由誰執行什麼程式）：`--prefix`、`--userconfig`、
 `--globalconfig`、`--cache`、`--script-shell`、`--node-options`、`--editor`、`-g`/`--global`、
@@ -460,6 +471,9 @@ fail-closed：**字串以 `~` 開頭一律視為超出讀取範圍**。代價是
   npm 須覆蓋操作元文法：`npm view markdown-it`、`npm view @scope/pkg@1.2.3` → allow；
   `npm view /outside/dir`、`npm view ./x`、`npm view ../x`、`npm view file:./x`、
   `npm view https://example.com/x.tgz`、`npm view C:/x`、`npm view ~/x` → ask。
+  另須覆蓋「不探索本機專案」判準：**無操作元的 `npm view`** → ask；
+  `npm ls`、`npm outdated`、`npm explain x`、`npm root`、`npm prefix`、`npm pkg get name`、
+  `npm config get registry` → 全部 ask；`npm ping`、`npm whoami`、`npm --version` → allow。
 - **base64**（`base64_test.ts`）：`base64 -w 0 f.txt` 的 `0` 不被當成路徑；`base64 --wrap=0 f.txt`
   同理；`base64 <專案外檔>` → ask；未知旗標 → ask。
 - **`-w` 不得外溢的迴歸測試**：`md5sum -c -w /outside/checksums` 必須 ask
@@ -580,6 +594,14 @@ cache 與 debug log，見本節末的實測**）：`view`(`v`/`info`/`show`)、`
 其他：`npm bin` 在 11.x 已移除；`npm why` 是 `npm explain` 的別名。
 官方文件：<https://docs.npmjs.com/cli/v11/commands/>
 
+**本機查詢子指令的向上專案探索（實測）**：npm 對本機查詢類子指令會沿目錄樹向上尋找
+package.json 以決定 effective prefix。實測在一個兩層深、自身與中間層皆無 package.json 的空目錄
+中執行：`npm pkg get name` 印出**父層** package.json 的 `name`；`npm prefix` 印出父層目錄路徑；
+`npm ls` 印出父層專案的名稱與版本。受影響者包括 `pkg get`、`ls`、`outdated`、`explain`、`root`、
+`prefix`，以及無操作元的 `view`。`config get` 讀取的 `.npmrc` 層級同樣由此探索決定。
+
+對本專案尤其相關：本專案是 Deno 專案、無 package.json，因此這些子指令在此執行時必然讀到專案外。
+
 **npm 自身的 cache 與 log 寫入（實測）**：即使是純查詢子指令，npm 仍會寫入其 cache 目錄
 （`npm config get cache`，本機為 `D:\.npm-cache`）下的 `_cacache` 與 `_logs`。
 實測一次 `npm view markdown-it version`：`_logs` 目錄新增一個 `*-debug-0.log` 檔，
@@ -663,15 +685,19 @@ npm 仍會在其 cache 目錄（本機為 `D:\.npm-cache`，位於專案外）�
 「npm 的 cache/log 位置由使用者自己的 npm 設定決定」；若日後該前提改變（例如設計上開始容許
 由指令參數指定寫入位置），此豁免不自動延用。
 
-### npm 子指令範圍限於「registry 元資料 + 本機查詢」
+### npm 子指令範圍限於「不探索本機專案」者
 
-**Concern**：`search`、`audit`、`diff`、`sbom`、`doctor`、`token list`、`version`、`fund`、
-`cache ls`、`org ls`、`team ls`、`profile get`、`owner ls`、`query`、`help-search` 雖經查證為唯讀，
-但不納入 allowlist。
+**Concern**：許多經查證為唯讀的 npm 子指令不納入 allowlist，包括依賴本機專案探索的
+`ls`/`outdated`/`explain`/`root`/`prefix`/`pkg get`/`config get`，以及 `search`、`audit`、
+`diff`、`sbom`、`doctor`、`token list`、`version`、`fund`、`cache ls`、`org ls`、`team ls`、
+`profile get`、`owner ls`、`query`、`help-search`。
 
 **Decision**：不納入，維持 ask。
 
-**Rationale**：`search`/`audit`/`diff` 會把查詢字串或本機依賴清單送到外部 registry，超出本次
-選定的範圍；`token list` 列出認證令牌中繼資料；`doctor` 會檢查檔案權限、官方描述含診斷性修復；
-`version` 的安全與否取決於有無位置參數，形態辨識成本高於其價值；其餘為低頻子指令。
-未涵蓋者只是多問一次，符合「誤 ask 可接受，誤 allow 不可接受」的根本取捨。
+**Rationale**：本機查詢類會沿目錄樹向上找 package.json，讀取的位置可能落在允許範圍外，且沒有
+操作元可供檢查——本工具的路徑判定完全無從介入（實測見「查證依據」）。要納入就得讀取並疊加
+`.npmrc` 層級以求出 effective prefix，與「純詞法判定、不碰檔案系統」的核心設計衝突。
+其餘：`search`/`audit`/`diff` 會把查詢字串或本機依賴清單送到外部 registry；`token list` 列出
+認證令牌中繼資料；`doctor` 會檢查檔案權限、官方描述含診斷性修復；`version` 的安全與否取決於有無
+位置參數，形態辨識成本高於其價值；其餘為低頻子指令。未涵蓋者只是多問一次，符合「誤 ask 可接受，
+誤 allow 不可接受」的根本取捨。
