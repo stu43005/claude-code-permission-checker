@@ -338,9 +338,15 @@ value-flag 的值而跳過，失去唯一的路徑操作元、在專案內 cwd �
 
 比照 `git.ts` 的子指令 allowlist 結構：維護唯讀子指令集合，集合內才 allow、其餘 ask。
 
-**allowlist 的判準是「不探索本機專案」**，比「唯讀」更嚴格。npm 對本機查詢類子指令會沿目錄樹
-**向上**尋找 package.json 決定 effective prefix，並讀取該處的 package.json / .npmrc——那個位置
-可能在允許範圍之外，且沒有任何操作元可供本工具檢查（詳見「查證依據」的實測）。
+**allowlist 的判準是「不把本機專案內容當成輸出」**。必須先講清楚一件本工具管不到的事：
+**所有** npm 呼叫（含 `view`/`ping`/`whoami`）都會在 dispatch 子指令前載入設定，沿目錄樹向上
+尋找 local prefix 並讀取該處的 `.npmrc`。這一點無法靠挑選子指令避免，其後果記在
+「Non-goals / Accepted limitations」。
+
+本判準能控制的是另一件事：**子指令是否會把探索到的本機專案內容讀出來當輸出**。
+`ls`/`outdated`/`explain`/`root`/`prefix`/`pkg get`/`config get` 以及無操作元的 `view` 會，
+因此排除；帶操作元的 `view` 查的是 registry 上的指定套件，`ping` 只測連線，`whoami` 只輸出
+帳號名，皆不輸出本機專案內容（詳見「查證依據」的實測）。
 
 **允許的子指令**：
 
@@ -379,6 +385,11 @@ package.json 的內容**（name、version、description 等），構成呼叫者
 - 可選的 `@<version|range|tag>` 後綴
 - **不得**以 `.`、`/`、`~`、`-` 開頭；不得含 `\`、`:`（排除 `file:`、`http(s):`、`git+ssh:`、
   磁碟機字母如 `C:`）；除 scope 的那一個 `/` 外不得再含 `/`
+- **不得以 `.tgz`、`.tar`、`.tar.gz` 結尾**。這些副檔名即使是不含 `/` 也不含 `:` 的裸名，
+  仍會被 `npm-package-arg` 判為本地 tarball：實測 `npm view archive.tgz` 報
+  `tarball data for file:archive.tgz … ENOENT`（嘗試開啟本地檔），而 `npm view
+  definitely-not-a-real-pkg-xyz` 報 `E404 … GET https://registry.npmjs.org/…`（走 registry）。
+  少了這條，前述規則會把本地 tarball 路徑當成合法套件名放行。
 
 不符者一律 ask，不嘗試對其做 `resolvePath`——本規則的立場是「只認得套件名」，路徑形態交給使用者
 確認。動態 token 一律 ask（不臆測其展開結果）。
@@ -498,7 +509,8 @@ fail-closed：**字串以 `~` 開頭一律視為超出讀取範圍**。代價是
   形態 B（`-d`/`-s`/`-l`/`-M`/`-t dos`）帶專案外操作元時必須 ask、且不得取得 cwd 豁免。
   npm 須覆蓋操作元文法：`npm view markdown-it`、`npm view @scope/pkg@1.2.3` → allow；
   `npm view /outside/dir`、`npm view ./x`、`npm view ../x`、`npm view file:./x`、
-  `npm view https://example.com/x.tgz`、`npm view C:/x`、`npm view ~/x` → ask。
+  `npm view https://example.com/x.tgz`、`npm view C:/x`、`npm view ~/x`、
+  **`npm view archive.tgz`、`npm view archive.tar.gz`、`npm view archive.tar`** → ask。
   另須覆蓋「不探索本機專案」判準：**無操作元的 `npm view`** → ask；
   `npm ls`、`npm outdated`、`npm explain x`、`npm root`、`npm prefix`、`npm pkg get name`、
   `npm config get registry` → 全部 ask；`npm ping`、`npm whoami`、`npm --version` → allow。
@@ -622,6 +634,18 @@ cache 與 debug log，見本節末的實測**）：`view`(`v`/`info`/`show`)、`
 其他：`npm bin` 在 11.x 已移除；`npm why` 是 `npm explain` 的別名。
 官方文件：<https://docs.npmjs.com/cli/v11/commands/>
 
+**設定載入先於子指令 dispatch（實測）**：所有 npm 呼叫都會先載入設定，沿目錄樹向上尋找
+local prefix 並讀取該處 `.npmrc`。實測：於祖先目錄放置 `package.json` 與設定
+`logs-dir=<任意路徑>` 的 `.npmrc`，再於兩層深的子目錄執行 `npm view markdown-it version`，
+debug log 被寫入該 `.npmrc` 指定的目錄。僅有 `.npmrc` 而無 `package.json` 時不生效
+（local prefix 未成立）。同一機制亦可重導 `cache` 與 `registry`。此行為與子指令無關，
+無法藉由挑選子指令規避。
+
+**操作元的 tarball 形態（實測）**：裸名若帶 tarball 副檔名會被判為本地檔而非 registry 套件。
+`npm view archive.tgz` → `tarball data for file:archive.tgz … ENOENT`（開啟本地檔失敗）；
+`npm view archive.tar.gz` 同；對照 `npm view definitely-not-a-real-pkg-xyz` →
+`E404 … GET https://registry.npmjs.org/definitely-not-a-real-pkg-xyz`（走 registry）。
+
 **本機查詢子指令的向上專案探索（實測）**：npm 對本機查詢類子指令會沿目錄樹向上尋找
 package.json 以決定 effective prefix。實測在一個兩層深、自身與中間層皆無 package.json 的空目錄
 中執行：`npm pkg get name` 印出**父層** package.json 的 `name`；`npm prefix` 印出父層目錄路徑；
@@ -697,21 +721,30 @@ ask；方案 2 誤殺較少，但 `CwdState` 需能攜帶多個候選，`walk` �
 （例如願意接受 `cd X; …` 一律 ask），或 cwd 推導被用於更強的放行決策，此豁免不自動延用，
 應重走方案 1／2 的評估。
 
-### npm 對自身 cache 與 debug log 的寫入不納入判定
+### npm 的設定探索與其寫入位置不納入判定
 
-**Concern**：本工具的契約是「純唯讀且全部落在專案內」，但實測顯示即使 `npm view` 這類純查詢，
-npm 仍會在其 cache 目錄（本機為 `D:\.npm-cache`，位於專案外）寫入 `_cacache` 與新的
-`*-debug-0.log`，並輪替刪除舊 log（實測一次呼叫刪除 38 個舊檔）。允許 npm 查詢即等於允許這些
-專案外的寫入與刪除。
+**Concern**：兩層事實，第二層推翻了本條目最初的前提。
 
-**Decision**：接受，不實作任何對寫入目的地的驗證。
+1. 即使 `npm view` 這類純查詢，npm 仍會在其 cache 目錄（本機預設 `D:\.npm-cache`，位於專案外）
+   寫入 `_cacache` 與新的 `*-debug-0.log`，並輪替刪除舊 log（實測一次呼叫刪除 38 個舊檔）。
+2. **這些位置不必然由使用者自己的設定決定。** 所有 npm 呼叫都在 dispatch 子指令**之前**載入
+   設定，沿目錄樹向上找 local prefix 並讀取該處 `.npmrc`。實測：在祖先目錄放置
+   `package.json` 與一個設定 `logs-dir=<任意路徑>` 的 `.npmrc` 後，於兩層深的子目錄執行
+   `npm view markdown-it version`，debug log 確實被寫進該 `.npmrc` 指定的目錄。
+   同一機制也可重導 `cache`，以及把 `registry` 指向其他主機。
 
-**Rationale**：npm 管理自己的 cache 與 log 屬於工具的內部管家行為——不觸碰專案檔案、不外洩專案
-內容、不執行任意程式，不是本工具要防的威脅。相對地，若要在放行前確認寫入位置，必須讀取並疊加
-`.npmrc` 的專案／使用者／全域／內建四層設定以求出 effective `cache` 與 `logs-dir`，這與本工具
-「純詞法判定、不碰檔案系統」的核心設計直接衝突，成本與風險都遠高於所防的問題。本限制的前提是
-「npm 的 cache/log 位置由使用者自己的 npm 設定決定」；若日後該前提改變（例如設計上開始容許
-由指令參數指定寫入位置），此豁免不自動延用。
+**Decision**：接受，保留 `view`（帶操作元）／`ping`／`whoami`，不實作任何對設定來源或寫入
+目的地的驗證。
+
+**Rationale**：寫入的是 npm 自己的 log 與 cache 檔，內容不由攻擊者直接控制（log 檔名帶時間戳，
+不覆蓋既有檔案）；且任何人在同一目錄樹下執行 npm 都面臨完全相同的情況——這是 npm 的既有設定
+模型，不是本工具放行與否造成的差異。相對地，要在放行前確認寫入位置，就得讀取並疊加 `.npmrc`
+的專案／使用者／全域／內建四層設定以求出 effective `cache`、`logs-dir` 與 `registry`，與本工具
+「純詞法判定、不碰檔案系統」的核心設計直接衝突。
+
+本限制的前提是「npm 會依其自身設定模型讀寫，且寫入內容不受呼叫者控制」。若日後 npm 的設定模型
+改變、或本工具開始允許以指令參數指定寫入位置（如 `--cache`、`--logs-dir`——兩者目前都在 ask
+清單），此豁免不自動延用。
 
 ### npm 子指令範圍限於「不探索本機專案」者
 
