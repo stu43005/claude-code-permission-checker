@@ -427,11 +427,37 @@ Expected: PASS
 /**
  * bash 的 home（`$HOME`），僅供 tilde 展開。
  * 刻意不重用 resolveHome：後者在 Windows 優先 USERPROFILE，而 bash tilde expansion 只看 HOME。
+ *
+ * 非絕對路徑的 HOME 視為不可用：bash 會相對於行程 cwd 展開它，而 normalizeAbsolute 假設輸入
+ * 已是絕對路徑、會直接補上前導 `/`。兩者結果不同，拿來做範圍判定會誤放行。
  */
 export function shellHomeDir(env: EnvReader): string | null {
   const h = env.get("HOME");
-  return h && h.trim() !== "" ? normalizeAbsolute(h) : null;
+  if (!h || h.trim() === "") return null;
+  if (!isAbsolute(h)) return null;
+  return normalizeAbsolute(h);
 }
+```
+
+`isAbsolute` 已由 `src/engine/scope.ts` 匯出，在 `main.ts` 的既有 import 補上即可：
+
+```ts
+import { isAbsolute, normalizeAbsolute } from "./engine/scope.ts";
+```
+
+並在 `src/main_test.ts` 追加直接針對它的測試：
+
+```ts
+Deno.test("shellHomeDir: 只接受絕對路徑的 HOME", () => {
+  const of = (home: string | undefined) =>
+    shellHomeDir({ get: (k: string) => (k === "HOME" ? home : undefined) });
+  assertEquals(of("/home/u"), "/home/u");
+  assertEquals(of(undefined), null);
+  assertEquals(of(""), null);
+  assertEquals(of("   "), null);
+  assertEquals(of("../relative"), null);
+  assertEquals(of("relative/home"), null);
+});
 ```
 
 在 `main()` 內呼叫 `evaluate` 的那一行（既有寫法為
@@ -601,7 +627,8 @@ import type { CommandInvocation } from "../types.ts";
 - [ ] **Step 2: 執行測試確認失敗**
 
 Run: `deno test --allow-env src/engine/classify_test.ts`
-Expected: FAIL。目前 unknown cwd 不觸發規則一，`git`（無參數）會取得 allow。
+Expected: FAIL。目前 unknown cwd 不觸發規則一，`git log` 會取得 allow。
+（對照組與 known cwd 的案例應已通過。）
 
 - [ ] **Step 3: 實作**
 
@@ -951,9 +978,19 @@ Deno.test("framework: 內層加引號的字面 ~ 可求值（引號抑制展開�
 
 Deno.test("dirname / basename: 含反斜線的操作元不求值", () => {
   // GNU coreutils 在 Windows / Cygwin 上也把 `\` 當分隔符，本實作只處理 `/`；
-  // 與其算錯，不如放棄（算錯會讓 Task 7 拿到錯誤的 known cwd）
+  // 算錯會把一個錯誤的路徑當成 known cwd 交給後續範圍判定，故寧可放棄求值
   assertEquals(evalSubstitutionWord(wordOf(String.raw`cd "$(dirname 'C:\Windows\System32')"`), CWD), null);
   assertEquals(evalSubstitutionWord(wordOf(String.raw`cd "$(basename 'C:\Windows\System32')"`), CWD), null);
+});
+
+Deno.test("framework: 求值結果含換行 → null（經由真實求值器）", () => {
+  // 引號內的實際換行進入 echo 的操作元，走完求值器後才被結果過濾擋下，
+  // 藉此確認 evalSubstitutionWord 確實有套用 resultIsUsable
+  assertEquals(evalSubstitutionWord(wordOf("cd \"$(echo 'a\nb')\""), CWD), null);
+});
+
+Deno.test("framework: 求值為空字串 → null（經由真實求值器）", () => {
+  assertEquals(evalSubstitutionWord(wordOf(`cd "$(echo '')"`), CWD), null);
 });
 
 Deno.test("printf: 其餘形態不求值", () => {
@@ -1249,10 +1286,13 @@ Deno.test({
 
 Deno.test({
   ...WIN_ONLY,
-  name: "cygpath: 反斜線開頭的路徑 → null",
+  name: "cygpath: 反斜線開頭與無分隔符的磁碟前綴 → null",
   fn() {
     // `\d\proj` 在 Windows 是「當前磁碟機根」的絕對路徑，但 applyPath 會當成相對路徑
     assertEquals(evalSubstitutionWord(wordOf(String.raw`cd "$(cygpath -u '\d\proj')"`), CWD), null);
+    // `C:Windows` 是「C 磁碟機的當前目錄」語義，cygpath 會補上分隔符解析成 C:/Windows，
+    // 而 applyPath 會把它接到 cwd 之後 → 兩者不同
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -a -u 'C:Windows')"`), CWD), null);
   },
 });
 
@@ -1357,7 +1397,9 @@ const cygpathEvaluator: SubstEvaluator = {
  * 其餘以 `/` 開頭者由 MSYS2 mount 表決定實際位置，不等價。
  */
 function isNormalizationEquivalent(p: string): boolean {
-  if (/^[A-Za-z]:[/\\]/.test(p)) return true; // X:/… 或 X:\…
+  // 磁碟前綴必須接分隔符。`C:Windows`（無分隔符）在 Windows 是「該磁碟機的當前目錄」語義，
+  // cygpath 會補上分隔符解析成 C:/Windows，而 applyPath 會把它當相對路徑接到 cwd 之後。
+  if (/^[A-Za-z]:/.test(p)) return /^[A-Za-z]:[/\\]/.test(p);
   // 反斜線開頭（`\d\proj`）在 Windows 是「當前磁碟機根」的絕對路徑，但 applyPath 會把它
   // 當成相對路徑接到 cwd 之後 → 兩者指向不同目錄，不可求值。
   if (p.startsWith("\\")) return false;
@@ -2316,12 +2358,21 @@ Deno.test("npm: 版本後綴也必須合法（否則是本地目錄 spec）", ()
   assertEquals(npmRule.evaluate(ctxOf("npm view pkg@..")).kind, "ask");
   assertEquals(npmRule.evaluate(ctxOf("npm view pkg@.")).kind, "ask");
   assertEquals(npmRule.evaluate(ctxOf('npm view "pkg@. "')).kind, "ask"); // 尾隨空白
+  assertEquals(npmRule.evaluate(ctxOf("npm view pkg@.hidden")).kind, "ask"); // 以 . 開頭是本地目錄
   assertEquals(npmRule.evaluate(ctxOf("npm view pkg@")).kind, "ask");
   assertEquals(npmRule.evaluate(ctxOf("npm view pkg@@bad")).kind, "ask");
   assertEquals(npmRule.evaluate(ctxOf('npm view "not a package"')).kind, "ask");
-  // 合法的 range / tag 仍放行
+  // 合法的 range / tag 仍放行，含帶空白的 range
   assertEquals(npmRule.evaluate(ctxOf("npm view pkg@latest")).kind, "allow");
   assertEquals(npmRule.evaluate(ctxOf('npm view "pkg@^1.2.3"')).kind, "allow");
+  assertEquals(npmRule.evaluate(ctxOf('npm view "pkg@>=1.0.0 <2.0.0"')).kind, "allow");
+  assertEquals(npmRule.evaluate(ctxOf('npm view "pkg@1.0.0 - 2.0.0"')).kind, "allow");
+});
+
+Deno.test("npm: 布林旗標後接 true/false 會吃掉操作元 → ask", () => {
+  assertEquals(npmRule.evaluate(ctxOf("npm view --json true")).kind, "ask");
+  assertEquals(npmRule.evaluate(ctxOf("npm view --offline false")).kind, "ask");
+  assertEquals(npmRule.evaluate(ctxOf("npm view markdown-it --json")).kind, "allow");
 });
 
 Deno.test("npm: 安全吃值旗標缺值、空值或被旗標當成值 → ask", () => {
@@ -2402,18 +2453,18 @@ const PKG_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
  * **不得含 `/`、`\`、`:`，也不得含獨立的 `.` 或 `..` 段**——`pkg@..` 會被
  * npm-package-arg 解析成指向上層目錄的本地 spec。
  */
-const PKG_SUFFIX = /^[A-Za-z0-9.\-+^~><=*|]+$/;
+const PKG_SUFFIX = /^[A-Za-z0-9.\-+^~><=*| ]+$/;
 
 function isValidSuffix(suffix: string): boolean {
   if (suffix === "") return false;
-  // 不允許任何空白：`pkg@. ` 的尾隨空白會讓「純由 . 組成」的檢查失效，
-  // 而 npm-package-arg 仍把它解析成本地目錄 spec
-  if (/\s/.test(suffix)) return false;
-  if (!PKG_SUFFIX.test(suffix)) return false;
-  // 排除純由 . 組成的形態（`.`、`..`、`...`）與含 `..` 者
-  if (/^\.+$/.test(suffix)) return false;
+  // 前後空白一律拒絕。允許中間的空白是為了支援合法 range（`>=1.0.0 <2.0.0`、`1.0.0 - 2.0.0`），
+  // 但 `pkg@. ` 這種靠尾隨空白偽裝的形態必須擋下。
+  if (suffix !== suffix.trim()) return false;
+  // 以 `.` 開頭一律拒絕：npm-package-arg 會把 `pkg@.`、`pkg@..`、`pkg@.hidden`
+  // 一併解析成本地目錄 spec，而非 registry 上的版本
+  if (suffix.startsWith(".")) return false;
   if (suffix.includes("..")) return false;
-  return true;
+  return PKG_SUFFIX.test(suffix);
 }
 
 function isRegistrySpec(value: string): boolean {
@@ -2466,6 +2517,12 @@ export const npmRule: CommandRule = {
         const name = eq === -1 ? t : t.slice(0, eq);
         if (SAFE_VALUELESS_FLAGS.has(name)) {
           if (eq !== -1) return ask(`npm：未列入安全集合的旗標形式 ${t}`);
+          // npm 的解析器會讓布林旗標吃掉其後的 `true` / `false`。若這裡照樣把該 token 當成
+          // 位置參數，`npm view --json true` 會被誤認為「有操作元」，實際上 npm 收到的是
+          // 零操作元、於是改查當前專案——正是本規則要擋的形態。
+          if (tokens[i + 1] === "true" || tokens[i + 1] === "false") {
+            return ask(`npm：${name} 後接布林值，操作元數量無法靜態判定`);
+          }
           continue;
         }
         if (SAFE_VALUE_FLAGS.has(name)) {
@@ -2697,19 +2754,10 @@ Deno.test("e2e: 未加引號的 ~ 展開為 HOME，落在專案外 → ask", asy
   }
 });
 
-Deno.test("e2e: Read(~/cache/**) 以 settings home 解析，指令的 ~ 以 HOME 展開", async () => {
-  // settings 側的 ~ 走 resolveHome（Windows 優先 USERPROFILE）；指令側的 ~ 走 HOME。
-  // 兩者不同時，授權的路徑與實際讀取的路徑不同 → 必須 ask。
+// 正面案例跨平台成立：兩個 home 相同時，settings 的 ~ 與指令的 ~ 指向同一處
+Deno.test("e2e: Read(~/cache/**) 授權後，指令的 ~ 展開命中該範圍 → allow", async () => {
   const proj = await projWithAllow(["Read(~/cache/**)"]);
   try {
-    assertEquals(
-      await decisionWithEnv("cat ~/cache/x", proj, {
-        HOME: "/bash-home",
-        USERPROFILE: "/settings-home",
-      }),
-      "ask",
-    );
-    // 兩者相同時，授權與實際讀取一致 → allow
     assertEquals(
       await decisionWithEnv("cat ~/cache/x", proj, {
         HOME: "/same-home",
@@ -2721,11 +2769,29 @@ Deno.test("e2e: Read(~/cache/**) 以 settings home 解析，指令的 ~ 以 HOME
     await Deno.remove(proj, { recursive: true });
   }
 });
-```
 
-> 第二個測試在非 Windows 平台上 `resolveHome` 優先 `HOME`，兩個斷言會同為 allow。
-> 以 `Deno.test({ ignore: Deno.build.os !== "windows", … })` 包住第一個斷言，
-> 或把該測試整體標為 Windows-only。
+// 兩個 home 分歧只在 Windows 成立：resolveHome 在該平台優先 USERPROFILE，
+// 其他平台兩者都用 HOME，分歧無從產生。
+Deno.test({
+  ignore: Deno.build.os !== "windows",
+  name: "e2e: HOME 與 USERPROFILE 分歧時，settings 的 ~ 走 USERPROFILE、指令的 ~ 走 HOME",
+  async fn() {
+    const proj = await projWithAllow(["Read(~/cache/**)"]);
+    try {
+      // 授權的是 USERPROFILE/cache，實際讀的是 HOME/cache → 不一致 → ask
+      assertEquals(
+        await decisionWithEnv("cat ~/cache/x", proj, {
+          HOME: "/bash-home",
+          USERPROFILE: "/settings-home",
+        }),
+        "ask",
+      );
+    } finally {
+      await Deno.remove(proj, { recursive: true });
+    }
+  },
+});
+```
 
 - [ ] **Step 4: 執行 e2e 測試**
 
@@ -2777,7 +2843,10 @@ run '"cd \"$(cygpath -u '\''D:/claude-code-permission-checker'\'')\" && cat deno
 run '"cat ~/.ssh/id_rsa"'                                                                  # 期望 ask
 
 echo "exit 非 0 的次數：$failures"
-[ "$failures" -eq 0 ] || echo "!!! operational verification 未通過"
+if [ "$failures" -ne 0 ]; then
+  echo "!!! operational verification 未通過"
+  exit 1
+fi
 ```
 
 Expected：標示 allow 的回 `permissionDecision: "allow"`、標示 ask 的回 `"ask"`，
