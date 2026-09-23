@@ -124,12 +124,13 @@ parse.ts (unbash) → walk.ts → 閘① sleep → 閘② 名稱重定義 → no
   成為 `grep.ts` 內獨立的 `rgRule`）。
 
   **解析器歸屬與豁免資格是兩件事**：走 `CommandSpec` 的只有 `grep`/`egrep`/`fgrep`、`head`、`wc`、
-  `tail`、`base64`；`gh`、`jq`、`sed`、`npm`、`cygpath` 各有自己的**單一 memoized 掃描**（同樣保證
+  `tail`、`base64`；`gh`、`jq`、`sed`、`cygpath` 各有自己的**單一 memoized 掃描**（同樣保證
   evaluate 與述詞讀同一份結果）；`curl` 與 `rg` 沿用既有 legacy 解析。豁免資格則由 `cwdIndependent`
   宣告，兩者不重疊：`curl` 不走 `CommandSpec` 但會豁免，`rg` 既不走 `CommandSpec` 也不豁免（恆為遞迴）。
+  `npm` 在 `evaluate` 內直接掃描 argv，沒有 memoization，也不宣告 `cwdIndependent`。
 
   **本次新增四條規則**：`base64.ts`（走 `CommandSpec`：`-d`/`--decode`/`-i`/`--ignore-garbage` 不吃值、
-  `-w`/`--wrap` 吃值，僅接受單一 FILE 位置參數，無任何寫檔旗標）；`test.ts`（只允許「單一一元檔案測試
+  `-w`/`--wrap` 吃值，逐一檢查所有路徑位置參數的範圍，不限制其數量，無任何寫檔旗標）；`test.ts`（只允許「單一一元檔案測試
   運算子 + 一個路徑操作元」，`argv.length !== 2` 或運算子不在安全集合即 ask；`-a`/`-o`/`-t`/`-n`/`-z`/
   `-v`/`-R` 因語義依參數個數而定或操作元非路徑而刻意排除）；`cygpath.ts`（依旗標分三形態：形態 A
   純字串轉換一律 allow（不對操作元做範圍檢查，即使會經 MSYS2 mount 表也照樣 allow——cygpath 只
@@ -157,13 +158,14 @@ parse.ts (unbash) → walk.ts → 閘① sleep → 閘② 名稱重定義 → no
 
 （註：對「遞迴遍歷磁碟根/家目錄根」的 `deny` 不是中央前置規則，而是各遞迴指令規則內以 `isDangerousRoot` 判定、再由 `classify` 對 `deny` 短路；故不在本四條之列。）
 
-1. **cwd 範圍**：`cwd.kind === "unknown"` → ask（工作目錄無法靜態確定，鏈內 `cd`/`git -C` 目標為
-   動態）；否則 `cwd.kind === "known"` 但落在「專案 ∪ 使用者以 `Read()/Edit()/Write()` 放寬的外部
-   唯讀範圍 ∪ 當前 session 的 trusted read roots」之外 → ask（判定由 `scope.ts` 的 `isReadScoped`
-   統一負責）。初始 cwd 恆為 `known`（`main.ts` 的 `initialCwd` 在 hook 傳入的 `cwd` 缺欄位時
-   fallback 到專案根，不會產生 `unknown`），故 `unknown` 必然源自鏈內 `cd` 把目標寫成動態
-   token——不擋的話，等於能整個跳過範圍檢查。**唯一例外**：五道護欄全部成立時跳過本條（且只
-   跳過本條）——
+1. **cwd 範圍**：`cwd.kind === "unknown"` → ask（工作目錄無法靜態確定）；否則 `cwd.kind === "known"`
+   但落在「專案 ∪ 使用者以 `Read()/Edit()/Write()` 放寬的外部唯讀範圍 ∪ 當前 session 的
+   trusted read roots」之外 → ask（判定由 `scope.ts` 的 `isReadScoped` 統一負責）。初始 cwd 恆為
+   `known`（`main.ts` 的 `initialCwd` 在 hook 傳入的 `cwd` 缺欄位時 fallback 到專案根，不會產生
+   `unknown`）。後續無法推導的 `cd`（無參數、帶選項或多參數、tilde 形態不可展開、取值以 `-`
+   開頭、substitution 不可求值）、含 `cd` 的控制流，以及 `gitEffectiveCwd` 遇到動態路徑選項，
+   都可能產生 `unknown`；此時仍須阻擋範圍檢查繞過——不擋的話，把 cd 目標寫成動態就能整個跳過
+   範圍檢查。**唯一例外**：五道護欄全部成立時跳過本條（且只跳過本條）——
    (1) 指令規則自身回 `allow`（`permissions.allow` 升級的 ask 永不豁免）；
    (2) hook 傳入的 session cwd 本身在範圍內 **且** 當前 cwd 由鏈內 `cd` 產生（`origin === "chain-cd"`，
        此欄位只存在於 `kind === "known"`，故 `unknown` 必然不滿足本護欄、永遠無法豁免）；
