@@ -199,7 +199,9 @@ export function mayExpandToOption(word: Word): boolean;  // value 的第一個�
 - `globWords` 為空 → null（通過）。
 - `injectable` = `globWords` 中有任何 word 使 `mayExpandToOption` 為 true。
   被注入的 `-r`/`-R` 可能讓非遞迴呼叫變成遞迴，例如 `grep x ?r ~` 遇到名為 `-r` 的檔案。
-- 若 `isRecursive || injectable`：
+- `globstar` = `globWords` 中有任何 word 含一個恰為 `**` 的段。開啟 globstar 時，shell 展開本身就會遞迴遍歷前綴目錄，
+  例如 `cat /home/me/**/*.md`；未開啟時它等同 `*`，屬於安全方向的誤判。
+- 若 `isRecursive || injectable || globstar`：
   - `globWords` 中若有任何 word 使 `ctx.globMaySelectDangerousRoot` 為 true → `deny(recursiveRootDenyReason(ctx.name, word.value))`；
   - 若 `injectable`，`ctx.argv` 中其餘 Word 若有任何一個使 `ctx.isDangerousRoot` 為 true → 同樣 deny。
     明確遞迴時，其餘 Word 已由既有的遞迴 deny 檢查過。
@@ -281,7 +283,9 @@ export function mayExpandToOption(word: Word): boolean;  // value 的第一個�
       `grep ?e -e --file=C:secret ./safe.txt`；
     - deny（在 `Read(~/**)` 或 `Read(//C:/**)` 放行家目錄/磁碟根的設定下也一樣，且在一般只含專案範圍的設定下
       也必須是 deny、不得被 ask 搶先）：`grep x ?r ~`、`ls ?R /`、`grep -r x /home/m?`（home=`/home/me`）、
-      `grep -r x m?`（cwd=`/home`）、`grep -r x /*`、`ls -R /home/me/*`；
+      `grep -r x m?`（cwd=`/home`）、`grep -r x /*`、`ls -R /home/me/*`、
+      `cat /home/me/**/*.md`、`head /**/*.md`、`grep x /home/me/**/*.md`（globstar 視為遞迴）；
+    - allow：`cat src/**/*.ts`（專案內前綴、非危險根）；
     - 非遞迴、無注入風險時不觸發閘門：`cat /home/me/*.md`、`grep x /home/m?/a.md` 依一般範圍判定（前綴在專案外 → ask，不是 deny）；
     - allow：`grep "a\|b" *.md`、`grep -m 5 x *.md`、`grep -rn x *.md`、`ls -la *.md`、
       `grep /outside/secret ./*.md`（有字面前綴、不會注入，所以不套用護欄）。
