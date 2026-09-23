@@ -24,13 +24,17 @@ function centralPreflightAsk(
   scope: ScopeConfig,
   skipCwdCheck: boolean,
 ): RuleVerdict | null {
-  // 一：cwd 範圍（known 但不在「專案 ∪ 外部允許唯讀範圍」）。skipCwdCheck 由 classify
-  // 依五道護欄算出；規則二/三/四不受影響。
-  if (
-    !skipCwdCheck && inv.cwd.kind === "known" &&
-    !isReadScoped(normalizeAbsolute(inv.cwd.path), scope)
-  ) {
-    return ask(`工作目錄超出允許範圍：${inv.cwd.path}`);
+  // 一：cwd 範圍。skipCwdCheck 由 classify 依五道護欄算出；規則二/三/四不受影響。
+  if (!skipCwdCheck) {
+    // 初始 cwd 恆為 known（main.ts 的 initialCwd 缺欄位時 fallback 到專案根），
+    // 故 unknown 必然源自鏈內 cd 或 git -C <動態>——即「將在本工具無法確定的目錄執行」。
+    // 這正是規則一要防的情形；不擋的話，把 cd 目標寫成動態就能整個跳過範圍檢查。
+    if (inv.cwd.kind === "unknown") {
+      return ask(`${inv.name}：工作目錄無法靜態確定（鏈內 cd 目標為動態）`);
+    }
+    if (!isReadScoped(normalizeAbsolute(inv.cwd.path), scope)) {
+      return ask(`工作目錄超出允許範圍：${inv.cwd.path}`);
+    }
   }
   // 二：寫入型重導向
   if (hasWriteRedirect(inv.redirects)) {
