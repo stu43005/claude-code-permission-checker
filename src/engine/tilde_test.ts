@@ -32,6 +32,20 @@ Deno.test("hasUnquotedLeadingTilde: 不以 ~ 開頭者一律 false", () => {
   assertEquals(hasUnquotedLeadingTilde(wordOf("cd a~b")), false);
 });
 
+Deno.test("hasUnquotedLeadingTilde: tilde-prefix 內含引號時 bash 不展開", () => {
+  // prefix 是 `~""`（到第一個未加引號的 /），含引號 → 不展開，字面 ./~/src
+  assertEquals(hasUnquotedLeadingTilde(wordOf('cd ~""/src')), false);
+  // 整個 word 都在 prefix 內且含引號 → 不展開
+  assertEquals(hasUnquotedLeadingTilde(wordOf('cd ~"/src"')), false);
+  assertEquals(hasUnquotedLeadingTilde(wordOf("cd ~''/src")), false);
+});
+
+Deno.test("hasUnquotedLeadingTilde: prefix 乾淨時仍展開（引號只落在 prefix 之後）", () => {
+  // prefix 是 `~`，第一個未加引號的 / 之後才有引號 → 照常展開
+  assertEquals(hasUnquotedLeadingTilde(wordOf('cd ~/"src"')), true);
+  assertEquals(hasUnquotedLeadingTilde(wordOf(`cd ~/'src'/x`)), true);
+});
+
 Deno.test("expandTilde: 只支援 ~ 與 ~/<rest>", () => {
   assertEquals(expandTilde("~", "/home/u"), "/home/u");
   assertEquals(expandTilde("~/x/y", "/home/u"), "/home/u/x/y");
