@@ -184,7 +184,9 @@ async function main(): Promise<void> {
     console.log(`\n${CASES.length - failures}/${CASES.length} passed`);
     if (failures > 0) {
       console.error(`${failures} case(s) failed`);
-      Deno.exit(1);
+      // Deno.exit(1) 會立即終止行程、跳過下面的 finally，讓失敗時暫存目錄留下垃圾。
+      // 用 Deno.exitCode 只設定退出狀態、不中斷控制流，finally 的清理仍會執行。
+      Deno.exitCode = 1;
     }
   } finally {
     await Deno.remove(root, { recursive: true });
