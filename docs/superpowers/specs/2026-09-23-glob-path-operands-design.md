@@ -75,7 +75,10 @@ grep -n "careTreatment\|WebApi\|webapi" *.md runtime-behavior/*.md | head -40
 - **grep/egrep/fgrep**：沒有寫檔或 exec 類旗標。
   - 注入 `-r`/`-R` 只會遞迴 cwd 內、已通過範圍檢查的操作元。
   - 注入 `-f<name>`/`--file=<name>` 讀取的是 cwd 內的檔案。
-  - 注入吃值旗標會吞掉下一個檔名作為值，也無害。
+  - **但注入會翻轉位置參數的分類**。例如 cwd 有名為 `-e^` 的檔案時，`grep /outside/secret *`
+    展開後帶有明確的 `-e` pattern，GNU grep 便把原本的 PATTERN `/outside/secret` 當成檔案並印出其內容。
+    同理，注入一個吃值的旗標，也可能吞掉後面合法的 `-e`，把它的值推回位置參數。
+    因此只要某個 token 可能被注入翻成檔案操作元，就必須做範圍檢查，見 §2 的「注入護欄」。
 - **wc**：`--files0-from=<name>` 會讀 cwd 內 `<name>` 所列的任意路徑，並輸出其**計數與檔名**。
   這是殘留風險，見 Non-goals / Accepted limitations。
 
@@ -87,7 +90,11 @@ grep -n "careTreatment\|WebApi\|webapi" *.md runtime-behavior/*.md | head -40
 export interface GlobPath { prefix: string }            // 字面前綴目錄；"" 代表 cwd
 export function parseGlobPath(word: Word): GlobPath | null;
 export function isGlobAttachedValue(word: Word, flagName: string): boolean;
+export function mayExpandToOption(word: Word): boolean;  // value 的第一個字元是未跳脫的 * ? [
 ```
+
+`mayExpandToOption` 為 true 表示該 glob 沒有字面前綴，展開結果的第一個字元取自 cwd 內的檔名，
+所以可能以 `-` 開頭而被當成旗標。
 
 `parseGlobPath` 只有在以下條件**全部**成立時才回非 null。
 
@@ -121,9 +128,14 @@ export function isGlobAttachedValue(word: Word, flagName: string): boolean;
 2. 把 `prefix` 解析成絕對路徑 *P*：
    - `prefix === ""` 時，cwd 為 known 取 `cwd.path`，否則回 `"dynamic"`；
    - 其餘情形沿用 `resolveResolvedValue` 相同的絕對/相對語義，相對路徑以 cwd 為基準，cwd unknown → `"dynamic"`。
-3. `isReadScoped(P, scope)` 為 false → `"out-of-project"`。
-4. **巢狀否決**：*P* 不在 `scope.root` 之內，但 `scope.deny` 或 `scope.ask` 有任何 root 或 file 嚴格位於 *P* 之下
-   → `"out-of-project"`。*P* 在 root 內時不做此檢查，維持 root-first 語義。
+3. **目錄涵蓋判定**（不使用 `isReadScoped`，因為它會接受 `scope.allow.files` 的精確單檔匹配，
+   而精確單檔的 allow 不得擴大成涵蓋其子路徑）：
+   - `isWithin(scope.root, P)` → 視為涵蓋，跳到步驟 5；
+   - 否則若 `scope.deny` 或 `scope.ask` 命中 *P*（roots 用 `isWithin`、files 用精確相等）→ `"out-of-project"`；
+   - 否則若 `scope.allow.roots` 或 `scope.trusted` 有某個 root 使 `isWithin(root, P)` 成立 → 涵蓋，進入步驟 4；
+   - 其餘（包括 *P* 只命中 `scope.allow.files`）→ `"out-of-project"`。
+4. **巢狀否決**（只在 *P* 位於專案根之外時執行）：`scope.deny` 或 `scope.ask` 若有任何 root 或 file
+   嚴格位於 *P* 之下 → `"out-of-project"`。*P* 在專案根內時不做此檢查，維持 root-first 語義。
 5. 其餘 → `"in-project"`。
 
 `RuleContext` 新增 `resolveGlobPath(arg: Word): PathScope`，由 `classify.ts` 綁定 cwd 與 scope。
@@ -144,6 +156,19 @@ export function isGlobAttachedValue(word: Word, flagName: string): boolean;
 - 吃值旗標的獨立 token 值若是 glob（例如 `-e *.md`），沿用現狀 → dynamic。
 - `evaluateWithSpec` 在既有 `pathOperands` 檢查之後，對 `globOperands` 逐一呼叫 `ctx.resolveGlobPath`，
   任何一個不是 `in-project` 都 ask，理由為 `${name}：glob 路徑超出專案範圍或無法靜態解析（${value}）`。
+- `ArgvParse` 另新增 `injectionRisk: boolean`：當存在某個 glob 操作元使 `mayExpandToOption` 為 true，
+  且它出現在 `optionsDone` 變為 true（即字面 `--`）之前時，設為 true。
+  另新增 `separateValueTokens: Word[]`：以獨立 token 形式被吃掉的旗標值 Word。
+- **注入護欄**：`injectionRisk` 為 true 時，`evaluateWithSpec` 必須對 `nonPathOperands` 與
+  `separateValueTokens` 的每個 Word 呼叫 `ctx.resolvePath`，任何一個不是 `in-project` 都 ask，
+  理由為 `${name}：glob 可能展開成旗標，${value} 可能被當成檔案讀取且超出範圍`。
+  - 一般的 pattern（例如 `"careTreatment\|WebApi"`）或數值（例如 `-m 5` 的 `5`）是相對路徑，
+    會解析到 cwd 內 → in-project，照常 allow。
+  - `grep /outside/secret *.md`、`grep *.md -e /outside` 則 → ask。
+  - `--name=value` 黏寫的旗標值不在此列：被注入的旗標只能吞掉**下一個獨立 token**，黏寫值無法被推成位置參數。
+- **legacy 路徑不需要注入護欄**：legacy 的 `positionals` 對所有非 `-` 開頭的 token（含未列入 `valueFlags`
+  的旗標值）一律 `resolvePath`，而 cat、ls 在 `fileReaderRule` 的 `valueFlags` 中沒有吃值旗標。
+  所以任何可能被注入翻成檔案的 token 本來就已經檢查過範圍。
 - `cwdIndependentWhenNoPaths` 述詞額外要求 `p.globOperands.length === 0`。
 
 **legacy 路徑（cat、ls）**
@@ -176,19 +201,27 @@ export function isGlobAttachedValue(word: Word, flagName: string): boolean;
 - **`src/engine/scope_test.ts`**
   - `resolveGlobPath` 三態：專案內前綴 → in-project；專案外前綴 → out-of-project；cwd unknown 且前綴相對 → dynamic。
   - 外部 allow root 內有巢狀 deny/ask 時 → out-of-project；外部 allow root 內沒有巢狀 deny → in-project。
+  - `Read(//outside/data)` 這類精確單檔的 allow：`/outside/data/*` → out-of-project；
+    `Read(//outside/data/**)` 這類 allow root：`/outside/data/*` → in-project。
   - Windows 的 `/d/` 形態以 `Deno.build.os` 分支。
+- **`src/engine/glob_test.ts`（補充）**：`mayExpandToOption` 對 `*.md`、`?x`、`[ab]x` 為 true；
+  對 `./*.md`、`src/*.md` 為 false。
 - **規則測試**（`command_spec_test.ts`、`grep_test.ts`、`coreutils_test.ts`）
   - allow：`wc -l *.md`、`head *.md`、`grep -n x *.md sub/*.md`、`grep -rn x --include=*.md .`、
     `cat src/*.ts`、`ls *.md`。
   - ask：`grep *.md f`、`grep -e *.md f`、`grep -f *.x f`、`wc --files0-from=*.x`、`stat *.md`、
     `cat ../*.md`（前綴在範圍外）、`ls .*`。
   - 清單外規則維持 ask：`tail *.md`、`diff *.md x`、`sort *.md`。
+  - 注入護欄：
+    - ask：`grep /outside/secret *.md`、`grep *.md -e /outside`、`head *.md -n /outside/x`；
+    - allow：`grep "a\|b" *.md`、`grep -m 5 x *.md`、`grep /outside/secret ./*.md`（有字面前綴、不會注入）、
+      `grep /outside/secret -- *.md`（glob 在 `--` 之後、不會注入，PATTERN 只是字串）。
 - **`src/engine/classify_test.ts`**
   - `cat < *.md` → ask。
   - `cd /outside && wc -l *.md`（chain-cd）→ ask，因為不豁免。
   - `permissions.allow` 含 `Bash(stat *)` 時，`stat *.md` 仍為 ask。
 - **Operational verification**：在 `scripts/verify-hook-binary.ts` 的 `CASES` 加入三條範例指令（期望 allow），
-  以及 `cat < *.md`、`stat *.md`、`grep *.md f`、`ls .*`（期望 ask）。
+  以及 `cat < *.md`、`stat *.md`、`grep *.md f`、`ls .*`、`grep /outside/secret *`（期望 ask）。
 - 最後執行 `deno task check && deno task lint && deno task test`，並跑上述 verify 腳本。
 
 ## 文件
