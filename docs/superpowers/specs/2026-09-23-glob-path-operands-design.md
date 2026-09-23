@@ -183,7 +183,11 @@ export function mayExpandToOption(word: Word): boolean;  // value 的第一個�
 因此護欄不區分 token 的種類，規則如下：
 1. 若 `globWords` 中沒有任何 word 使 `mayExpandToOption` 為 true → 通過。
    有字面前綴的 glob（`./*.md`、`src/*.md`）不可能展開成旗標。
-2. 否則，對 `ctx.argv` 中**不在 `globWords` 之內的每一個 Word**（包括旗標 token、旗標值、PATTERN），
+2. **遞迴危險根**：被注入的 `-r`/`-R` 可能讓非遞迴呼叫變成遞迴（例如 `grep x ?r ~` 遇到名為 `-r` 的檔案）。
+   因此對 `ctx.argv` 中不在 `globWords` 之內的每一個 Word，只要 `ctx.isDangerousRoot(word)` 為 true，就回
+   `deny(recursiveRootDenyReason(ctx.name, word.value))`。這一步先於步驟 3，且不受讀取範圍放寬影響，
+   以維持「遞迴遍歷磁碟根/家目錄根 = 硬 deny」這個不變量。
+3. 否則，對 `ctx.argv` 中**不在 `globWords` 之內的每一個 Word**（包括旗標 token、旗標值、PATTERN），
    都呼叫 `ctx.resolvePath`，把它當成「可能被讀取的路徑」檢查。任何一個不是 `in-project` 都 ask，
    理由為 `${name}：glob 可能展開成旗標，${value} 可能被當成檔案讀取且超出範圍`。
    非靜態的 token（例如 `--include=*.md`）在這裡會得到 `dynamic` → ask。
@@ -235,6 +239,7 @@ export function mayExpandToOption(word: Word): boolean;  // value 的第一個�
     - ask：`grep /outside/secret *.md`、`grep *.md -e /outside`、`head *.md -n /outside/x`、
       `grep -e . ?? --label=/../../secret`、`cat *.md --x=/../../secret`、`ls -la *.md --hide=/../../x`、
       `grep /outside/secret -- *.md`（護欄不看 `--`）、`grep -n x *.md --include=*.md`；
+    - deny（在 `Read(~/**)` 或 `Read(//C:/**)` 放行家目錄/磁碟根的設定下也一樣）：`grep x ?r ~`、`ls ?R /`；
     - allow：`grep "a\|b" *.md`、`grep -m 5 x *.md`、`grep -rn x *.md`、`ls -la *.md`、
       `grep /outside/secret ./*.md`（有字面前綴、不會注入，所以不套用護欄）。
 - **`src/engine/classify_test.ts`**
