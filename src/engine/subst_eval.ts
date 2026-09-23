@@ -16,8 +16,130 @@ export interface SubstEvaluator {
   evaluate(argv: string[], cwd: CwdState): string | null;
 }
 
+/** 去掉尾端斜線（但單一 "/" 保留）。 */
+function stripTrailingSlashes(s: string): string {
+  let out = s;
+  while (out.length > 1 && out.endsWith("/")) out = out.slice(0, -1);
+  return out;
+}
+
+/** GNU dirname 語義（純字串，不碰檔案系統）。 */
+function dirnameOf(value: string): string {
+  const s = stripTrailingSlashes(value);
+  const idx = s.lastIndexOf("/");
+  if (idx === -1) return ".";
+  if (idx === 0) return "/";
+  return stripTrailingSlashes(s.slice(0, idx));
+}
+
+/** GNU basename 語義（純字串，不碰檔案系統）。 */
+function basenameOf(value: string, suffix?: string): string {
+  const s = stripTrailingSlashes(value);
+  if (s === "/") return "/";
+  const idx = s.lastIndexOf("/");
+  let base = idx === -1 ? s : s.slice(idx + 1);
+  if (suffix && suffix !== base && base.endsWith(suffix)) {
+    base = base.slice(0, -suffix.length);
+  }
+  return base;
+}
+
+/**
+ * 本實作只處理 POSIX 形態的路徑。兩類操作元一律放棄求值，因為算錯的結果會被當成
+ * known cwd 用於後續範圍判定：
+ *
+ *  1. 含 `\`：GNU coreutils 在 Windows / Cygwin 上也把 `\` 當分隔符
+ *     （`dirname 'C:\Windows\System32'` → `C:\Windows`），照 `/`-only 邏輯會算成 `.`。
+ *  2. 含磁碟前綴（`C:` / `C:/…`）：GNU 在支援磁碟機的平台上會保留該前綴並禁止從磁碟根
+ *     移除後綴（`basename C: :` → `C:`），而 `/`-only 的字串切法會得到 `C`。
+ */
+function isUnsupportedPathForm(value: string): boolean {
+  return value.includes("\\") || /^[A-Za-z]:/.test(value);
+}
+
+const dirnameEvaluator: SubstEvaluator = {
+  names: ["dirname"],
+  evaluate(argv) {
+    // 旗標（含 -z/--zero）與多操作元一律放棄：-z 改用 NUL 分隔、多操作元逐行輸出
+    if (argv.length !== 1) return null;
+    if (argv[0].startsWith("-")) return null;
+    if (isUnsupportedPathForm(argv[0])) return null;
+    return dirnameOf(argv[0]);
+  },
+};
+
+const basenameEvaluator: SubstEvaluator = {
+  names: ["basename"],
+  evaluate(argv) {
+    if (argv.some(isUnsupportedPathForm)) return null;
+    // `basename -s SUFFIX NAME`
+    if (argv.length === 3 && argv[0] === "-s") {
+      if (argv[2].startsWith("-")) return null;
+      return basenameOf(argv[2], argv[1]);
+    }
+    // `basename NAME` / `basename NAME SUFFIX`
+    if (argv.length === 1 || argv.length === 2) {
+      if (argv.some((a) => a.startsWith("-"))) return null;
+      return basenameOf(argv[0], argv[1]);
+    }
+    return null;
+  },
+};
+
+const pwdEvaluator: SubstEvaluator = {
+  names: ["pwd"],
+  evaluate(argv, cwd) {
+    if (argv.length !== 0) return null; // -P 會解 symlink，需碰檔案系統
+    if (cwd.kind !== "known") return null;
+    return cwd.path;
+  },
+};
+
+const echoEvaluator: SubstEvaluator = {
+  names: ["echo"],
+  evaluate(argv) {
+    // 連 `-n` 都不接受。bash 在 POSIX mode 且 `xpg_echo` 為 on 時會把 `-n` 當成**操作元**
+    // 輸出（`echo -n x` → `-n x`），而這兩個 shell 選項都是執行期狀態、靜態不可知。
+    // 求值器的契約是「輸出可能取決於執行期 shell 選項就回 null」，故只接受無旗標形態。
+    const operands = argv;
+    if (operands.length === 0) return null;
+    for (const o of operands) {
+      // 任一以 `-` 開頭的 token 一律放棄：它可能是旗標（`-e` 會改變跳脫處理），
+      // 也可能因 shell 選項而變成字面操作元。兩種解讀的輸出不同，靜態無從區分。
+      if (o.startsWith("-")) return null;
+      // 含反斜線時，輸出取決於執行期的 xpg_echo shopt（靜態不可知）→ 放棄
+      if (o.includes("\\")) return null;
+    }
+    return operands.join(" ");
+  },
+};
+
+const printfEvaluator: SubstEvaluator = {
+  names: ["printf"],
+  evaluate(argv) {
+    if (argv.length === 0) return null;
+    const fmt = argv[0];
+    // 格式字串永遠解釋反斜線（即使不含 %），故含反斜線一律放棄
+    if (fmt.includes("\\")) return null;
+    if (fmt.startsWith("-")) return null; // -v var 會賦值而非輸出
+    if (fmt === "%s") {
+      if (argv.length !== 2) return null; // 格式會重複套用到所有參數
+      if (argv[1].includes("\\")) return null;
+      return argv[1];
+    }
+    if (!fmt.includes("%") && argv.length === 1) return fmt;
+    return null;
+  },
+};
+
 /** 已註冊的求值器。指令名重複註冊會在載入時丟錯。 */
-const EVALUATORS: SubstEvaluator[] = [];
+const EVALUATORS: SubstEvaluator[] = [
+  dirnameEvaluator,
+  basenameEvaluator,
+  pwdEvaluator,
+  echoEvaluator,
+  printfEvaluator,
+];
 
 const INDEX = new Map<string, SubstEvaluator>();
 for (const e of EVALUATORS) {
