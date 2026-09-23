@@ -69,7 +69,7 @@ grep -n "careTreatment\|WebApi\|webapi" *.md runtime-behavior/*.md | head -40
 
 ### 其餘清單成員的旗標注入分析（依本 repo 現有 spec 與 GNU `--help`）
 
-被注入的 token 來自 cwd 內的檔名，因此**不可能含 `/`**。
+§1 規則 4 規定可能展開成旗標的 glob 必須是單段，因此被注入的 token 就是 cwd 內的某個檔名，**不可能含 `/`**。
 
 - **head**：旗標只控制輸出數量與格式，被注入也無害。
 - **grep/egrep/fgrep**：沒有寫檔或 exec 類旗標。
@@ -102,6 +102,12 @@ export function mayExpandToOption(word: Word): boolean;  // value 的第一個�
 1. `word.parts` 為 `undefined`（整個 word 完全未加引號）。
 2. `word.value` 至少含一個未跳脫的 `*`、`?` 或 `[`，而且**不含反斜線**。
 3. 不以 `-` 開頭，也不以 `~` 開頭；並且不是磁碟相對形態，即 `scope.ts` 的 `isDriveRelative` 為 false。
+4. **可能展開成旗標的 glob 必須是單段**：若 value 的第一個字元是未跳脫的 `*`、`?` 或 `[`（即
+   `mayExpandToOption` 為 true），value 就不得含 `/`。
+   原因：多段 glob 的展開結果會帶有 `/`。例如專案內有名為 `-f` 的目錄時，`*/outside/secret` 會展開成
+   `-f/outside/secret`，grep 就把 `/outside/secret` 當成 pattern 檔讀取。只有單段 glob 能保證被注入的
+   token 不含 `/`，於是任何被注入的旗標值都只能指向 cwd 內的某個檔名。
+   此規則不看 `--` 的位置，以保持判定簡單並涵蓋 legacy 路徑；需要多段時請寫成 `./*/x.md`。
 
 **切段**：以 `/` 切段。第一個含 glob 字元的段稱為 *G*。*G* 之前的所有段依原樣以 `/` 連接，就是 `prefix`：
 
@@ -193,8 +199,8 @@ export function mayExpandToOption(word: Word): boolean;  // value 的第一個�
 
 - **`src/engine/glob_test.ts`**
   - `parseGlobPath` 接受並回傳對應 prefix：`*.md` → `""`、`runtime-behavior/*.md` → `runtime-behavior`、
-    `src/**/*.ts` → `src`、`./*.md` → `.`、`/d/proj/*.md` → `/d/proj`、`../x/*.md` → `../x`、`/*.md` → `/`。
-  - `parseGlobPath` 拒絕：`-*`、`~/*.md`、`"src"/*.md`、`src/\*.md`、`C:*.md`、`sub*/../x`、`.*`、`sub/.*`、
+    `src/**/*.ts` → `src`、`./*.md` → `.`、`./*/x.md` → `.`、`/d/proj/*.md` → `/d/proj`、`../x/*.md` → `../x`、`/*.md` → `/`。
+  - `parseGlobPath` 拒絕：`*/outside/secret`、`*/x.md`（可能展開成旗標的多段 glob）、`-*`、`~/*.md`、`"src"/*.md`、`src/\*.md`、`C:*.md`、`sub*/../x`、`.*`、`sub/.*`、
     `[.]*`、`x/[ab]*`、`a.md`（無 glob）。
   - `isGlobAttachedValue`：`(--include=*.md, --include)` 為 true；`(--include=a.md, --include)` 為 false；
     `(--exclude=*.log, --include)` 為 false。
@@ -244,6 +250,11 @@ export function mayExpandToOption(word: Word): boolean;  // value 的第一個�
 - **Concern**：globstar 展開時是否跟隨指向專案外的 symlink 目錄，未經查證。
   **Decision**：不處理。
   **Rationale**：與本工具既有的「純詞法、不做 symlink 檢查」限制同性質，字面路徑本就有相同狀況。
+- **Concern**：開啟 nullglob 且無任何匹配時，`grep -r x safe/*.txt` 會變成 `grep -r x`，改為遞迴搜尋 cwd。
+  若 cwd 位於以 `Read()` 放寬的外部 root，而其下又有 deny/ask 子目錄，就可能讀到被否決的內容。
+  **Decision**：不實作防護。
+  **Rationale**：這與既有的 `grep -r x .` 完全相同（今天在同樣情境下本來就 allow），glob 支援沒有讓它更差；
+  而且需要 nullglob、外部 cwd、巢狀 deny 三個條件同時成立。使用者評估後接受。
 - **Concern**：清單外的指令（tail、stat、diff、sort、find、git 等）含 glob 仍為 ask。
   **Decision**：清單固定，不提供擴增機制。
   **Rationale**：旗標注入無法由本工具的旗標解析器觀察到；逐指令擴增等同對 GNU 全旗標集做 denylist，
