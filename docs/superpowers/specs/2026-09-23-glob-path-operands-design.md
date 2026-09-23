@@ -221,6 +221,11 @@ export function mayExpandToOption(word: Word): boolean;  // value 的第一個�
    都呼叫 `ctx.resolvePath`，把它當成「可能被讀取的路徑」檢查。任何一個不是 `in-project` 都 ask，
    理由為 `${name}：glob 可能展開成旗標，${value} 可能被當成檔案讀取且超出範圍`。
    非靜態的 token（例如 `--include=*.md`）在這裡會得到 `dynamic` → ask。
+3. 此外，以 `-` 開頭的每個其他 Word（取 `staticValue`），都必須完全由 `[A-Za-z0-9_=.,+-]` 組成，否則 ask。
+   原因：被注入的吃值旗標可以吞掉原本的旗標，使原本只是「值」的 token 變成有效旗標；例如
+   `grep ?e -e --file=/outside/secret ./safe.txt` 遇到名為 `-e` 的檔案時，`--file=/outside/secret` 就會生效。
+   禁止 `/`、`\`、`:`、`~` 之後，任何可能生效的黏寫值（`--file=x`、`-fx`）都只能指向 cwd 內的某個檔名。
+   一般旗標如 `-rn`、`-m5`、`--color=auto`、`--max-count=5` 不受影響。
 
 效果：
 - 一般旗標（`-n`、`-la`、`-rn`）、一般 pattern（`"careTreatment\|WebApi"`）、數值（`-m 5` 的 `5`）
@@ -271,7 +276,9 @@ export function mayExpandToOption(word: Word): boolean;  // value 的第一個�
   - 注入護欄：
     - ask：`grep /outside/secret *.md`、`grep *.md -e /outside`、`head *.md -n /outside/x`、
       `grep -e . ?? --label=/../../secret`、`cat *.md --x=/../../secret`、`ls -la *.md --hide=/../../x`、
-      `grep /outside/secret -- *.md`（護欄不看 `--`）、`grep -n x *.md --include=*.md`；
+      `grep /outside/secret -- *.md`（護欄不看 `--`）、`grep -n x *.md --include=*.md`、
+      `grep ?e -e --file=/outside/secret ./safe.txt`、`grep ?e -e -f/outside/secret ./safe.txt`、
+      `grep ?e -e --file=C:secret ./safe.txt`；
     - deny（在 `Read(~/**)` 或 `Read(//C:/**)` 放行家目錄/磁碟根的設定下也一樣，且在一般只含專案範圍的設定下
       也必須是 deny、不得被 ask 搶先）：`grep x ?r ~`、`ls ?R /`、`grep -r x /home/m?`（home=`/home/me`）、
       `grep -r x m?`（cwd=`/home`）、`grep -r x /*`、`ls -R /home/me/*`；
