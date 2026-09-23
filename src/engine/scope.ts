@@ -26,6 +26,15 @@ export function isAbsolute(p: string): boolean {
 }
 
 /**
+ * Windows 磁碟前綴但缺分隔符（`C:Windows`）。這既不是絕對路徑，也不是相對於本行程 cwd 的
+ * 路徑——它的基準是**該磁碟機各自的當前目錄**，靜態不可知。當成相對路徑接到 cwd 會得到
+ * `<cwd>/C:Windows`（看似專案內），實際卻落在 C 磁碟上。
+ */
+function isDriveRelative(p: string): boolean {
+  return /^[A-Za-z]:(?![/\\])/.test(p);
+}
+
+/**
  * 詞法正規化為絕對 posix 路徑（折疊 `.` / `..`）。
  * 假設輸入已是絕對路徑；Windows drive 一律轉大寫以便比較。
  */
@@ -228,6 +237,8 @@ export function isReadScoped(absPosix: string, scope: ScopeConfig): boolean {
 
 /** 絕對／相對路徑的範圍判定本體；呼叫端負責先處理 tilde 語義。 */
 function resolveResolvedValue(value: string, cwd: CwdState, scope: ScopeConfig): PathScope {
+  // 磁碟相對形態（`C:Windows`）的基準是該磁碟機的當前目錄，靜態不可知 → 一律視為超出範圍
+  if (isDriveRelative(value)) return "out-of-project";
   let abs: string;
   if (isAbsolute(value)) {
     abs = normalizeAbsolute(value);

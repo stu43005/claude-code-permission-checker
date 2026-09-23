@@ -90,3 +90,14 @@ Deno.test("cygpath：讀檔旗標與未知旗標 → ask", () => {
 Deno.test("cygpath：動態 token → ask", () => {
   assertEquals(cygpathRule.evaluate(ctxOf("cygpath -u $X")).kind, "ask");
 });
+
+Deno.test("cygpath 形態 B：磁碟相對操作元 → ask", () => {
+  // C:Windows 的基準是 C 磁碟的當前目錄，不是 /proj 底下
+  assertEquals(cygpathRule.evaluate(ctxOf("cygpath -d C:Windows")).kind, "ask");
+  assertEquals(cygpathRule.evaluate(ctxOf("cygpath -w -s C:Windows")).kind, "ask");
+});
+
+Deno.test("cygpath 形態 A：磁碟相對操作元仍 allow（不做範圍檢查）", () => {
+  // 形態 A 只改寫路徑的書寫形式，不查檔案系統、不洩漏任何狀態
+  assertEquals(cygpathRule.evaluate(ctxOf("cygpath -u C:Windows")).kind, "allow");
+});

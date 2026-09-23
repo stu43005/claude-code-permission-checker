@@ -411,3 +411,16 @@ Deno.test("shell home 展開後命中 allow 範圍 → in-project", () => {
   };
   assertEquals(resolvePath(wordOf("cat ~/cache/x"), cwd, scope), "in-project");
 });
+
+Deno.test("resolvePath: 磁碟相對形態（C:Windows）不是專案內相對路徑", () => {
+  const cwd: CwdState = { kind: "known", path: "/proj" };
+  const scope = rootScope("/proj");
+  // 基準是 C 磁碟各自的當前目錄，靜態不可知——絕不能接成 /proj/C:Windows
+  assertEquals(resolvePath(wordOf("cat C:Windows"), cwd, scope), "out-of-project");
+  assertEquals(resolvePath(wordOf("cat C:Windows/win.ini"), cwd, scope), "out-of-project");
+  assertEquals(resolvePathValue("C:Windows/win.ini", cwd, scope), "out-of-project");
+  // 帶分隔符的絕對形式照既有邏輯判定（專案外 → out-of-project）
+  assertEquals(resolvePath(wordOf("cat C:/Windows/win.ini"), cwd, scope), "out-of-project");
+  // 一般相對路徑不受影響
+  assertEquals(resolvePath(wordOf("cat src/a.ts"), cwd, scope), "in-project");
+});
