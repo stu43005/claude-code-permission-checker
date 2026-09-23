@@ -132,6 +132,90 @@ const printfEvaluator: SubstEvaluator = {
   },
 };
 
+/**
+ * cygpath 可靜態求值的旗標。
+ * 不吃值：-u -w -m -a -i
+ * 吃值：  -t <type>（僅 unix|windows|mixed）、-C <codepage>
+ * 其餘一律不求值——詳見下方 evaluate 內的分類註解。
+ */
+const CYGPATH_VALUELESS = new Set(["-u", "-w", "-m", "-a", "-i"]);
+const CYGPATH_WITH_VALUE = new Set(["-t", "-C"]);
+const CYGPATH_SAFE_TYPES = new Set(["unix", "windows", "mixed"]);
+
+/** 互斥的輸出格式旗標：同時給多個時 cygpath 會拒絕執行，不會輸出任何路徑。 */
+const CYGPATH_OUTPUT_MODES = new Set(["-u", "-w", "-m", "-t"]);
+/** -C 接受的 codepage 值（其餘值 cygpath 會報錯）。 */
+const CYGPATH_CODEPAGES = new Set(["ANSI", "OEM", "UTF8"]);
+
+const cygpathEvaluator: SubstEvaluator = {
+  names: ["cygpath"],
+  evaluate(argv, cwd) {
+    // cygpath 只存在於 Cygwin/MSYS2；求值所依賴的「/d/x ≡ D:/x」也只在 Windows 成立
+    // （normalizeAbsolute 的磁碟機正規化以 Deno.build.os 鎖定）。
+    if (Deno.build.os !== "windows") return null;
+
+    let needsKnownCwd = false;
+    let outputModes = 0;
+    const operands: string[] = [];
+    for (let i = 0; i < argv.length; i++) {
+      const t = argv[i];
+      if (!t.startsWith("-")) {
+        operands.push(t);
+        continue;
+      }
+      if (CYGPATH_OUTPUT_MODES.has(t)) outputModes++;
+      if (CYGPATH_VALUELESS.has(t)) {
+        if (t === "-a") needsKnownCwd = true; // 相對路徑以行程 cwd 展開
+        continue;
+      }
+      if (CYGPATH_WITH_VALUE.has(t)) {
+        i++;
+        if (i >= argv.length) return null;
+        // -t dos 等同 -d（DOS 8.3 短名，需查檔案系統）；未知類型 cygpath 會報錯
+        if (t === "-t" && !CYGPATH_SAFE_TYPES.has(argv[i])) return null;
+        // -C 的值必須是 cygpath 認得的 codepage，否則它會報錯而非輸出路徑
+        if (t === "-C" && !CYGPATH_CODEPAGES.has(argv[i].toUpperCase())) return null;
+        continue;
+      }
+      // 其餘一律不求值：
+      //   -d / -s / -l  短名與長名還原，需查檔案系統（-d 對不存在路徑 exit 2）
+      //   -M            回報 binary/text，需查檔案系統
+      //   -D -H -O -P -S -W -F -A  輸出系統目錄，與輸入無關
+      //   -f / -o       從檔案或 stdin 讀取操作元／選項
+      //   -U / -r / -p  輸出形式（/proc/cygdrive、\\?\、PATH 列表）與 normalizeAbsolute 不保證等價
+      return null;
+    }
+
+    if (operands.length !== 1) return null;
+    if (needsKnownCwd && cwd.kind !== "known") return null;
+    // 輸出格式旗標互斥：`cygpath -u -w x` 會被 cygpath 拒絕、不輸出路徑，
+    // 若這裡照樣回傳操作元，等於憑空造出一個並不存在的 cd 目標。
+    if (outputModes > 1) return null;
+    // 只有磁碟形式與相對路徑可回原樣：-u/-w/-m 對它們只改變磁碟機與斜線的書寫形式，
+    // 而呼叫端的 applyPath 隨即 normalizeAbsolute，D:/x、D:\x、/d/x 會正規化成同一字串。
+    // 其餘絕對路徑會經 MSYS2 mount 表對映（實測 `cygpath -m /usr/bin` →
+    // `C:/Program Files/Git/usr/bin`），normalizeAbsolute 不懂 mount 表 → 必須放棄。
+    if (!isNormalizationEquivalent(operands[0])) return null;
+    return operands[0];
+  },
+};
+
+/**
+ * 該路徑經 cygpath 轉換後，是否與 normalizeAbsolute 的語義等價。
+ * 成立的三種形態：Windows 磁碟絕對（X:/ 或 X:\）、MSYS 磁碟形式（/x 或 /x/…）、相對路徑。
+ * 其餘以 `/` 開頭者由 MSYS2 mount 表決定實際位置，不等價。
+ */
+function isNormalizationEquivalent(p: string): boolean {
+  // 磁碟前綴必須接分隔符。`C:Windows`（無分隔符）在 Windows 是「該磁碟機的當前目錄」語義，
+  // cygpath 會補上分隔符解析成 C:/Windows，而 applyPath 會把它當相對路徑接到 cwd 之後。
+  if (/^[A-Za-z]:/.test(p)) return /^[A-Za-z]:[/\\]/.test(p);
+  // 反斜線開頭（`\d\proj`）在 Windows 是「當前磁碟機根」的絕對路徑，但 applyPath 會把它
+  // 當成相對路徑接到 cwd 之後 → 兩者指向不同目錄，不可求值。
+  if (p.startsWith("\\")) return false;
+  if (!p.startsWith("/")) return true; // 相對路徑
+  return /^\/[A-Za-z](\/|$)/.test(p); // /x 或 /x/…
+}
+
 /** 已註冊的求值器。指令名重複註冊會在載入時丟錯。 */
 const EVALUATORS: SubstEvaluator[] = [
   dirnameEvaluator,
@@ -139,6 +223,7 @@ const EVALUATORS: SubstEvaluator[] = [
   pwdEvaluator,
   echoEvaluator,
   printfEvaluator,
+  cygpathEvaluator,
 ];
 
 const INDEX = new Map<string, SubstEvaluator>();

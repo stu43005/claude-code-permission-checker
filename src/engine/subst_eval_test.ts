@@ -152,3 +152,122 @@ Deno.test("printf: 其餘形態不求值", () => {
   assertEquals(evalSubstitutionWord(wordOf(`cd "$(printf '%b' a)"`), CWD), null);
   assertEquals(evalSubstitutionWord(wordOf(`cd "$(printf -v x '%s' a)"`), CWD), null);
 });
+
+const WIN_ONLY = { ignore: Deno.build.os !== "windows" };
+
+Deno.test({
+  ...WIN_ONLY,
+  name: "cygpath: 純轉換旗標求值為操作元原樣",
+  fn() {
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -u 'D:/proj')"`), CWD), "D:/proj");
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -m /d/proj)"`), CWD), "/d/proj");
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -w /d/proj)"`), CWD), "/d/proj");
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -t unix 'D:/proj')"`), CWD), "D:/proj");
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath 'D:/proj')"`), CWD), "D:/proj");
+  },
+});
+
+Deno.test({
+  ...WIN_ONLY,
+  name: "cygpath: 查檔案系統的旗標不求值",
+  fn() {
+    // -d / -t dos / -s 都是 DOS 8.3 短名，-l 是長名還原，皆需查檔案系統
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -d 'D:/proj')"`), CWD), null);
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -t dos 'D:/proj')"`), CWD), null);
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -w -s 'D:/proj')"`), CWD), null);
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -w -l 'D:/proj')"`), CWD), null);
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -M 'D:/proj')"`), CWD), null);
+  },
+});
+
+Deno.test({
+  ...WIN_ONLY,
+  name: "cygpath: 系統目錄旗標與讀檔旗標不求值",
+  fn() {
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -D)"`), CWD), null);
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -S)"`), CWD), null);
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -f list.txt)"`), CWD), null);
+    // 輸出形式與 normalizeAbsolute 不保證等價
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -U 'D:/proj')"`), CWD), null);
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -w -r /d/proj)"`), CWD), null);
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -p /a:/b)"`), CWD), null);
+  },
+});
+
+Deno.test({
+  ...WIN_ONLY,
+  name: "cygpath: -a 需要 known cwd；操作元必須恰一個",
+  fn() {
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -a sub)"`), CWD), "sub");
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -a sub)"`), { kind: "unknown" }), null);
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -u a b)"`), CWD), null);
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -u)"`), CWD), null);
+  },
+});
+
+Deno.test({
+  ...WIN_ONLY,
+  name: "cygpath: 只有磁碟形式與相對路徑可求值（mount 對映不等價）",
+  fn() {
+    // 磁碟形式：normalizeAbsolute 認得，等價
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -m /d/proj)"`), CWD), "/d/proj");
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -w 'C:\\proj')"`), CWD), "C:\\proj");
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -u sub/dir)"`), CWD), "sub/dir");
+    // 非磁碟形式的絕對路徑由 MSYS2 mount 表決定實際位置
+    // （實測 cygpath -m /usr/bin → C:/Program Files/Git/usr/bin）
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -m /usr/bin)"`), CWD), null);
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -m /mingw64/bin)"`), CWD), null);
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -u /tmp)"`), CWD), null);
+  },
+});
+
+Deno.test({
+  ...WIN_ONLY,
+  name: "cygpath: -C / -i 可求值；吃值旗標缺值或值無效 → null",
+  fn() {
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -C UTF8 -m /d/proj)"`), CWD), "/d/proj");
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -i -u /d/proj)"`), CWD), "/d/proj");
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -m /d/proj -C)"`), CWD), null);
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -m /d/proj -t)"`), CWD), null);
+    // cygpath 會拒絕無效的 codepage，不會輸出路徑
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -C bogus -m /d/proj)"`), CWD), null);
+  },
+});
+
+Deno.test({
+  ...WIN_ONLY,
+  name: "cygpath: 互斥的輸出格式旗標 → null",
+  fn() {
+    // cygpath 會拒絕執行，不輸出任何路徑；照樣回傳操作元等於憑空造出 cd 目標
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -u -w 'D:/proj')"`), CWD), null);
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -m -t unix 'D:/proj')"`), CWD), null);
+  },
+});
+
+Deno.test({
+  ...WIN_ONLY,
+  name: "cygpath: 反斜線開頭與無分隔符的磁碟前綴 → null",
+  fn() {
+    // `\d\proj` 在 Windows 是「當前磁碟機根」的絕對路徑，但 applyPath 會當成相對路徑
+    assertEquals(evalSubstitutionWord(wordOf(String.raw`cd "$(cygpath -u '\d\proj')"`), CWD), null);
+    // `C:Windows` 是「C 磁碟機的當前目錄」語義，cygpath 會補上分隔符解析成 C:/Windows，
+    // 而 applyPath 會把它接到 cwd 之後 → 兩者不同
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -a -u 'C:Windows')"`), CWD), null);
+  },
+});
+
+Deno.test({
+  ...WIN_ONLY,
+  name: "cygpath: 未知旗標不求值",
+  fn() {
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -Z 'D:/proj')"`), CWD), null);
+  },
+});
+
+Deno.test({
+  ignore: Deno.build.os === "windows",
+  name: "cygpath: 非 Windows 平台一律不求值",
+  fn() {
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -u 'D:/proj')"`), CWD), null);
+  },
+});
