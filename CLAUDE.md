@@ -64,6 +64,13 @@ parse.ts (unbash) → walk.ts → 閘① sleep → 閘② 名稱重定義 → no
   command substitution `$(…)` 內層指令、把 Statement / 複合結構的重導向繼承給內部指令、對 `git`
   套用 `gitEffectiveCwd`（`-C`/`--git-dir`/`--work-tree`/`-c core.worktree`）。同時列舉 heredoc `redirect.body`
   中的 command substitution（`$(…)` 展開），以及提供名稱重定義偵測 helper：`hasExecutableFunctionDefinition(script)`（shell 函式定義）、`hasAliasRedefinition(invocations)`（alias 類），供 evaluate 閘② 呼叫。
+  `cd` 目標的求值由 `cwd.ts` 的 `applyCd` 負責，依序嘗試：① 未加引號的 leading tilde（見
+  `tilde.ts`，僅 `~`/`~/<rest>` 且 shellHome 已知才展開）；② `staticValue` 直接取值；③ 單一
+  `"$(…)"` 且內層可靜態求值時，交給 `subst_eval.ts` 的求值框架。`cd -`（回上一目錄）、`cd ~`
+  （單獨無 rest）、以及帶選項的形態（`cd -P /outside`、`cd DIR REPLACE` 字串替換）一律不臆測、
+  直接標 `unknown`——`applyTarget` 對以 `-` 開頭的取值結果同樣放棄（涵蓋求值副產物剛好長成
+  `-P`/`-` 的情形），`applyCd` 對 `cmd.suffix.length !== 1` 者直接回 `unknown`（只有「恰一個參數」
+  才嘗試推導）。
 - **`print_only.ts`** 是「載具框架 ＋ `printDisguiseDeny`」的主入口。`isAllPrintOnly(invocations)` 供既有測試沿用；`leafCarrier(inv)` 識別葉載具（`"shell"` 為 echo/printf/cat·tac heredoc 靜態吐字、`"interp"` 為 node/python/deno/bun/ts-node 裸 all-static-print）；`printDisguiseDeny(script, cwd)` 為 evaluate 閘③ 呼叫的聚合入口，匹配多種 print 偽裝形態（shell-print、interp-inline、write-exec、cat-readback、pipe），命中回 `{ kind }` → deny。依賴 `static_output.ts` 與 `interp_payload.ts`。
 - **`static_output.ts`** 提供 shell 指令靜態輸出工具：`isEchoPrintOnly`/`isPrintfPrintOnly`/`isCatPassthrough`（葉 print 形態判斷）、`producerStdout`（pipeline 生產端靜態文字萃取）、`writtenContent`（重導向寫入內容萃取），供 `print_only.ts` 使用。
 - **`interp_payload.ts`** 提供直譯器 payload 靜態 print 判斷：`payloadIsAllStaticPrint(payload, lang)` 判定 JS/Python payload 是否整段僅含靜態 print 輸出；`printExprIsStaticString(expr, lang)` 判定 `-p` 表達式是否為靜態字串。
@@ -80,6 +87,17 @@ parse.ts (unbash) → walk.ts → 閘① sleep → 閘② 名稱重定義 → no
   `in-project` / `out-of-project` / `dynamic`，後兩者 → ask。
   另提供 `isDangerousRootAbs`/`dangerousRoot` 危險根偵測（字面 `~`/`~/`、lone `$HOME`/`${HOME}`/`$HOME/`、Windows `$USERPROFILE`、靜態絕對等於磁碟根 `/`、`X:/` 或家目錄），供遞迴指令回 `deny`。
   另提供 `buildScopeConfig`，供 `evaluate`（計算 `sessionCwdInScope`）與 `classify` 共用同一份範圍定義。
+  路徑操作元若命中未加引號的 leading tilde，先呼叫 `tilde.ts` 用 **shell home**（`HOME`）展開，
+  才進 `resolvePath`/`resolvePathValue` 的範圍判定——與 settings 端 `resolveHome`（Windows 優先
+  `USERPROFILE`）刻意分開，因為指令執行時的 `~` 展開語義來自 shell、不是 Claude Code 設定。
+- **`tilde.ts`** tilde expansion 語義的唯一權威來源：`hasUnquotedLeadingTilde(word)` 純看 Word
+  結構判斷 `~` 是否會被 bash 展開（引號會抑制展開、且要看到 tilde-prefix 結束為止，不能只看
+  `parts[0]`）；`expandTilde(value, shellHome)` 只展開 `~`/`~/<rest>` 兩種形態，`~user`/`~+`/`~-`
+  與 shellHome 未知一律回 `null`（fail-closed，呼叫端視為不可解析）。
+- **`subst_eval.ts`** command substitution `$(…)` 的靜態求值框架，供 `resolvePath` 類判定與
+  `cwd.ts` 的 `applyCd` 共用。純函式、不碰檔案系統：已知求值器涵蓋 `dirname`/`basename`/`pwd`/
+  `echo`/`printf`/`cygpath`，任何「結果可能取決於檔案系統狀態、環境變數、執行期 shell 選項」的
+  情形一律回 `null`（呼叫端 fail-closed，退回不可判定）。
 - **`rules/`**：`types.ts`（`CommandRule`/`RuleContext`/`RuleVerdict` + `allow()`/`ask()`/`deny()`，
   另含 `cwdIndependent` / `toleratesNonStaticOperand` 兩個可選述詞）、
   `command_spec.ts`（`CommandSpec`：每個旗標只描述一次——名稱、吃值方式
@@ -90,9 +108,20 @@ parse.ts (unbash) → walk.ts → 閘① sleep → 閘② 名稱重定義 → no
   成為 `grep.ts` 內獨立的 `rgRule`）。
 
   **解析器歸屬與豁免資格是兩件事**：走 `CommandSpec` 的只有 `grep`/`egrep`/`fgrep`、`head`、`wc`、
-  `tail`；`gh`、`jq`、`sed` 各有自己的**單一 memoized 掃描**（同樣保證 evaluate 與述詞讀同一份結果）；
-  `curl` 與 `rg` 沿用既有 legacy 解析。豁免資格則由 `cwdIndependent` 宣告，兩者不重疊：
-  `curl` 不走 `CommandSpec` 但會豁免，`rg` 既不走 `CommandSpec` 也不豁免（恆為遞迴）。
+  `tail`、`base64`；`gh`、`jq`、`sed`、`npm`、`cygpath` 各有自己的**單一 memoized 掃描**（同樣保證
+  evaluate 與述詞讀同一份結果）；`curl` 與 `rg` 沿用既有 legacy 解析。豁免資格則由 `cwdIndependent`
+  宣告，兩者不重疊：`curl` 不走 `CommandSpec` 但會豁免，`rg` 既不走 `CommandSpec` 也不豁免（恆為遞迴）。
+
+  **本次新增四條規則**：`base64.ts`（走 `CommandSpec`：`-d`/`--decode`/`-i`/`--ignore-garbage` 不吃值、
+  `-w`/`--wrap` 吃值，僅接受單一 FILE 位置參數，無任何寫檔旗標）；`test.ts`（只允許「單一一元檔案測試
+  運算子 + 一個路徑操作元」，`argv.length !== 2` 或運算子不在安全集合即 ask；`-a`/`-o`/`-t`/`-n`/`-z`/
+  `-v`/`-R` 因語義依參數個數而定或操作元非路徑而刻意排除）；`cygpath.ts`（依旗標分三形態：形態 A
+  純字串轉換允許、形態 B 查詢檔案系統 metadata 的操作元須落在範圍內才允許、形態 C 只輸出系統目錄
+  與輸入無關而允許；`-f`/`-o`/`-c` 涉及讀檔操作元或行程管理一律 ask）；`npm.ts`（只允許不把本機
+  專案內容當輸出的唯讀子指令：`view`/`info`/`show`/`v`（操作元須為 registry package spec，拒絕目錄/
+  檔案/tarball/URL/git spec 等會被 npm 實際讀取的形態）與 `ping`/`whoami`（不吃操作元）；刻意排除
+  `ls`/`outdated`/`explain`/`root`/`prefix`/`pkg get`/`config get`——這些會沿目錄樹向上找
+  `package.json` 並印出父層專案內容，且沒有操作元可供本工具做範圍檢查）。
 - **`permissions/`**：`settings.ts`（`loadPermissionRules`：讀專案 `.claude/settings.json`、
   `.claude/settings.local.json`、使用者 `<configDir>/settings.json`（`<configDir> = CLAUDE_CONFIG_DIR ?? <home>/.claude`），抽出 `permissions.{allow,deny,ask}` 中
   的 `Bash(...)` 規則並 union；家目錄依平台解析 `USERPROFILE`/`HOME`；fail-safe：讀檔/解析失敗退化為空
@@ -110,11 +139,16 @@ parse.ts (unbash) → walk.ts → 閘① sleep → 閘② 名稱重定義 → no
 
 （註：對「遞迴遍歷磁碟根/家目錄根」的 `deny` 不是中央前置規則，而是各遞迴指令規則內以 `isDangerousRoot` 判定、再由 `classify` 對 `deny` 短路；故不在本四條之列。）
 
-1. **cwd 範圍**：`cwd.kind === "known"` 但落在「專案 ∪ 使用者以 `Read()/Edit()/Write()` 放寬的外部
+1. **cwd 範圍**：`cwd.kind === "unknown"` → ask（工作目錄無法靜態確定，鏈內 `cd`/`git -C` 目標為
+   動態）；否則 `cwd.kind === "known"` 但落在「專案 ∪ 使用者以 `Read()/Edit()/Write()` 放寬的外部
    唯讀範圍 ∪ 當前 session 的 trusted read roots」之外 → ask（判定由 `scope.ts` 的 `isReadScoped`
-   統一負責）。**唯一例外**：五道護欄全部成立時跳過本條（且只跳過本條）——
+   統一負責）。初始 cwd 恆為 `known`（`main.ts` 的 `initialCwd` 在 hook 傳入的 `cwd` 缺欄位時
+   fallback 到專案根，不會產生 `unknown`），故 `unknown` 必然源自鏈內 `cd` 把目標寫成動態
+   token——不擋的話，等於能整個跳過範圍檢查。**唯一例外**：五道護欄全部成立時跳過本條（且只
+   跳過本條）——
    (1) 指令規則自身回 `allow`（`permissions.allow` 升級的 ask 永不豁免）；
-   (2) hook 傳入的 session cwd 本身在範圍內 **且** 當前 cwd 由鏈內 `cd` 產生（`origin === "chain-cd"`）；
+   (2) hook 傳入的 session cwd 本身在範圍內 **且** 當前 cwd 由鏈內 `cd` 產生（`origin === "chain-cd"`，
+       此欄位只存在於 `kind === "known"`，故 `unknown` 必然不滿足本護欄、永遠無法豁免）；
    (3) 相對路徑仍以真實 cwd 解析；
    (4) argv 全為靜態 token（唯一例外是 `gh api` 的 endpoint 操作元，由規則以
        `toleratesNonStaticOperand` 認定）；
@@ -261,6 +295,22 @@ parse.ts (unbash) → walk.ts → 閘① sleep → 閘② 名稱重定義 → no
 - **sed/awk 程式碼會寫檔/執行**：即使無 `-i`，腳本內 `w`/`e`/`s///w`（sed）、`print >`/`system()`/
   `getline`/pipe（awk）都是副作用。用程式掃描白名單，無法靜態確認即 ask。awk 的 `>` 偵測要錨定在
   `print`/`printf` 之後（否則誤殺 `$3>100` 比較）；pipe 偵測要排除 `||`。
+- **`resolvePath` 對未加引號的 leading tilde 必須先展開**：shell home 一律用 `HOME`，**不可用
+  `resolveHome`**——後者在 Windows 優先 `USERPROFILE`，是 settings 端的家目錄語義，不是指令執行時
+  bash 展開 `~` 所依據的環境變數；兩者混用會讓 `cat ~/.ssh/id_rsa` 這類指令在 `HOME`/`USERPROFILE`
+  分歧時被誤判。`resolvePathValue` 對以 `~` 開頭的字串一律 fail-closed（不可解析 → ask，不臆測
+  展開結果）。引號形態（`"~/x"`）必須維持相對語義、不可一併擋掉——它不會被 bash 展開，是相對於
+  cwd 的字面路徑。另 `C:Windows` 這種 Windows 磁碟相對形態語義有歧義（可能是磁碟根、也可能是
+  該磁碟當前目錄下的 `Windows`，且無正當寫法可用來表達使用者真正想要的路徑），一律視為超出範圍。
+- **cygpath 的「回操作元原樣」只對磁碟形式與相對路徑成立**：`cygpath -m /usr/bin` 會經 MSYS2
+  mount 表轉換成 `C:/Program Files/Git/usr/bin`，而 `normalizeAbsolute` 不懂 mount 表、無法重現
+  這個轉換；含 `..` 段的操作元亦然（MSYS 先折疊 `..` 再套 mount 表，順序與本工具「先看字面路徑」
+  相反）。故 `cygpath.ts` 只在能確認純字串轉換（形態 A）時 allow，任何可能經過 mount 表的形態
+  一律 ask。
+- **`base64` 的 `-w` 吃值，但 `md5sum`/`sha256sum` 的 `-w` 是不吃值的 `--warn`**——旗標 arity 不可跨
+  指令共用，否則會讓 checksum 工具的路徑操作元被當成 `-w` 的值吃掉而漏檢（`md5sum -c -w
+  /outside/checksums` 這類形態）。`base64.ts` 因此刻意獨立於 `fileReaderRule`，不與 `md5sum`/
+  `sha256sum` 共用同一份 `valueFlags`。
 
 ### hook 決策 vs settings.json 權限的優先序（重要）
 
@@ -312,6 +362,14 @@ Bash 不做此正規化，此為本 hook 刻意的加值層。
 **已接受 over-deny（安全方向的誤殺，設計決策）**：
 1. **名稱重定義**（函式/alias）：即使是無害的函式定義，一律閘② deny。要執行 shell 函式直接寫成 `.sh` 腳本檔，讓 Write/Bash tool 分開處理。
 2. **cat 讀回兩步偽裝**（`cat > x <<'EOF'…EOF; cat x`）：cat-readback 模式偵測後由閘③ 硬 deny；寫入重導向本已中央前置 ask 攔截，現在讀回執行的整體形態再提升為 deny。
+
+**已接受限制（經檢視後擱置收緊方案，非無解）**：
+1. **`cd` 一律視為成功**：目標目錄不存在時 bash 會留在原地，後續相對路徑解析到別處，本工具仍照 `cd`
+   成功推導 cwd。已知的兩個純詞法收緊方案——只信任 `&&` 之後的 `cd`（`;`/換行後的 `cd` 失敗不影響
+   後續指令）、或要求 `cd` 前後兩個 cwd 都通過範圍檢查——因誤殺與改動面被擱置，不是無解。
+2. **npm 的設定探索與寫入位置不納入判定**：所有 npm 呼叫都在 dispatch 前沿目錄樹向上讀 `.npmrc`，
+   該檔可重導 `cache`/`logs-dir`/`registry`；npm 也會寫入並輪替刪除自己的 debug log。放行
+   `npm view`/`ping`/`whoami` 即等於接受這層行為。
 
 此外，本檢查器也沿用 `permissions.{allow,deny,ask}` 中的 `Read()/Edit()/Write()` 規則放寬「讀取位置」：
 凡純唯讀指令（allowlist 內）其路徑落在使用者以這些規則 allow 宣告、且未被 deny/ask 否決的外部目錄／
