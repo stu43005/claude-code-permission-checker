@@ -40,6 +40,9 @@ function applyPath(cwd: CwdState, value: string): CwdState {
  */
 export function applyCd(cmd: Command, cwd: CwdState, shellHome: string | null = null): CwdState {
   if (cmd.suffix.length === 0) return UNKNOWN; // cd 無參數 = $HOME
+  // cd 接受選項（-L/-P/-e/-@ 與 `--`），此時真正的目標不是第一個參數；bash 另有
+  // `cd DIR REPLACE` 的字串替換形態。兩者都不臆測——只有「恰一個參數」才嘗試推導。
+  if (cmd.suffix.length !== 1) return UNKNOWN;
   const target = cmd.suffix[0];
 
   if (hasUnquotedLeadingTilde(target)) {
@@ -62,12 +65,14 @@ export function applyCd(cmd: Command, cwd: CwdState, shellHome: string | null = 
 }
 
 /**
- * 把已取得的 cd 目標字串接上 cwd。`-` 必須在這裡擋，而不是只擋原始 token——
- * 求值結果同樣可能是 `-`（`basename ./-`、`printf '%s' -`），而 bash 對 `cd -` 的解讀
- * 是「回上一個工作目錄」，不是相對路徑 `./-`。
+ * 把已取得的 cd 目標字串接上 cwd。
+ *
+ * 以 `-` 開頭者一律放棄，而不只是單獨的 `-`：bash 會把 `-P`/`-L`/`-e`/`-@`/`--` 當成選項、
+ * 把 `-` 當成「回上一個工作目錄」，兩者都不是相對路徑。求值結果同樣可能長成選項
+ * （`basename ./-P` → `-P`、`printf '%s' -` → `-`），故必須在取得值之後才檢查。
  */
 function applyTarget(cwd: CwdState, value: string): CwdState {
-  if (value === "-") return UNKNOWN;
+  if (value.startsWith("-")) return UNKNOWN;
   return applyPath(cwd, value);
 }
 

@@ -152,3 +152,17 @@ Deno.test("walk: shell home 傳達到巢狀結構中的 cd ~", () => {
   const cat = invs.find((i) => i.name === "cat")!;
   assertEquals(cat.cwd, { kind: "known", path: "/home/u/src", origin: "chain-cd" });
 });
+
+Deno.test("applyCd: 選項形態與多參數一律 unknown（既有缺陷）", () => {
+  // bash 把 -P/-L/-- 當成選項，真正的目標是後面的參數；只看 suffix[0] 會記下 <cwd>/-P
+  assertEquals(applyCd(cmdOf("cd -P /outside"), { kind: "known", path: "/proj" }).kind, "unknown");
+  assertEquals(applyCd(cmdOf("cd -L /outside"), { kind: "known", path: "/proj" }).kind, "unknown");
+  assertEquals(applyCd(cmdOf("cd -- /outside"), { kind: "known", path: "/proj" }).kind, "unknown");
+  // `cd DIR REPLACE` 的字串替換形態同樣不臆測
+  assertEquals(applyCd(cmdOf("cd src other"), { kind: "known", path: "/proj" }).kind, "unknown");
+});
+
+Deno.test("applyCd: 求值出選項形態的結果也要擋下", () => {
+  // basename ./-P → "-P"，bash 會當成選項而非目錄
+  assertEquals(applyCd(cmdOf(`cd "$(basename ./-P)"`), { kind: "known", path: "/proj" }).kind, "unknown");
+});
