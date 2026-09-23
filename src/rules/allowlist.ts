@@ -12,6 +12,9 @@ import { gitRule } from "./commands/git.ts";
 import { denoRule } from "./commands/deno.ts";
 import { ghRule } from "./commands/gh.ts";
 import { curlRule } from "./commands/curl.ts";
+import { base64Rule } from "./commands/base64.ts";
+import { testRule } from "./commands/test.ts";
+import { cygpathRule } from "./commands/cygpath.ts";
 
 const RULES: CommandRule[] = [
   fileReaderRule,
@@ -36,6 +39,9 @@ const RULES: CommandRule[] = [
   denoRule,
   ghRule,
   curlRule,
+  base64Rule,
+  testRule,
+  cygpathRule,
 ];
 
 const INDEX = new Map<string, CommandRule>();
