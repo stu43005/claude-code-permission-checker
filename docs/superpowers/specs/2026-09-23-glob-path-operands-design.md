@@ -125,7 +125,9 @@ export function mayExpandToOption(word: Word): boolean;  // value 的第一個�
 `isGlobAttachedValue(word, flagName)` 在以下條件全部成立時回 true：
 - `word.parts === undefined`；
 - `word.value` 以 `flagName + "="` 開頭；
-- `=` 之後的部分含未跳脫 glob 字元，且整個 value 不含反斜線。
+- `=` 之後的部分含未跳脫 glob 字元，且整個 value 不含反斜線；
+- 整個 value **不含 `/`**。bash 會把整個 word 當成路徑 pattern 展開；單段就只會匹配 cwd 內的項目，
+  不會經由 `..` 或 `**` 遍歷到 cwd 之外。多段形態（`--include=*/../../../**`）一律拒絕，維持 dynamic → ask。
 
 ### §2 範圍判定與規則接線
 
@@ -258,7 +260,7 @@ export function mayExpandToOption(word: Word): boolean;  // value 的第一個�
   - `parseGlobPath` 拒絕：`*/outside/secret`、`*/x.md`（可能展開成旗標的多段 glob）、`-*`、`~/*.md`、`"src"/*.md`、`src/\*.md`、`C:*.md`、`sub*/../x`、`.*`、`sub/.*`、
     `[.]*`、`x/[ab]*`、`a.md`（無 glob）。
   - `isGlobAttachedValue`：`(--include=*.md, --include)` 為 true；`(--include=a.md, --include)` 為 false；
-    `(--exclude=*.log, --include)` 為 false。
+    `(--exclude=*.log, --include)` 為 false；`(--include=*/../../../**, --include)`、`(--include=src/*.md, --include)` 為 false。
 - **`src/engine/scope_test.ts`**
   - `resolveGlobPath` 三態：專案內前綴 → in-project；專案外前綴 → out-of-project；cwd unknown 且前綴相對 → dynamic。
   - 外部 allow root 內有巢狀 deny/ask 時 → out-of-project；外部 allow root 內沒有巢狀 deny → in-project。
