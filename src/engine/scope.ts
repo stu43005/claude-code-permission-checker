@@ -31,7 +31,7 @@ export function isAbsolute(p: string): boolean {
  * 寫法會用它：要指 C 磁碟就寫 `/c/Windows` 或 `C:/Windows`。歧義且無正當用途，依 default-deny
  * 一律拒絕，不去臆測它會落在哪裡。
  */
-function isDriveRelative(p: string): boolean {
+export function isDriveRelative(p: string): boolean {
   return /^[A-Za-z]:(?![/\\])/.test(p);
 }
 

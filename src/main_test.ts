@@ -560,6 +560,16 @@ Deno.test({
   },
 });
 
+Deno.test("e2e: 磁碟相對的 cd 目標不得造出假的專案內 cwd", async () => {
+  const proj = await projWithAllow([]);
+  try {
+    assertEquals(await decisionOf("cd C:Windows && cat win.ini", proj), "ask");
+    assertEquals(await decisionOf(`cd "$(echo C:Windows)" && cat win.ini`, proj), "ask");
+  } finally {
+    await Deno.remove(proj, { recursive: true });
+  }
+});
+
 /** 帶環境變數跑 hook 並取出決策。 */
 async function decisionWithEnv(
   command: string,

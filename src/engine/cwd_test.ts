@@ -137,6 +137,22 @@ Deno.test("applyCd: 求值結果為 - 時也要擋下", () => {
   assertEquals(r, { kind: "known", path: "/proj/~", origin: "chain-cd" });
 });
 
+Deno.test("applyCd: 磁碟相對形態的目標 → unknown", () => {
+  // 接成 <cwd>/C:Windows 會造出看似專案內的假 cwd；實測 bash 的 cd "C:Windows" 落在 /c/Windows
+  assertEquals(applyCd(cmdOf("cd C:Windows"), { kind: "known", path: "/proj" }).kind, "unknown");
+  assertEquals(applyCd(cmdOf("cd C:Windows/sub"), { kind: "known", path: "/proj" }).kind, "unknown");
+  // 求值結果同樣可能長成該形態
+  assertEquals(
+    applyCd(cmdOf(`cd "$(echo C:Windows)"`), { kind: "known", path: "/proj" }).kind,
+    "unknown",
+  );
+  // 帶分隔符的絕對形式不受影響（照既有邏輯推導）
+  assertEquals(
+    applyCd(cmdOf("cd C:/Windows"), { kind: "known", path: "/proj" }),
+    { kind: "known", path: "C:/Windows", origin: "chain-cd" },
+  );
+});
+
 Deno.test({
   ignore: Deno.build.os !== "windows",
   name: "applyCd: cygpath 推導出專案內 cwd（本次的主要需求）",

@@ -86,6 +86,16 @@ const CASES: Case[] = [
     command: () => "cd -P /c/Windows && cat win.ini",
     expected: "ask",
   },
+  {
+    description: "cd C:Windows && cat win.ini（磁碟相對 cd 目標不得造出假的專案內 cwd）",
+    command: () => "cd C:Windows && cat win.ini",
+    expected: "ask",
+  },
+  {
+    description: "cd \"$(echo C:Windows)\" && cat win.ini（求值結果同樣可能長成磁碟相對形態）",
+    command: () => `cd "$(echo C:Windows)" && cat win.ini`,
+    expected: "ask",
+  },
 ];
 
 function toForwardSlash(p: string): string {

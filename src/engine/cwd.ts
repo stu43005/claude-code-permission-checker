@@ -1,7 +1,7 @@
 import type { Command, Word } from "../deps.ts";
 import type { CwdState } from "../types.ts";
 import { staticValue } from "./word.ts";
-import { isAbsolute, normalizeAbsolute } from "./scope.ts";
+import { isAbsolute, isDriveRelative, normalizeAbsolute } from "./scope.ts";
 import { expandTilde, hasUnquotedLeadingTilde } from "./tilde.ts";
 import { evalSubstitutionWord } from "./subst_eval.ts";
 
@@ -67,12 +67,15 @@ export function applyCd(cmd: Command, cwd: CwdState, shellHome: string | null = 
 /**
  * 把已取得的 cd 目標字串接上 cwd。
  *
- * 以 `-` 開頭者一律放棄，而不只是單獨的 `-`：bash 會把 `-P`/`-L`/`-e`/`-@`/`--` 當成選項、
- * 把 `-` 當成「回上一個工作目錄」，兩者都不是相對路徑。求值結果同樣可能長成選項
- * （`basename ./-P` → `-P`、`printf '%s' -` → `-`），故必須在取得值之後才檢查。
+ * 以 `-` 開頭者一律放棄（bash 視為選項或「回上一個工作目錄」），磁碟相對形態
+ * （`C:Windows`）同樣放棄——它語義有歧義且無正當寫法，接成 `<cwd>/C:Windows` 會造出一個
+ * 看似專案內、實則不存在的 cwd，使其後所有相對路徑判定失準（實測 bash 的
+ * `cd "C:Windows"` 會落在 `/c/Windows`）。兩者都必須在取得值之後才檢查，因為求值結果
+ * 同樣可能長成這些形態。
  */
 function applyTarget(cwd: CwdState, value: string): CwdState {
   if (value.startsWith("-")) return UNKNOWN;
+  if (isDriveRelative(value)) return UNKNOWN;
   return applyPath(cwd, value);
 }
 
