@@ -69,8 +69,9 @@ export function classify(
   trustedReadRoots: string[] = [],
   // 缺省 false = 起點不可信 → 永不豁免（fail-safe；既有呼叫端行為不變）
   sessionCwdInScope = false,
+  shellHome: string | null = null,
 ): RuleVerdict {
-  const scope: ScopeConfig = buildScopeConfig(root, rules, home, trustedReadRoots);
+  const scope: ScopeConfig = buildScopeConfig(root, rules, home, trustedReadRoots, shellHome);
 
   // 步驟 1：動態指令名
   if (inv.name === null) return ask("動態指令名，無法判定");

@@ -3,6 +3,7 @@ import { staticValue } from "./word.ts";
 import type { CwdState } from "../types.ts";
 import type { ReadScope } from "../permissions/path_scope.ts";
 import type { PermissionRules } from "../permissions/settings.ts";
+import { expandTilde, hasUnquotedLeadingTilde } from "./tilde.ts";
 
 export type PathScope = "in-project" | "out-of-project" | "dynamic";
 
@@ -155,6 +156,13 @@ export function isWithin(root: string, target: string): boolean {
 export interface ScopeConfig {
   root: string;
   home: string | null;
+  /**
+   * bash 的 home（`$HOME`），**僅供 tilde 展開**。與上方 `home` 刻意分離：
+   * `home` 來自 settings 的 resolveHome（Windows 優先 USERPROFILE），供權限規則
+   * 與 <home>/.claude 定位使用；bash 的 tilde expansion 只看 HOME。兩者不同時混用
+   * 會拿「已授權的 USERPROFILE 路徑」核准「未授權的 HOME 路徑」。
+   */
+  shellHome: string | null;
   allow: ReadScope;
   deny: ReadScope;
   ask: ReadScope;
@@ -172,10 +180,12 @@ export function buildScopeConfig(
   rules: PermissionRules,
   home: string | null,
   trustedReadRoots: string[],
+  shellHome: string | null = null,
 ): ScopeConfig {
   return {
     root,
     home,
+    shellHome,
     allow: rules.readScope.allow,
     deny: rules.readScope.deny,
     ask: rules.readScope.ask,
@@ -188,6 +198,7 @@ export function rootScope(root: string): ScopeConfig {
   return {
     root,
     home: null,
+    shellHome: null,
     allow: { roots: [], files: [] },
     deny: { roots: [], files: [] },
     ask: { roots: [], files: [] },
@@ -215,9 +226,8 @@ export function isReadScoped(absPosix: string, scope: ScopeConfig): boolean {
   return false;
 }
 
-/** 對「已取得的字串路徑值」做範圍檢查（三態）。 */
-export function resolvePathValue(value: string | null, cwd: CwdState, scope: ScopeConfig): PathScope {
-  if (value === null) return "dynamic";
+/** 絕對／相對路徑的範圍判定本體；呼叫端負責先處理 tilde 語義。 */
+function resolveResolvedValue(value: string, cwd: CwdState, scope: ScopeConfig): PathScope {
   let abs: string;
   if (isAbsolute(value)) {
     abs = normalizeAbsolute(value);
@@ -228,9 +238,38 @@ export function resolvePathValue(value: string | null, cwd: CwdState, scope: Sco
   return isReadScoped(abs, scope) ? "in-project" : "out-of-project";
 }
 
-/** 解析單一參數對專案根的範圍（三態）。 */
+/**
+ * 對「已取得的字串路徑值」做範圍檢查（三態）。
+ *
+ * 字串值沒有 word 結構，無從判斷開頭的 `~` 是否被引號保護：未加引號時 bash 展開為 $HOME
+ * （專案外），加引號時是 `./~`（專案內）。無法區分就取安全的一邊 → fail-closed。
+ * 代價是 `--flag="~/x"` 這類引號形態會被誤 ask；此形態罕見，方向安全。
+ */
+export function resolvePathValue(value: string | null, cwd: CwdState, scope: ScopeConfig): PathScope {
+  if (value === null) return "dynamic";
+  if (value.startsWith("~")) return "out-of-project";
+  return resolveResolvedValue(value, cwd, scope);
+}
+
+/**
+ * 解析單一參數對專案根的範圍（三態）。
+ *
+ * 有 word 結構可用，因此能精確區分兩種 tilde：
+ *   未加引號（`~/x`、`~/"x"`）→ bash 會展開 → 以 shellHome 展開後判定，不可解析則超出範圍
+ *   引號包裝（`"~/x"`）      → bash 不展開，指向 `./~/x` → 走一般相對路徑語義（維持既有行為）
+ */
 export function resolvePath(arg: Word, cwd: CwdState, scope: ScopeConfig): PathScope {
-  return resolvePathValue(staticValue(arg), cwd, scope);
+  const v = staticValue(arg);
+  if (v === null) return "dynamic";
+  if (hasUnquotedLeadingTilde(arg)) {
+    const expanded = expandTilde(v, scope.shellHome);
+    // 不支援的 tilde 形態（~user / ~+ / ~-）或 shellHome 未知 → 絕不退回相對路徑語義，
+    // 那正是本次要修的漏洞（`cat ~/.ssh/id_rsa` 被判成 <project>/~/.ssh/id_rsa）。
+    if (expanded === null) return "out-of-project";
+    return resolveResolvedValue(expanded, cwd, scope);
+  }
+  // 引號形態的 `~` 走到這裡：不經 resolvePathValue 的字串 tilde 檢查，維持相對語義。
+  return resolveResolvedValue(v, cwd, scope);
 }
 
 /** 已正規化絕對 POSIX 路徑是否為磁碟根（/、X:/）或恰好等於家目錄。 */

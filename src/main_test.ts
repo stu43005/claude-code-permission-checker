@@ -1,5 +1,5 @@
 import { assertEquals } from "@std/assert";
-import { homeDir } from "./main.ts";
+import { homeDir, shellHomeDir } from "./main.ts";
 import { normalizeAbsolute } from "./engine/scope.ts";
 
 /** 以子行程執行 main.ts，餵入 hook JSON，回傳 stdout。 */
@@ -102,6 +102,17 @@ Deno.test("homeDir: HOME 未設時退回 USERPROFILE", () => {
 
 Deno.test("homeDir: 皆未設 -> null", () => {
   assertEquals(homeDir({ get: () => undefined }), null);
+});
+
+Deno.test("shellHomeDir: 只接受絕對路徑的 HOME", () => {
+  const of = (home: string | undefined) =>
+    shellHomeDir({ get: (k: string) => (k === "HOME" ? home : undefined) });
+  assertEquals(of("/home/u"), "/home/u");
+  assertEquals(of(undefined), null);
+  assertEquals(of(""), null);
+  assertEquals(of("   "), null);
+  assertEquals(of("../relative"), null);
+  assertEquals(of("relative/home"), null);
 });
 
 Deno.test("e2e: recursive root scan -> deny", async () => {

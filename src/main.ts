@@ -2,7 +2,7 @@ import { parseHookInput, readStdin, renderDecision } from "./hook/io.ts";
 import { resolveProjectRoot } from "./project.ts";
 import type { EnvReader } from "./project.ts";
 import { evaluate } from "./engine/evaluate.ts";
-import { normalizeAbsolute } from "./engine/scope.ts";
+import { isAbsolute, normalizeAbsolute } from "./engine/scope.ts";
 import { loadPermissionRules, resolveHome } from "./permissions/settings.ts";
 import type { CwdState, Decision } from "./types.ts";
 import { resolveClaudeConfigDir, sessionTrustedReadRoots } from "./claude_dir.ts";
@@ -12,6 +12,20 @@ import { tmpdir } from "node:os";
 export function homeDir(env: EnvReader): string | null {
   const h = resolveHome(env);
   return h === null ? null : normalizeAbsolute(h);
+}
+
+/**
+ * bash 的 home（`$HOME`），僅供 tilde 展開。
+ * 刻意不重用 resolveHome：後者在 Windows 優先 USERPROFILE，而 bash tilde expansion 只看 HOME。
+ *
+ * 非絕對路徑的 HOME 視為不可用：bash 會相對於行程 cwd 展開它，而 normalizeAbsolute 假設輸入
+ * 已是絕對路徑、會直接補上前導 `/`。兩者結果不同，拿來做範圍判定會誤放行。
+ */
+export function shellHomeDir(env: EnvReader): string | null {
+  const h = env.get("HOME");
+  if (!h || h.trim() === "") return null;
+  if (!isAbsolute(h)) return null;
+  return normalizeAbsolute(h);
 }
 
 function initialCwd(cwd: string | undefined, root: string): CwdState {
@@ -77,7 +91,13 @@ async function main(): Promise<void> {
       uid,
       osTmpBase,
     );
-    decision = evaluate(command, root, initialCwd(input.cwd, root), rules, home, trusted);
+    let shellHome: string | null = null;
+    try {
+      shellHome = shellHomeDir(Deno.env);
+    } catch {
+      shellHome = null; // env 權限失敗 → tilde 一律不可解析（fail-safe）
+    }
+    decision = evaluate(command, root, initialCwd(input.cwd, root), rules, home, trusted, shellHome);
   }
   console.log(renderDecision(decision));
 }
