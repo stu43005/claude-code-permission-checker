@@ -2,6 +2,8 @@ import { assertEquals } from "@std/assert";
 import { parse } from "../deps.ts";
 import type { Command } from "../deps.ts";
 import { applyCd, gitEffectiveCwd, isCd } from "./cwd.ts";
+import { walk } from "./walk.ts";
+import { parseCommand } from "./parse.ts";
 
 function cmdOf(src: string): Command {
   return parse(src).commands[0].command as Command;
@@ -70,4 +72,113 @@ Deno.test("gitEffectiveCwd: no path options -> unchanged", () => {
     gitEffectiveCwd(cmdOf("git status"), { kind: "known", path: "/proj" }),
     { kind: "known", path: "/proj" },
   );
+});
+
+Deno.test("applyCd: cd - 靜態不可知 → unknown", () => {
+  assertEquals(applyCd(cmdOf("cd -"), { kind: "known", path: "/proj" }).kind, "unknown");
+});
+
+Deno.test("applyCd: cd ~ / cd ~/x 以 shell home 展開", () => {
+  assertEquals(
+    applyCd(cmdOf("cd ~"), { kind: "known", path: "/proj" }, "/home/u"),
+    { kind: "known", path: "/home/u", origin: "chain-cd" },
+  );
+  assertEquals(
+    applyCd(cmdOf("cd ~/src"), { kind: "known", path: "/proj" }, "/home/u"),
+    { kind: "known", path: "/home/u/src", origin: "chain-cd" },
+  );
+});
+
+Deno.test("applyCd: home 在專案內時展開結果仍在專案內", () => {
+  assertEquals(
+    applyCd(cmdOf("cd ~/src"), { kind: "known", path: "/proj" }, "/proj/home"),
+    { kind: "known", path: "/proj/home/src", origin: "chain-cd" },
+  );
+});
+
+Deno.test("applyCd: shell home 未知 → unknown", () => {
+  assertEquals(applyCd(cmdOf("cd ~"), { kind: "known", path: "/proj" }).kind, "unknown");
+  assertEquals(applyCd(cmdOf("cd ~/src"), { kind: "known", path: "/proj" }, null).kind, "unknown");
+  assertEquals(applyCd(cmdOf("cd ~/src"), { kind: "known", path: "/proj" }, "   ").kind, "unknown");
+});
+
+Deno.test("applyCd: 不支援的 tilde 形態即使 home 已知也 unknown", () => {
+  assertEquals(applyCd(cmdOf("cd ~user/x"), { kind: "known", path: "/proj" }, "/home/u").kind, "unknown");
+  assertEquals(applyCd(cmdOf("cd ~+"), { kind: "known", path: "/proj" }, "/home/u").kind, "unknown");
+  assertEquals(applyCd(cmdOf("cd ~-"), { kind: "known", path: "/proj" }, "/home/u").kind, "unknown");
+});
+
+Deno.test('applyCd: cd "~" 引號抑制展開，維持相對語義', () => {
+  const r = applyCd(cmdOf('cd "~"'), { kind: "known", path: "/proj" }, "/home/u");
+  assertEquals(r, { kind: "known", path: "/proj/~", origin: "chain-cd" });
+});
+
+Deno.test("applyCd: 混合引號 tilde 形態 → unknown", () => {
+  // `cd ~/"src"` 的開頭 ~ 仍會展開，但後段是引號內容；不臆測混合展開結果
+  assertEquals(applyCd(cmdOf('cd ~/"src"'), { kind: "known", path: "/proj" }, "/home/u").kind, "unknown");
+});
+
+Deno.test("applyCd: 可求值的 substitution 推導出具體 cwd", () => {
+  const r = applyCd(cmdOf('cd "$(dirname /proj/src/a.ts)"'), { kind: "known", path: "/proj" });
+  assertEquals(r, { kind: "known", path: "/proj/src", origin: "chain-cd" });
+});
+
+Deno.test("applyCd: 不可求值的 substitution 仍為 unknown", () => {
+  assertEquals(applyCd(cmdOf('cd "$(uname -a)"'), { kind: "known", path: "/proj" }).kind, "unknown");
+  assertEquals(applyCd(cmdOf("cd $(dirname /a/b)"), { kind: "known", path: "/proj" }).kind, "unknown");
+});
+
+Deno.test("applyCd: 求值結果為 - 時也要擋下", () => {
+  // basename ./- → "-"；bash 會把它當成 cd -（回上一個工作目錄），不是相對路徑 "./-"
+  assertEquals(applyCd(cmdOf(`cd "$(basename ./-)"`), { kind: "known", path: "/proj" }).kind, "unknown");
+  assertEquals(applyCd(cmdOf(`cd "$(printf '%s' -)"`), { kind: "known", path: "/proj" }).kind, "unknown");
+  // 求值出的字面 ~ 由 bash 視為普通字元（tilde expansion 早於 substitution），故維持相對語義
+  const r = applyCd(cmdOf(`cd "$(echo '~')"`), { kind: "known", path: "/proj" });
+  assertEquals(r, { kind: "known", path: "/proj/~", origin: "chain-cd" });
+});
+
+Deno.test("applyCd: 磁碟相對形態的目標 → unknown", () => {
+  // 接成 <cwd>/C:Windows 會造出看似專案內的假 cwd；實測 bash 的 cd "C:Windows" 落在 /c/Windows
+  assertEquals(applyCd(cmdOf("cd C:Windows"), { kind: "known", path: "/proj" }).kind, "unknown");
+  assertEquals(applyCd(cmdOf("cd C:Windows/sub"), { kind: "known", path: "/proj" }).kind, "unknown");
+  // 求值結果同樣可能長成該形態
+  assertEquals(
+    applyCd(cmdOf(`cd "$(echo C:Windows)"`), { kind: "known", path: "/proj" }).kind,
+    "unknown",
+  );
+  // 帶分隔符的絕對形式不受影響（照既有邏輯推導）
+  assertEquals(
+    applyCd(cmdOf("cd C:/Windows"), { kind: "known", path: "/proj" }),
+    { kind: "known", path: "C:/Windows", origin: "chain-cd" },
+  );
+});
+
+Deno.test({
+  ignore: Deno.build.os !== "windows",
+  name: "applyCd: cygpath 推導出專案內 cwd（本次的主要需求）",
+  fn() {
+    const r = applyCd(cmdOf(`cd "$(cygpath -u 'D:/proj/src')"`), { kind: "known", path: "D:/proj" });
+    assertEquals(r, { kind: "known", path: "D:/proj/src", origin: "chain-cd" });
+  },
+});
+
+Deno.test("walk: shell home 傳達到巢狀結構中的 cd ~", () => {
+  const { script } = parseCommand("{ cd ~/src && cat a.ts; }");
+  const invs = walk(script, { kind: "known", path: "/proj" }, "/proj", "/home/u");
+  const cat = invs.find((i) => i.name === "cat")!;
+  assertEquals(cat.cwd, { kind: "known", path: "/home/u/src", origin: "chain-cd" });
+});
+
+Deno.test("applyCd: 選項形態與多參數一律 unknown（既有缺陷）", () => {
+  // bash 把 -P/-L/-- 當成選項，真正的目標是後面的參數；只看 suffix[0] 會記下 <cwd>/-P
+  assertEquals(applyCd(cmdOf("cd -P /outside"), { kind: "known", path: "/proj" }).kind, "unknown");
+  assertEquals(applyCd(cmdOf("cd -L /outside"), { kind: "known", path: "/proj" }).kind, "unknown");
+  assertEquals(applyCd(cmdOf("cd -- /outside"), { kind: "known", path: "/proj" }).kind, "unknown");
+  // `cd DIR REPLACE` 的字串替換形態同樣不臆測
+  assertEquals(applyCd(cmdOf("cd src other"), { kind: "known", path: "/proj" }).kind, "unknown");
+});
+
+Deno.test("applyCd: 求值出選項形態的結果也要擋下", () => {
+  // basename ./-P → "-P"，bash 會當成選項而非目錄
+  assertEquals(applyCd(cmdOf(`cd "$(basename ./-P)"`), { kind: "known", path: "/proj" }).kind, "unknown");
 });

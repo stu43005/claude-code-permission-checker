@@ -2006,6 +2006,8 @@ git commit -m "feat(rules): add test rule for unary file-test operators"
 **Files:**
 - Create: `src/rules/commands/cygpath.ts`
 - Test: `src/rules/commands/cygpath_test.ts`
+- Modify: `src/rules/allowlist.ts`、`src/rules/allowlist_test.ts`（一併註冊 base64 / test / cygpath 三條規則——
+  見本 Task 末的「附帶步驟」）
 
 - [ ] **Step 1: 寫失敗測試**
 
@@ -2261,6 +2263,34 @@ Run: `deno task check && deno task lint`
 ```bash
 git add src/rules/commands/cygpath.ts src/rules/commands/cygpath_test.ts
 git commit -m "feat(rules): add cygpath rule with three flag shapes"
+```
+
+- [ ] **附帶步驟：註冊 base64 / test / cygpath**
+
+原計畫把四條規則的註冊集中在 Task 12，但那會讓 Task 8～10 產出「存在卻無法從正式分類器
+觸及」的規則——既不符合 CLAUDE.md 的「改 `rules/commands/*.ts` → 在 `allowlist.ts` 註冊」
+工作流程，也讓每個 Task 無法獨立驗證。改為各規則 Task 自行註冊；本 Task 補上前兩個。
+
+`src/rules/allowlist.ts` 加入 import 與 `RULES` 成員：
+
+```ts
+import { base64Rule } from "./commands/base64.ts";
+import { testRule } from "./commands/test.ts";
+import { cygpathRule } from "./commands/cygpath.ts";
+```
+
+```ts
+  base64Rule,
+  testRule,
+  cygpathRule,
+```
+
+`src/rules/allowlist_test.ts` 的「known commands resolve to a rule」清單加入 `"base64"`、
+`"test"`、`"cygpath"`。**不要動排除清單中的 `npm`**——那由 Task 11 一併處理。
+
+```bash
+git add src/rules/allowlist.ts src/rules/allowlist_test.ts
+git commit -m "feat(rules): register base64, test and cygpath rules"
 ```
 
 ---
@@ -2621,17 +2651,31 @@ git add src/rules/commands/npm.ts src/rules/commands/npm_test.ts
 git commit -m "feat(rules): add npm rule for registry-only read subcommands"
 ```
 
+- [ ] **附帶步驟：註冊 npm 規則**
+
+`src/rules/allowlist.ts` 加入 `import { npmRule } from "./commands/npm.ts";` 與 `RULES` 成員 `npmRule`。
+
+`src/rules/allowlist_test.ts` 需**兩處**改動：把 `"npm"` 從「excluded / unknown commands」
+清單移出，並加入「known commands resolve to a rule」清單。該檔第 11 行目前把 `npm` 列為
+「未涵蓋指令」，註冊後會失敗。
+
+```bash
+git add src/rules/allowlist.ts src/rules/allowlist_test.ts
+git commit -m "feat(rules): register npm rule"
+```
+
 ---
 
 ### Task 12: 註冊、端對端測試、build 與 operational verification
 
 **Files:**
-- Modify: `src/rules/allowlist.ts`
-- Modify: `src/rules/allowlist_test.ts`（`npm` 已不再是「未涵蓋指令」）
 - Test: `src/main_test.ts`（追加 e2e）
 - Modify: `CLAUDE.md`
 
-- [ ] **Step 1: 註冊四條規則**
+> **註冊已在 Task 10 / 11 完成**（四條規則都已進入 `allowlist.ts`，`allowlist_test.ts`
+> 也已同步）。本 Task 只需在 Step 2 確認註冊結果正確，不要重複註冊。
+
+- [ ] **Step 1（已完成，僅驗證）：確認四條規則都已註冊**
 
 `src/rules/allowlist.ts` 加入 import 與陣列成員：
 

@@ -1,13 +1,19 @@
 import { assertEquals } from "@std/assert";
 import { parse } from "../deps.ts";
-import type { Command } from "../deps.ts";
-import { buildScopeConfig, canonicalizeExecPath, dangerousRoot, isDangerousRootAbs, isReadScoped, isWithin, normalizeAbsolute, resolvePath, rootScope, type PathScope, type ScopeConfig } from "./scope.ts";
+import type { Command, Word } from "../deps.ts";
+import { buildScopeConfig, canonicalizeExecPath, dangerousRoot, isDangerousRootAbs, isReadScoped, isWithin, normalizeAbsolute, resolvePath, resolvePathValue, rootScope, type PathScope, type ScopeConfig } from "./scope.ts";
 import type { CwdState } from "../types.ts";
 import type { PermissionRules } from "../permissions/settings.ts";
 import { EMPTY_DOMAIN_SCOPE } from "../permissions/domain_scope.ts";
 
 function firstArg(src: string) {
   return (parse(src).commands[0].command as Command).suffix[0];
+}
+
+/** 取出指令的第一個 argv Word。 */
+function wordOf(src: string): Word {
+  const cmd = parse(src).commands[0].command as Command;
+  return cmd.suffix[0];
 }
 
 Deno.test("normalizeAbsolute collapses . and ..", () => {
@@ -121,6 +127,7 @@ function scopeWith(
   return {
     root: "/proj",
     home: null,
+    shellHome: null,
     allow: { roots: allowRoots, files: allowFiles },
     deny: { roots: denyRoots, files: [] },
     ask: { roots: askRoots, files: [] },
@@ -344,4 +351,76 @@ Deno.test("buildScopeConfig maps allow/deny/ask to distinct fields", () => {
   assertEquals(scope.allow.roots, ["/allowed"]);
   assertEquals(scope.deny.roots, ["/denied"]);
   assertEquals(scope.ask.roots, ["/asked"]);
+});
+
+Deno.test("resolvePath: 未加引號的 ~/ 以 shellHome 展開後落在專案外 → out-of-project", () => {
+  const cwd: CwdState = { kind: "known", path: "/proj" };
+  const scope = { ...rootScope("/proj"), shellHome: "/home/u" };
+  assertEquals(resolvePath(wordOf("cat ~/secret"), cwd, scope), "out-of-project");
+  assertEquals(resolvePath(wordOf("cat ~/.ssh/id_rsa"), cwd, scope), "out-of-project");
+});
+
+Deno.test("resolvePath: 引號包裝的 ~ 維持相對語義（指向 ./~ ，確實在專案內）", () => {
+  const cwd: CwdState = { kind: "known", path: "/proj" };
+  const scope = { ...rootScope("/proj"), shellHome: "/home/u" };
+  assertEquals(resolvePath(wordOf('cat "~/secret"'), cwd, scope), "in-project");
+});
+
+Deno.test("resolvePath: 不支援的 tilde 形態與 shellHome 未知皆 out-of-project", () => {
+  const cwd: CwdState = { kind: "known", path: "/proj" };
+  const withHome = { ...rootScope("/proj"), shellHome: "/home/u" };
+  const noHome = { ...rootScope("/proj"), shellHome: null };
+  assertEquals(resolvePath(wordOf("cat ~user/x"), cwd, withHome), "out-of-project");
+  assertEquals(resolvePath(wordOf("cat ~+/x"), cwd, withHome), "out-of-project");
+  assertEquals(resolvePath(wordOf("cat ~/x"), cwd, noHome), "out-of-project");
+});
+
+Deno.test("resolvePath: 展開後落在專案內則 in-project", () => {
+  const cwd: CwdState = { kind: "known", path: "/proj" };
+  const scope = { ...rootScope("/proj"), shellHome: "/proj/home" };
+  assertEquals(resolvePath(wordOf("cat ~/x"), cwd, scope), "in-project");
+});
+
+Deno.test("resolvePathValue: 以 ~ 開頭的字串值 fail-closed", () => {
+  const cwd: CwdState = { kind: "known", path: "/proj" };
+  const scope = { ...rootScope("/proj"), shellHome: "/home/u" };
+  // 字串值沒有 word 結構，無從判斷引號 → 一律視為超出範圍
+  assertEquals(resolvePathValue("~/x", cwd, scope), "out-of-project");
+});
+
+Deno.test("shell home 與 settings home 分離：授權的是 settings home 時，指令的 ~ 仍以 HOME 展開", () => {
+  const cwd: CwdState = { kind: "known", path: "/proj" };
+  // Read(~/cache/**) 由 settings home 解析 → 授權的是 /settings-home/cache
+  const scope: ScopeConfig = {
+    ...rootScope("/proj"),
+    home: "/settings-home",
+    shellHome: "/bash-home",
+    allow: { roots: ["/settings-home/cache"], files: [] },
+  };
+  // 但指令中的 ~/cache/x 依 bash 語義展開為 /bash-home/cache/x —— 未被授權
+  assertEquals(resolvePath(wordOf("cat ~/cache/x"), cwd, scope), "out-of-project");
+});
+
+Deno.test("shell home 展開後命中 allow 範圍 → in-project", () => {
+  const cwd: CwdState = { kind: "known", path: "/proj" };
+  const scope: ScopeConfig = {
+    ...rootScope("/proj"),
+    home: "/bash-home",
+    shellHome: "/bash-home",
+    allow: { roots: ["/bash-home/cache"], files: [] },
+  };
+  assertEquals(resolvePath(wordOf("cat ~/cache/x"), cwd, scope), "in-project");
+});
+
+Deno.test("resolvePath: 磁碟相對形態（C:Windows）不得視為專案內相對路徑", () => {
+  const cwd: CwdState = { kind: "known", path: "/proj" };
+  const scope = rootScope("/proj");
+  // 語義有歧義、無正當用途 → 直接拒絕，不臆測解析結果
+  assertEquals(resolvePath(wordOf("cat C:Windows"), cwd, scope), "out-of-project");
+  assertEquals(resolvePath(wordOf("cat C:Windows/win.ini"), cwd, scope), "out-of-project");
+  assertEquals(resolvePathValue("C:Windows/win.ini", cwd, scope), "out-of-project");
+  // 帶分隔符的絕對形式照既有邏輯判定（專案外 → out-of-project）
+  assertEquals(resolvePath(wordOf("cat C:/Windows/win.ini"), cwd, scope), "out-of-project");
+  // 一般相對路徑不受影響
+  assertEquals(resolvePath(wordOf("cat src/a.ts"), cwd, scope), "in-project");
 });

@@ -19,11 +19,12 @@ export function evaluate(
   rules: PermissionRules = EMPTY_RULES,
   home: string | null = null,
   trustedReadRoots: string[] = [],
+  shellHome: string | null = null,
 ): Decision {
   try {
     const { script, errors } = parseCommand(command);
     if (errors.length > 0) return { verdict: "ask", reason: "指令語法無法可靠解析" };
-    const invocations = walk(script, initialCwd, root);
+    const invocations = walk(script, initialCwd, root, shellHome);
     if (invocations.some((inv) => inv.name === "sleep")) {
       return { verdict: "deny", reason: pollingDenyReason() };
     }
@@ -36,12 +37,12 @@ export function evaluate(
     if (invocations.length === 0) return { verdict: "allow", reason: "無可執行指令（no-op）" };
     const hit = printDisguiseDeny(script, initialCwd);
     if (hit) return { verdict: "deny", reason: printDisguiseDenyReason(hit.kind) };
-    const scope = buildScopeConfig(root, rules, home, trustedReadRoots);
+    const scope = buildScopeConfig(root, rules, home, trustedReadRoots, shellHome);
     const sessionCwdInScope = initialCwd.kind === "known" &&
       isReadScoped(normalizeAbsolute(initialCwd.path), scope);
     return combine(
       invocations.map((inv) =>
-        classify(inv, root, rules, home, trustedReadRoots, sessionCwdInScope)
+        classify(inv, root, rules, home, trustedReadRoots, sessionCwdInScope, shellHome)
       ),
     );
   } catch (_err) {

@@ -3,11 +3,13 @@ import { parseCommand } from "./parse.ts";
 import { walk } from "./walk.ts";
 import { classify } from "./classify.ts";
 import { evaluate } from "./evaluate.ts";
-import type { CwdState } from "../types.ts";
+import type { CommandInvocation, CwdState } from "../types.ts";
 import { parseBashRule } from "../permissions/matcher.ts";
 import type { PermissionRules } from "../permissions/settings.ts";
 import { EMPTY_READ_SCOPE, parsePathRule, type ReadScope } from "../permissions/path_scope.ts";
 import { EMPTY_DOMAIN_SCOPE, parseDomainRule } from "../permissions/domain_scope.ts";
+import { parse } from "../deps.ts";
+import type { Command, Word } from "../deps.ts";
 
 const ROOT = "/proj";
 const START: CwdState = { kind: "known", path: "/proj" };
@@ -525,4 +527,55 @@ Deno.test("expansion invariance holds through the cwd exemption, not just evalua
   // 大括號是唯一例外，且兩側都必須 ask —— 原 token 因護欄 ask、展開結果因佔位符不豁免
   assertEquals(evaluate("cd /tmp && gh api repos/o/r/x?owner}", ROOT, START).verdict, "ask");
   assertEquals(evaluate("cd /tmp && gh api 'repos/o/r/x{owner}'", ROOT, START).verdict, "ask");
+});
+
+/** 由單一 token 建出 argv 用的 Word。 */
+function wordOfArg(token: string): Word {
+  const cmd = parse(`x ${token}`).commands[0].command as Command;
+  return cmd.suffix[0];
+}
+
+Deno.test("central rule 1: cwd known 且在範圍內 → 維持 allow（對照組）", () => {
+  const inv: CommandInvocation = {
+    name: "git",
+    argv: [wordOfArg("log")],
+    assignments: [],
+    redirects: [],
+    cwd: { kind: "known", path: "/proj" },
+  };
+  assertEquals(classify(inv, "/proj").kind, "allow");
+});
+
+Deno.test("central rule 1: cwd unknown → ask", () => {
+  const inv: CommandInvocation = {
+    name: "git",
+    argv: [wordOfArg("log")],
+    assignments: [],
+    redirects: [],
+    cwd: { kind: "unknown" },
+  };
+  assertEquals(classify(inv, "/proj").kind, "ask");
+});
+
+Deno.test("central rule 1: cwd unknown 不可由 permissions.allow 升級", () => {
+  const inv: CommandInvocation = {
+    name: "git",
+    argv: [wordOfArg("log")],
+    assignments: [],
+    redirects: [],
+    cwd: { kind: "unknown" },
+  };
+  assertEquals(classify(inv, "/proj", rulesOf({ allow: ["Bash(git *)"] })).kind, "ask");
+});
+
+Deno.test("central rule 1: cwdIndependent 的指令在 unknown cwd 下也不得豁免", () => {
+  // gh api 有宣告 cwdIndependent，但五道護欄的第 (2) 條要求 cwd 為 known 且 origin 為 chain-cd
+  const inv: CommandInvocation = {
+    name: "gh",
+    argv: [wordOfArg("api"), wordOfArg("repos/o/r")],
+    assignments: [],
+    redirects: [],
+    cwd: { kind: "unknown" },
+  };
+  assertEquals(classify(inv, "/proj", undefined, null, [], true).kind, "ask");
 });

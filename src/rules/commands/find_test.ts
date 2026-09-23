@@ -49,8 +49,10 @@ Deno.test("find 遞迴遍歷根/家目錄 -> deny", () => {
   assertEquals(findRule.evaluate(ctxOf("find ${HOME}")).kind, "deny");
 });
 
-Deno.test("find 根/家目錄的子路徑 -> 非 deny", () => {
-  assertEquals(findRule.evaluate(ctxOf("find ~/.claude")).kind, "allow");
+Deno.test("find 根/家目錄的子路徑 -> 非 deny（tilde 展開後在專案外）", () => {
+  // （tilde 展開後在專案外）：shellHome 未知，未加引號的 ~/.claude fail-closed 為
+  // out-of-project -> ask，不是本測試要驗的「遞迴遍歷」deny，仍屬「非 deny」。
+  assertEquals(findRule.evaluate(ctxOf("find ~/.claude")).kind, "ask");
   assertEquals(findRule.evaluate(ctxOf("find .")).kind, "allow");
   assertEquals(findRule.evaluate(ctxOf("find /usr")).kind, "ask");
 });

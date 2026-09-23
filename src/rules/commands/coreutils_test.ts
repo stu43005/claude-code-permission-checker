@@ -71,8 +71,10 @@ Deno.test("ls -R 遞迴遍歷根/家目錄 -> deny", () => {
   assertEquals(fileReaderRule.evaluate(ctxOf("ls --recursive $HOME")).kind, "deny");
 });
 
-Deno.test("ls 非遞迴碰根 / cat 碰根 -> 非 deny", () => {
-  assertEquals(fileReaderRule.evaluate(ctxOf("ls -l ~")).kind, "allow");
+Deno.test("ls 非遞迴碰根 / cat 碰根 -> 非 deny（tilde 展開後在專案外）", () => {
+  // （tilde 展開後在專案外）：shellHome 未知，未加引號的 ~ fail-closed 為 out-of-project -> ask，
+  // 不是本測試要驗的「遞迴遍歷」deny，仍屬「非 deny」。
+  assertEquals(fileReaderRule.evaluate(ctxOf("ls -l ~")).kind, "ask");
   assertEquals(fileReaderRule.evaluate(ctxOf("cat /")).kind, "ask");
   assertEquals(fileReaderRule.evaluate(ctxOf("ls -R ./sub")).kind, "allow");
 });

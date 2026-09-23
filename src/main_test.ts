@@ -1,5 +1,5 @@
 import { assertEquals } from "@std/assert";
-import { homeDir } from "./main.ts";
+import { homeDir, shellHomeDir } from "./main.ts";
 import { normalizeAbsolute } from "./engine/scope.ts";
 
 /** 以子行程執行 main.ts，餵入 hook JSON，回傳 stdout。 */
@@ -102,6 +102,17 @@ Deno.test("homeDir: HOME 未設時退回 USERPROFILE", () => {
 
 Deno.test("homeDir: 皆未設 -> null", () => {
   assertEquals(homeDir({ get: () => undefined }), null);
+});
+
+Deno.test("shellHomeDir: 只接受絕對路徑的 HOME", () => {
+  const of = (home: string | undefined) =>
+    shellHomeDir({ get: (k: string) => (k === "HOME" ? home : undefined) });
+  assertEquals(of("/home/u"), "/home/u");
+  assertEquals(of(undefined), null);
+  assertEquals(of(""), null);
+  assertEquals(of("   "), null);
+  assertEquals(of("../relative"), null);
+  assertEquals(of("relative/home"), null);
 });
 
 Deno.test("e2e: recursive root scan -> deny", async () => {
@@ -486,4 +497,157 @@ Deno.test("e2e: pre-execution 無副作用（write-exec + cat-readback，內容/
   } finally {
     await Deno.remove(dir, { recursive: true });
   }
+});
+
+/** 由指令字串組出 hook payload，並取出決策。 */
+async function decisionOf(command: string, projectDir: string): Promise<string> {
+  const out = await runHook(
+    { tool_name: "Bash", tool_input: { command }, cwd: projectDir },
+    projectDir,
+  );
+  return JSON.parse(out).hookSpecificOutput.permissionDecision;
+}
+
+Deno.test("e2e: 本次的真實指令改為自動放行", async () => {
+  const proj = await projWithAllow([]);
+  try {
+    await Deno.writeTextFile(`${proj}/deno.json`, "{}");
+    // 觸發本次設計的四條真實指令（第一條是完整的原始 pipeline）
+    assertEquals(
+      await decisionOf(
+        `gh api repos/o/r/contents/README.md --template='{{.content}}' | base64 -d 2>&1 | grep -A 20 "x" | head -40`,
+        proj,
+      ),
+      "allow",
+    );
+    assertEquals(await decisionOf("test -f deno.json && cat deno.json | head -100", proj), "allow");
+    assertEquals(
+      await decisionOf(
+        "npm view markdown-it version && npm view marked version",
+        proj,
+      ),
+      "allow",
+    );
+    assertEquals(await decisionOf("base64 -w 0 deno.json", proj), "allow");
+  } finally {
+    await Deno.remove(proj, { recursive: true });
+  }
+});
+
+Deno.test("e2e: 動態 cd 目標不再繞過 cwd 檢查", async () => {
+  const proj = await projWithAllow([]);
+  try {
+    assertEquals(await decisionOf('cd "$(uname -a)" && git log --oneline -3', proj), "ask");
+  } finally {
+    await Deno.remove(proj, { recursive: true });
+  }
+});
+
+Deno.test({
+  ignore: Deno.build.os !== "windows",
+  name: "e2e: cygpath 推導 cwd 後，相對路徑讀取被正確判定（本次主要需求）",
+  async fn() {
+    const proj = await projWithAllow([]);
+    try {
+      await Deno.writeTextFile(`${proj}/deno.json`, "{}");
+      // 專案內：推導出的 cwd 在範圍內 → 相對路徑可解析 → allow
+      assertEquals(await decisionOf(`cd "$(cygpath -u '${proj}')" && cat deno.json`, proj), "allow");
+      // 專案外：推導出的 cwd 落在範圍外 → 中央前置規則一 → ask
+      assertEquals(await decisionOf(`cd "$(cygpath -u 'C:/Windows')" && cat deno.json`, proj), "ask");
+    } finally {
+      await Deno.remove(proj, { recursive: true });
+    }
+  },
+});
+
+Deno.test("e2e: 磁碟相對的 cd 目標不得造出假的專案內 cwd", async () => {
+  const proj = await projWithAllow([]);
+  try {
+    assertEquals(await decisionOf("cd C:Windows && cat win.ini", proj), "ask");
+    assertEquals(await decisionOf(`cd "$(echo C:Windows)" && cat win.ini`, proj), "ask");
+  } finally {
+    await Deno.remove(proj, { recursive: true });
+  }
+});
+
+/** 帶環境變數跑 hook 並取出決策。 */
+async function decisionWithEnv(
+  command: string,
+  proj: string,
+  env: Record<string, string>,
+): Promise<string> {
+  const out = await runHookWithEnv(
+    { tool_name: "Bash", tool_input: { command }, cwd: proj },
+    { CLAUDE_PROJECT_DIR: proj, ...env },
+  );
+  return JSON.parse(out).hookSpecificOutput.permissionDecision;
+}
+
+Deno.test("e2e: 未加引號的 ~ 展開為 HOME，落在專案外 → ask", async () => {
+  const proj = await projWithAllow([]);
+  try {
+    const env = { HOME: "/bash-home", USERPROFILE: "/bash-home" };
+    for (
+      const cmd of [
+        "cat ~/secret",
+        "cat ~/.ssh/id_rsa",
+        "grep x ~/secret",
+        "head -5 ~/secret",
+        "test -f ~/secret",
+        "base64 ~/secret",
+        "cat ~user/secret",
+        "cat ~+/secret",
+        "cat ~-/secret",
+      ]
+    ) {
+      assertEquals(await decisionWithEnv(cmd, proj, env), "ask", cmd);
+    }
+    // 引號形態指向 <proj>/~/secret，仍在專案內 → allow
+    assertEquals(await decisionWithEnv('cat "~/secret"', proj, env), "allow");
+    // HOME 未設定 → 不可解析 → ask
+    assertEquals(
+      await decisionWithEnv("cat ~/x", proj, { USERPROFILE: "/settings-home" }),
+      "ask",
+    );
+  } finally {
+    await Deno.remove(proj, { recursive: true });
+  }
+});
+
+// 正面案例跨平台成立：兩個 home 相同時，settings 的 ~ 與指令的 ~ 指向同一處
+Deno.test("e2e: Read(~/cache/**) 授權後，指令的 ~ 展開命中該範圍 → allow", async () => {
+  const proj = await projWithAllow(["Read(~/cache/**)"]);
+  try {
+    assertEquals(
+      await decisionWithEnv("cat ~/cache/x", proj, {
+        HOME: "/same-home",
+        USERPROFILE: "/same-home",
+      }),
+      "allow",
+    );
+  } finally {
+    await Deno.remove(proj, { recursive: true });
+  }
+});
+
+// 兩個 home 分歧只在 Windows 成立：resolveHome 在該平台優先 USERPROFILE，
+// 其他平台兩者都用 HOME，分歧無從產生。
+Deno.test({
+  ignore: Deno.build.os !== "windows",
+  name: "e2e: HOME 與 USERPROFILE 分歧時，settings 的 ~ 走 USERPROFILE、指令的 ~ 走 HOME",
+  async fn() {
+    const proj = await projWithAllow(["Read(~/cache/**)"]);
+    const env = { HOME: "/bash-home", USERPROFILE: "/settings-home" };
+    try {
+      // 授權的是 USERPROFILE/cache，實際讀的是 HOME/cache → 不一致 → ask
+      assertEquals(await decisionWithEnv("cat ~/cache/x", proj, env), "ask");
+      // 同一環境下，該規則**仍然**授權 USERPROFILE 底下的位置——證明它被正確解析、
+      // 而不是被丟棄或解析到別處（沒有這條，上面的 ask 也可能來自「規則根本沒生效」）
+      assertEquals(await decisionWithEnv("cat /settings-home/cache/x", proj, env), "allow");
+      // 而 HOME 底下的同名位置未被授權
+      assertEquals(await decisionWithEnv("cat /bash-home/cache/x", proj, env), "ask");
+    } finally {
+      await Deno.remove(proj, { recursive: true });
+    }
+  },
 });

@@ -13,11 +13,28 @@ import type { CommandInvocation, CwdState } from "../types.ts";
 import { staticValue } from "./word.ts";
 import { applyCd, gitEffectiveCwd, isCd } from "./cwd.ts";
 
+/**
+ * 本次遍歷的 bash home（`$HOME`），供 `applyCd` 展開 `cd ~`。
+ * 由 `walk` 在入口設定、finally 清除。`walk` 是同步、非重入、單執行緒，
+ * 故此值在一次遍歷內恆定，也不會外洩到下一次呼叫。
+ */
+let walkShellHome: string | null = null;
+
 /** 走訪 Script，回傳所有葉指令呼叫。 */
-export function walk(script: Script, startCwd: CwdState, _root: string): CommandInvocation[] {
-  const out: CommandInvocation[] = [];
-  walkSequence(script.commands, startCwd, out, [], true);
-  return out;
+export function walk(
+  script: Script,
+  startCwd: CwdState,
+  _root: string,
+  shellHome: string | null = null,
+): CommandInvocation[] {
+  walkShellHome = shellHome;
+  try {
+    const out: CommandInvocation[] = [];
+    walkSequence(script.commands, startCwd, out, [], true);
+    return out;
+  } finally {
+    walkShellHome = null;
+  }
 }
 
 /** 依序處理頂層 / 複合語句序列，回傳序列結束後的 threaded cwd。 */
@@ -52,7 +69,7 @@ function walkNode(
   switch (node.type) {
     case "Command": {
       emitCommand(node, cwd, out, inherited);
-      if (persistent && isCd(node)) return applyCd(node, cwd);
+      if (persistent && isCd(node)) return applyCd(node, cwd, walkShellHome);
       return cwd;
     }
     case "AndOr": {
