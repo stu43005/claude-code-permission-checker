@@ -1,0 +1,52 @@
+import { assertEquals } from "@std/assert";
+import { parse } from "../deps.ts";
+import type { Command, Word } from "../deps.ts";
+import { expandTilde, hasUnquotedLeadingTilde } from "./tilde.ts";
+
+/** 取出 `cd <word>` 的第一個 argv Word。 */
+function wordOf(src: string): Word {
+  const cmd = parse(src).commands[0].command as Command;
+  return cmd.suffix[0];
+}
+
+Deno.test("hasUnquotedLeadingTilde: 未加引號的 ~ 會被 bash 展開", () => {
+  assertEquals(hasUnquotedLeadingTilde(wordOf("cd ~")), true);
+  assertEquals(hasUnquotedLeadingTilde(wordOf("cd ~/src")), true);
+  assertEquals(hasUnquotedLeadingTilde(wordOf("cd ~user/x")), true);
+});
+
+Deno.test("hasUnquotedLeadingTilde: 引號抑制展開", () => {
+  // `cd "~"` 的 value 同樣是 "~"，只有 word 結構能區分
+  assertEquals(hasUnquotedLeadingTilde(wordOf('cd "~"')), false);
+  assertEquals(hasUnquotedLeadingTilde(wordOf("cd '~/x'")), false);
+});
+
+Deno.test("hasUnquotedLeadingTilde: 混合引號形態的開頭 ~ 仍會展開", () => {
+  // parts = [Literal("~/"), DoubleQuoted]
+  assertEquals(hasUnquotedLeadingTilde(wordOf('cd ~/"src"')), true);
+});
+
+Deno.test("hasUnquotedLeadingTilde: 不以 ~ 開頭者一律 false", () => {
+  assertEquals(hasUnquotedLeadingTilde(wordOf("cd src")), false);
+  assertEquals(hasUnquotedLeadingTilde(wordOf('cd "$(echo x)"')), false);
+  assertEquals(hasUnquotedLeadingTilde(wordOf("cd a~b")), false);
+});
+
+Deno.test("expandTilde: 只支援 ~ 與 ~/<rest>", () => {
+  assertEquals(expandTilde("~", "/home/u"), "/home/u");
+  assertEquals(expandTilde("~/x/y", "/home/u"), "/home/u/x/y");
+});
+
+Deno.test("expandTilde: 其餘形態不可解析", () => {
+  assertEquals(expandTilde("~user", "/home/u"), null);
+  assertEquals(expandTilde("~user/x", "/home/u"), null);
+  assertEquals(expandTilde("~+", "/home/u"), null);
+  assertEquals(expandTilde("~-", "/home/u"), null);
+  assertEquals(expandTilde("~+1", "/home/u"), null);
+  assertEquals(expandTilde("src", "/home/u"), null);
+});
+
+Deno.test("expandTilde: shellHome 未知時不可解析", () => {
+  assertEquals(expandTilde("~/x", null), null);
+  assertEquals(expandTilde("~/x", "   "), null);
+});
