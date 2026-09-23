@@ -311,6 +311,12 @@ export function mayExpandToOption(word: Word): boolean;  // value 的第一個�
   **Decision**：不實作防護。
   **Rationale**：這與既有的 `grep -r x .` 完全相同（今天在同樣情境下本來就 allow），glob 支援沒有讓它更差；
   而且需要 nullglob、外部 cwd、巢狀 deny 三個條件同時成立。使用者評估後接受。
+- **Concern**：開啟 nullglob 且無任何匹配時，遞迴 grep/ls 的 glob 操作元全部消失，改為遞迴隱含的 cwd。
+  若 cwd 本身是家目錄或磁碟根（且已用 `Read()` 放行），硬 deny 會被繞過，例如 `grep -r x /home/me/p/no-*.txt` 在 cwd=`/home/me` 時。
+  **Decision**：不實作；glob 危險根閘門不檢查隱含的 cwd。
+  **Rationale**：展開結果等同不帶操作元的 `grep -r x`、`ls -R`，而現有工具在同樣情境下本來就回 allow
+  （2026-09-23 以編譯後的 binary 實測確認，只有明寫 `.` 時才 deny），glob 支援沒有讓它更差。
+  這個既有缺口應另外處理，不在本 spec 範圍內。使用者裁決接受。
 - **Concern**：清單外的指令（tail、stat、diff、sort、find、git 等）含 glob 仍為 ask。
   **Decision**：清單固定，不提供擴增機制。
   **Rationale**：旗標注入無法由本工具的旗標解析器觀察到；逐指令擴增等同對 GNU 全旗標集做 denylist，
