@@ -144,7 +144,19 @@ export function mayExpandToOption(word: Word): boolean;  // value 的第一個�
    嚴格位於 *P* 之下 → `"out-of-project"`。*P* 在專案根內時不做此檢查，維持 root-first 語義。
 5. 其餘 → `"in-project"`。
 
-`RuleContext` 新增 `resolveGlobPath(arg: Word): PathScope`，由 `classify.ts` 綁定 cwd 與 scope。
+**`scope.ts` 新增 `globMaySelectDangerousRoot(arg: Word, cwd: CwdState, home: string | null): boolean`**
+- `parseGlobPath(arg)` 為 null → false，因為這種 word 本來就不會被當成 glob 操作元接受。
+- 依上述步驟 2 把 `prefix` 解析成 *P*；cwd unknown 且前綴為相對路徑時回 **true**（fail-closed）。
+- 以下任一成立就回 true：
+  - `isDangerousRootAbs(P, home)`：*P* 就是 `/`、`X:/` 或家目錄。展開結果是其子項，例如 `/home/me/*`。
+    這在效果上等同遍歷整個根，而 `/` 在 Windows 的子項 `/c` 就是磁碟根。
+  - `home !== null && isWithin(P, normalizeAbsolute(home))`：*P* 是家目錄的祖先，glob 可能選中家目錄本身，
+    例如 `/home/m?`。
+
+`RuleContext` 新增：
+- `resolveGlobPath(arg: Word): PathScope`；
+- `globMaySelectDangerousRoot(arg: Word): boolean`，由 `classify.ts` 綁定 cwd 與 `scope.home`，與 `isDangerousRoot` 同源。
+
 **`resolvePath`、`resolvePathValue` 不變。**
 
 **CommandSpec 路徑（grep/egrep/fgrep、head、wc）**
@@ -160,18 +172,40 @@ export function mayExpandToOption(word: Word): boolean;  // value 的第一個�
 - 位置參數分類時，glob 標記的 token 若落在 `nonPathOperands`（grep 的 PATTERN 位置），就把
   `dynamic` 設為 true；否則放進 `globOperands`，而不是 `pathOperands`。
 - 吃值旗標的獨立 token 值若是 glob（例如 `-e *.md`），沿用現狀 → dynamic。
-- `evaluateWithSpec` 在既有 `pathOperands` 檢查之後，對 `globOperands` 逐一呼叫 `ctx.resolveGlobPath`，
-  任何一個不是 `in-project` 都 ask，理由為 `${name}：glob 路徑超出專案範圍或無法靜態解析（${value}）`。
-- 注入護欄的呼叫點見下方「注入護欄（兩條路徑共用）」：`evaluateWithSpec` 在 `globOperands` 範圍檢查之後，
-  若 `globOperands` 非空就呼叫它。
+- `evaluateWithSpec` 的判定順序：
+  1. 既有的遞迴危險根 deny；
+  2. **glob 危險根閘門**，傳入 `globOperands` 與 `p.isRecursive`；
+  3. 既有的 dynamic、未知旗標、`pathValues`、`pathOperands` 檢查；
+  4. 對 `globOperands` 逐一呼叫 `ctx.resolveGlobPath`，任何一個不是 `in-project` 都 ask，
+     理由為 `${name}：glob 路徑超出專案範圍或無法靜態解析（${value}）`；
+  5. 注入護欄。
+  兩道閘門只在 `globOperands` 非空時才有作用。
 - `cwdIndependentWhenNoPaths` 述詞額外要求 `p.globOperands.length === 0`。
 
 **legacy 路徑（cat、ls）**
 - `FlagGatedReaderOptions` 新增 `globOperandNames?: string[]`，`fileReaderRule` 設為 `["cat", "ls"]`。
-- legacy 的位置參數迴圈中，若 `ctx.name` 在 `globOperandNames` 內、且 `parseGlobPath(arg)` 成立，
-  就改呼叫 `ctx.resolveGlobPath(arg)`；其餘沿用 `ctx.resolvePath(arg)`。
-- 位置參數全部檢查完之後，若有任何 glob 操作元，就呼叫下方的注入護欄。
+- 判定順序：
+  1. 既有的遞迴危險根 deny；
+  2. **glob 危險根閘門**：先收集 glob 操作元，即 `ctx.name` 在 `globOperandNames` 內、且 `parseGlobPath` 成立的位置參數；
+     再以既有的 `recursive` 結果呼叫閘門；
+  3. 既有的 `pathValueFlags` 檢查；
+  4. 位置參數迴圈，其中 glob 操作元改呼叫 `ctx.resolveGlobPath(arg)`，其餘沿用 `ctx.resolvePath(arg)`；
+  5. 注入護欄。
 - 其他 legacy 行為（未知旗標放行、`recursive`、`pathValueFlags`）不變。
+
+**glob 危險根閘門（兩條路徑共用，`factory.ts` 的 `globRootGate(ctx, globWords, isRecursive): RuleVerdict | null`）**
+
+放在任何可能回 ask 的檢查之前，確保硬 deny 不會被 ask 搶先返回。
+- `globWords` 為空 → null（通過）。
+- `injectable` = `globWords` 中有任何 word 使 `mayExpandToOption` 為 true。
+  被注入的 `-r`/`-R` 可能讓非遞迴呼叫變成遞迴，例如 `grep x ?r ~` 遇到名為 `-r` 的檔案。
+- 若 `isRecursive || injectable`：
+  - `globWords` 中若有任何 word 使 `ctx.globMaySelectDangerousRoot` 為 true → `deny(recursiveRootDenyReason(ctx.name, word.value))`；
+  - 若 `injectable`，`ctx.argv` 中其餘 Word 若有任何一個使 `ctx.isDangerousRoot` 為 true → 同樣 deny。
+    明確遞迴時，其餘 Word 已由既有的遞迴 deny 檢查過。
+- 其餘 → null。
+
+此閘門不受任何讀取範圍放寬影響（`Read(~/**)` 等），以維持「遞迴遍歷磁碟根/家目錄根 = 硬 deny」這個不變量。
 
 **注入護欄（兩條路徑共用，`factory.ts` 的 `injectionGuard(ctx, globWords)`）**
 
@@ -183,11 +217,7 @@ export function mayExpandToOption(word: Word): boolean;  // value 的第一個�
 因此護欄不區分 token 的種類，規則如下：
 1. 若 `globWords` 中沒有任何 word 使 `mayExpandToOption` 為 true → 通過。
    有字面前綴的 glob（`./*.md`、`src/*.md`）不可能展開成旗標。
-2. **遞迴危險根**：被注入的 `-r`/`-R` 可能讓非遞迴呼叫變成遞迴（例如 `grep x ?r ~` 遇到名為 `-r` 的檔案）。
-   因此對 `ctx.argv` 中不在 `globWords` 之內的每一個 Word，只要 `ctx.isDangerousRoot(word)` 為 true，就回
-   `deny(recursiveRootDenyReason(ctx.name, word.value))`。這一步先於步驟 3，且不受讀取範圍放寬影響，
-   以維持「遞迴遍歷磁碟根/家目錄根 = 硬 deny」這個不變量。
-3. 否則，對 `ctx.argv` 中**不在 `globWords` 之內的每一個 Word**（包括旗標 token、旗標值、PATTERN），
+2. 否則，對 `ctx.argv` 中**不在 `globWords` 之內的每一個 Word**（包括旗標 token、旗標值、PATTERN），
    都呼叫 `ctx.resolvePath`，把它當成「可能被讀取的路徑」檢查。任何一個不是 `in-project` 都 ask，
    理由為 `${name}：glob 可能展開成旗標，${value} 可能被當成檔案讀取且超出範圍`。
    非靜態的 token（例如 `--include=*.md`）在這裡會得到 `dynamic` → ask。
@@ -204,7 +234,8 @@ export function mayExpandToOption(word: Word): boolean;  // value 的第一個�
 - `classify.ts` 的 cwd 豁免護欄 (4) 使用 `staticValue`，glob token 不算靜態，所以不豁免。
 - `permissions/matcher.ts` 的 `reconstructCommand` 對 glob token 回 null，所以不升級。
 - 規則四的 `<` 目標仍走 `resolvePath`：`cat < *.md` → ask。
-- 遞迴危險根 deny 判定不變；`grep -r x /*` 的前綴 `/` 在範圍外 → ask，與現狀相同。
+- 既有的遞迴危險根 deny 判定不變。glob 相關的危險根由上述閘門另外處理：`grep -r x /*`、`grep -r x /home/m?`
+  現在回 deny（以前因為是動態 token 而 ask），方向更嚴。
 
 ### §3 錯誤處理
 
@@ -226,6 +257,8 @@ export function mayExpandToOption(word: Word): boolean;  // value 的第一個�
   - 外部 allow root 內有巢狀 deny/ask 時 → out-of-project；外部 allow root 內沒有巢狀 deny → in-project。
   - `Read(//outside/data)` 這類精確單檔的 allow：`/outside/data/*` → out-of-project；
     `Read(//outside/data/**)` 這類 allow root：`/outside/data/*` → in-project。
+  - `globMaySelectDangerousRoot`：`/*`、`/home/me/*`、`/home/m?`、`/h*/me`（前綴 `/`）→ true；
+    `/home/me/src/*` → false；cwd unknown 且前綴為相對路徑 → true。
   - Windows 的 `/d/` 形態以 `Deno.build.os` 分支。
 - **`src/engine/glob_test.ts`（補充）**：`mayExpandToOption` 對 `*.md`、`?x`、`[ab]x` 為 true；
   對 `./*.md`、`src/*.md` 為 false。
@@ -239,7 +272,10 @@ export function mayExpandToOption(word: Word): boolean;  // value 的第一個�
     - ask：`grep /outside/secret *.md`、`grep *.md -e /outside`、`head *.md -n /outside/x`、
       `grep -e . ?? --label=/../../secret`、`cat *.md --x=/../../secret`、`ls -la *.md --hide=/../../x`、
       `grep /outside/secret -- *.md`（護欄不看 `--`）、`grep -n x *.md --include=*.md`；
-    - deny（在 `Read(~/**)` 或 `Read(//C:/**)` 放行家目錄/磁碟根的設定下也一樣）：`grep x ?r ~`、`ls ?R /`；
+    - deny（在 `Read(~/**)` 或 `Read(//C:/**)` 放行家目錄/磁碟根的設定下也一樣，且在一般只含專案範圍的設定下
+      也必須是 deny、不得被 ask 搶先）：`grep x ?r ~`、`ls ?R /`、`grep -r x /home/m?`（home=`/home/me`）、
+      `grep -r x m?`（cwd=`/home`）、`grep -r x /*`、`ls -R /home/me/*`；
+    - 非遞迴、無注入風險時不觸發閘門：`cat /home/me/*.md`、`grep x /home/m?/a.md` 依一般範圍判定（前綴在專案外 → ask，不是 deny）；
     - allow：`grep "a\|b" *.md`、`grep -m 5 x *.md`、`grep -rn x *.md`、`ls -la *.md`、
       `grep /outside/secret ./*.md`（有字面前綴、不會注入，所以不套用護欄）。
 - **`src/engine/classify_test.ts`**
