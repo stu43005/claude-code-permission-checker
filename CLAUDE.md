@@ -35,6 +35,19 @@ echo '{"tool_name":"Bash","tool_input":{"command":"cat README.md"},"cwd":"D:/pro
   | CLAUDE_PROJECT_DIR="D:/proj" ./dist/permission-checker.exe   # 期望 allow、exit 0
 ```
 
+單次手動檢查用上面這種 echo-pipe 就好；要**重跑一整批案例**（例如驗證某次改動沒有讓既有案例
+退化）時，用 `scripts/verify-hook-binary.ts`——它會自己 `deno task build`、對編譯後的
+`dist/permission-checker.exe`（不是 `deno run src/main.ts`）逐一餵案例表、斷言決策與
+`exit === 0`，且在隔離的暫存目錄執行（`clearEnv` + 空的 `CLAUDE_CONFIG_DIR`，使用者自己的
+`permissions.allow` 不會介入）：
+
+```bash
+deno run --allow-run --allow-read --allow-write --allow-env scripts/verify-hook-binary.ts
+```
+
+新增案例只需在該檔的 `CASES` 陣列多加一行；只在 Windows 執行（多數案例是 cygpath-specific），
+其他平台會印訊息後正常結束。
+
 **⚠️ binary 回 `allow` 但 builtin 應為 `ask` 時，先檢查 settings.json——這不是失敗，是功能正常**：
 operational verification 會讀取真實的 settings.json（含使用者 `<configDir>/settings.json`（`<configDir> = CLAUDE_CONFIG_DIR ?? <home>/.claude`），三來源 union）。
 若某指令 builtin 判 `ask`、單元測試也判 `ask`，但 binary 卻回 `allow`，且 reason 為「命中 permissions.allow」，
