@@ -20,7 +20,9 @@ import type { Word } from "../deps.ts";
  */
 export function hasUnquotedLeadingTilde(word: Word): boolean {
   const parts = word.parts;
-  if (!parts || parts.length === 0) return word.value.startsWith("~");
+  if (!parts || parts.length === 0) {
+    return word.value.startsWith("~") && tildePrefixIsUnquoted(word.value);
+  }
   const head = parts[0];
   if (head.type !== "Literal" || !head.value.startsWith("~")) return false;
   // tilde-prefix = `~` 到第一個**未加引號**的 `/` 之間。POSIX/bash：該區間內只要出現任何
@@ -36,6 +38,22 @@ export function hasUnquotedLeadingTilde(word: Word): boolean {
   // 結果取決於該使用者是否存在——靜態不可知。回 true 讓 expandTilde 判定為不支援形態
   // （→ 呼叫端 fail-closed），而不是退回相對路徑語義那條會誤放行的路。
   return true;
+}
+
+/**
+ * 未加引號的字面 token：tilde-prefix（`~` 到第一個**未跳脫**的 `/`）內是否不含反斜線跳脫。
+ *
+ * `\/` 是被跳脫的 `/`，不終止 prefix，於是整個 token 都落在 prefix 內且含引號字元——
+ * bash 因此完全不展開（實測 `echo ~\/src` → `~/src`，而 `echo ~/src` → `$HOME/src`）。
+ * 有 parts 的 word 不需在此處理：未加引號的 Literal 含反斜線時，word.ts 的
+ * topPartIsDynamic 已使該 word 非靜態，呼叫端本就 fail closed。
+ */
+function tildePrefixIsUnquoted(value: string): boolean {
+  for (let i = 1; i < value.length; i++) {
+    if (value[i] === "\\") return false; // prefix 內出現跳脫字元 → 不展開
+    if (value[i] === "/") return true; // prefix 在此結束，且全程未加引號
+  }
+  return true; // 整個 token 都是未跳脫的 prefix（如 `~username`）
 }
 
 /**

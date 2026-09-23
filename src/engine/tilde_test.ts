@@ -46,6 +46,14 @@ Deno.test("hasUnquotedLeadingTilde: prefix 乾淨時仍展開（引號只落在 
   assertEquals(hasUnquotedLeadingTilde(wordOf(`cd ~/'src'/x`)), true);
 });
 
+Deno.test("hasUnquotedLeadingTilde: 反斜線跳脫的 / 不終止 tilde-prefix", () => {
+  // 實測 `echo ~\/src` → `~/src`（不展開），`echo ~/src` → `$HOME/src`（展開）
+  assertEquals(hasUnquotedLeadingTilde(wordOf(String.raw`cd ~\/src`)), false);
+  assertEquals(hasUnquotedLeadingTilde(wordOf(String.raw`cd ~us\er`)), false);
+  assertEquals(hasUnquotedLeadingTilde(wordOf("cd ~/src")), true);
+  assertEquals(hasUnquotedLeadingTilde(wordOf("cd ~user")), true);
+});
+
 Deno.test("expandTilde: 只支援 ~ 與 ~/<rest>", () => {
   assertEquals(expandTilde("~", "/home/u"), "/home/u");
   assertEquals(expandTilde("~/x/y", "/home/u"), "/home/u/x/y");
