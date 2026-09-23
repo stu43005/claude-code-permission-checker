@@ -206,6 +206,13 @@ const cygpathEvaluator: SubstEvaluator = {
  * 其餘以 `/` 開頭者由 MSYS2 mount 表決定實際位置，不等價。
  */
 function isNormalizationEquivalent(p: string): boolean {
+  // 含獨立 `..` 段一律放棄。MSYS 先折疊 POSIX `..` 再套 mount 表，normalizeAbsolute 則是
+  // 先把 `/d` 轉成 `D:` 再折疊——兩者可能落在完全不同的目錄：實測
+  // `cygpath -m '/d/../tmp'` → `C:/Users/…/AppData/Local/Temp`（MSYS 的 /tmp 掛載點），
+  // 而 normalizeAbsolute('/d/../tmp') 會得到 `D:/tmp`。此外含 `..` 時 cygpath 還會查檔案系統
+  // （實測 `cygpath -m '/d/proj/../x'` 在該路徑不存在時報 "No such file or directory"），
+  // 本身就不符合純靜態求值的契約。
+  if (p.replace(/\\/g, "/").split("/").some((seg) => seg === "..")) return false;
   // 磁碟前綴必須接分隔符。`C:Windows`（無分隔符）在 Windows 是「該磁碟機的當前目錄」語義，
   // cygpath 會補上分隔符解析成 C:/Windows，而 applyPath 會把它當相對路徑接到 cwd 之後。
   if (/^[A-Za-z]:/.test(p)) return /^[A-Za-z]:[/\\]/.test(p);

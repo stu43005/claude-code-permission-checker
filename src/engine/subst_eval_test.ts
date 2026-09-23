@@ -265,6 +265,22 @@ Deno.test({
 });
 
 Deno.test({
+  ...WIN_ONLY,
+  name: "cygpath: 含 .. 段的操作元 → null",
+  fn() {
+    // MSYS 先折疊 `..` 再套 mount 表，方向與 normalizeAbsolute 相反
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -m '/d/../tmp')"`), CWD), null);
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -m '/d/..')"`), CWD), null);
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -m '/d/../d/proj')"`), CWD), null);
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -w 'C:/a/../b')"`), CWD), null);
+    assertEquals(evalSubstitutionWord(wordOf(String.raw`cd "$(cygpath -w 'C:\a\..\b')"`), CWD), null);
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -u 'sub/../x')"`), CWD), null);
+    // 檔名中的 `..` 不是獨立段，不受影響
+    assertEquals(evalSubstitutionWord(wordOf(`cd "$(cygpath -m '/d/a..b')"`), CWD), "/d/a..b");
+  },
+});
+
+Deno.test({
   ignore: Deno.build.os === "windows",
   name: "cygpath: 非 Windows 平台一律不求值",
   fn() {
