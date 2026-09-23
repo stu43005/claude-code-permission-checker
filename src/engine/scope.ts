@@ -26,10 +26,10 @@ export function isAbsolute(p: string): boolean {
 }
 
 /**
- * Windows 磁碟前綴但缺分隔符（`C:Windows`）。MSYS 對此形態的解析**因程式而異**：
- * 實測 `cd "C:Windows"` 與 `realpath "C:Windows"` 會解析成 C 磁碟的 `C:/Windows`，
- * 而 `cat`/`ls`/`mkdir` 則把它當成含冒號的相對檔名。既然某些解析會離開專案，
- * 靜態判定就不能假設它留在專案內——一律視為超出範圍（保守方向）。
+ * Windows 磁碟前綴但缺分隔符（`C:Windows`）。這個形態的語義有歧義——不同程式解析結果不同
+ * （實測 `cd`/`realpath` 解析到 C 磁碟，`cat`/`ls` 當成含冒號的相對檔名）——且沒有任何正當
+ * 寫法會用它：要指 C 磁碟就寫 `/c/Windows` 或 `C:/Windows`。歧義且無正當用途，依 default-deny
+ * 一律拒絕，不去臆測它會落在哪裡。
  */
 function isDriveRelative(p: string): boolean {
   return /^[A-Za-z]:(?![/\\])/.test(p);
@@ -238,7 +238,7 @@ export function isReadScoped(absPosix: string, scope: ScopeConfig): boolean {
 
 /** 絕對／相對路徑的範圍判定本體；呼叫端負責先處理 tilde 語義。 */
 function resolveResolvedValue(value: string, cwd: CwdState, scope: ScopeConfig): PathScope {
-  // 磁碟相對形態（`C:Windows`）的解析因程式而異，部分情形會離開專案 → 一律視為超出範圍
+  // 磁碟相對形態（`C:Windows`）語義有歧義且無正當寫法 → 直接拒絕
   if (isDriveRelative(value)) return "out-of-project";
   let abs: string;
   if (isAbsolute(value)) {

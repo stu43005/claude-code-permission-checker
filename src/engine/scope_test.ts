@@ -415,7 +415,7 @@ Deno.test("shell home 展開後命中 allow 範圍 → in-project", () => {
 Deno.test("resolvePath: 磁碟相對形態（C:Windows）不得視為專案內相對路徑", () => {
   const cwd: CwdState = { kind: "known", path: "/proj" };
   const scope = rootScope("/proj");
-  // MSYS 的解析因程式而異——cd / realpath 會到 C 磁碟，故不能接成 /proj/C:Windows
+  // 語義有歧義、無正當用途 → 直接拒絕，不臆測解析結果
   assertEquals(resolvePath(wordOf("cat C:Windows"), cwd, scope), "out-of-project");
   assertEquals(resolvePath(wordOf("cat C:Windows/win.ini"), cwd, scope), "out-of-project");
   assertEquals(resolvePathValue("C:Windows/win.ini", cwd, scope), "out-of-project");
