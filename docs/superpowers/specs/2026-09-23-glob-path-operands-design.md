@@ -193,7 +193,12 @@ export function mayExpandToOption(word: Word): boolean;  // value 的第一個�
   3. 既有的 `pathValueFlags` 檢查；
   4. 位置參數迴圈，其中 glob 操作元改呼叫 `ctx.resolveGlobPath(arg)`，其餘沿用 `ctx.resolvePath(arg)`；
   5. 注入護欄。
-- 其他 legacy 行為（未知旗標放行、`recursive`、`pathValueFlags`）不變。
+- **ls 遞迴偵測補強**（危險根閘門的前提）：`fileReaderRule.recursive` 對 ls 目前只認完整 token `-R`、`--recursive`，
+  漏掉 `-lR` 這種短旗標群集。改為：除上述兩者外，任何「以單一 `-` 開頭、不含 `=`、長度 ≥ 2、第 2 字元之後含 `R`」
+  的 token 也視為遞迴，與 `grep.ts` 的 `shortClusterHasR` 同一形式。
+  這會多判（例如 `-wR` 裡的 `R` 其實是 `-w` 的值），但方向安全。
+  **這同時修正既有缺口**：明寫的 `ls -lR ~`、`ls -lR /` 從 allow 收緊為 deny。
+- 其他 legacy 行為（未知旗標放行、`pathValueFlags`）不變。
 
 **glob 危險根閘門（兩條路徑共用，`factory.ts` 的 `globRootGate(ctx, globWords, isRecursive): RuleVerdict | null`）**
 
@@ -286,7 +291,9 @@ export function mayExpandToOption(word: Word): boolean;  // value 的第一個�
     - deny（在 `Read(~/**)` 或 `Read(//C:/**)` 放行家目錄/磁碟根的設定下也一樣，且在一般只含專案範圍的設定下
       也必須是 deny、不得被 ask 搶先）：`grep x ?r ~`、`ls ?R /`、`grep -r x /home/m?`（home=`/home/me`）、
       `grep -r x m?`（cwd=`/home`）、`grep -r x /*`、`ls -R /home/me/*`、
-      `cat /home/me/**/*.md`、`head /**/*.md`、`grep x /home/me/**/*.md`（globstar 視為遞迴）；
+      `cat /home/me/**/*.md`、`head /**/*.md`、`grep x /home/me/**/*.md`（globstar 視為遞迴）、
+      `ls -lR /home/me/*`、`ls -lR /*`，以及沒有 glob 的 `ls -lR ~`、`ls -lR /`（群集遞迴偵測，既有行為收緊）；
+    - allow：`ls -la *.md`、`ls -lR src`（`-lR` 視為遞迴，但目標不是危險根）；
     - allow：`cat src/**/*.ts`（專案內前綴、非危險根）；
     - 非遞迴、無注入風險時不觸發閘門：`cat /home/me/*.md`、`grep x /home/m?/a.md` 依一般範圍判定（前綴在專案外 → ask，不是 deny）；
     - allow：`grep "a\|b" *.md`、`grep -m 5 x *.md`、`grep -rn x *.md`、`ls -la *.md`、
