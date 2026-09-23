@@ -162,26 +162,39 @@ export function mayExpandToOption(word: Word): boolean;  // value 的第一個�
 - 吃值旗標的獨立 token 值若是 glob（例如 `-e *.md`），沿用現狀 → dynamic。
 - `evaluateWithSpec` 在既有 `pathOperands` 檢查之後，對 `globOperands` 逐一呼叫 `ctx.resolveGlobPath`，
   任何一個不是 `in-project` 都 ask，理由為 `${name}：glob 路徑超出專案範圍或無法靜態解析（${value}）`。
-- `ArgvParse` 另新增 `injectionRisk: boolean`：當存在某個 glob 操作元使 `mayExpandToOption` 為 true，
-  且它出現在 `optionsDone` 變為 true（即字面 `--`）之前時，設為 true。
-  另新增 `separateValueTokens: Word[]`：以獨立 token 形式被吃掉的旗標值 Word。
-- **注入護欄**：`injectionRisk` 為 true 時，`evaluateWithSpec` 必須對 `nonPathOperands` 與
-  `separateValueTokens` 的每個 Word 呼叫 `ctx.resolvePath`，任何一個不是 `in-project` 都 ask，
-  理由為 `${name}：glob 可能展開成旗標，${value} 可能被當成檔案讀取且超出範圍`。
-  - 一般的 pattern（例如 `"careTreatment\|WebApi"`）或數值（例如 `-m 5` 的 `5`）是相對路徑，
-    會解析到 cwd 內 → in-project，照常 allow。
-  - `grep /outside/secret *.md`、`grep *.md -e /outside` 則 → ask。
-  - `--name=value` 黏寫的旗標值不在此列：被注入的旗標只能吞掉**下一個獨立 token**，黏寫值無法被推成位置參數。
-- **legacy 路徑不需要注入護欄**：legacy 的 `positionals` 對所有非 `-` 開頭的 token（含未列入 `valueFlags`
-  的旗標值）一律 `resolvePath`，而 cat、ls 在 `fileReaderRule` 的 `valueFlags` 中沒有吃值旗標。
-  所以任何可能被注入翻成檔案的 token 本來就已經檢查過範圍。
+- 注入護欄的呼叫點見下方「注入護欄（兩條路徑共用）」：`evaluateWithSpec` 在 `globOperands` 範圍檢查之後，
+  若 `globOperands` 非空就呼叫它。
 - `cwdIndependentWhenNoPaths` 述詞額外要求 `p.globOperands.length === 0`。
 
 **legacy 路徑（cat、ls）**
 - `FlagGatedReaderOptions` 新增 `globOperandNames?: string[]`，`fileReaderRule` 設為 `["cat", "ls"]`。
 - legacy 的位置參數迴圈中，若 `ctx.name` 在 `globOperandNames` 內、且 `parseGlobPath(arg)` 成立，
   就改呼叫 `ctx.resolveGlobPath(arg)`；其餘沿用 `ctx.resolvePath(arg)`。
+- 位置參數全部檢查完之後，若有任何 glob 操作元，就呼叫下方的注入護欄。
 - 其他 legacy 行為（未知旗標放行、`recursive`、`pathValueFlags`）不變。
+
+**注入護欄（兩條路徑共用，`factory.ts` 的 `injectionGuard(ctx, globWords)`）**
+
+被注入的旗標可能改變**任何**其他 token 的解讀方式：
+- 注入 `-e`/`-f` → 原本的 PATTERN 變成檔案；
+- 注入 `--` → 其後的旗標 token（例如 `--label=/../../secret`）變成檔案操作元；
+- 注入吃值旗標（例如 `-f`）→ 下一個 token（不論它是不是旗標）被當成路徑值讀取。
+
+因此護欄不區分 token 的種類，規則如下：
+1. 若 `globWords` 中沒有任何 word 使 `mayExpandToOption` 為 true → 通過。
+   有字面前綴的 glob（`./*.md`、`src/*.md`）不可能展開成旗標。
+2. 否則，對 `ctx.argv` 中**不在 `globWords` 之內的每一個 Word**（包括旗標 token、旗標值、PATTERN），
+   都呼叫 `ctx.resolvePath`，把它當成「可能被讀取的路徑」檢查。任何一個不是 `in-project` 都 ask，
+   理由為 `${name}：glob 可能展開成旗標，${value} 可能被當成檔案讀取且超出範圍`。
+   非靜態的 token（例如 `--include=*.md`）在這裡會得到 `dynamic` → ask。
+
+效果：
+- 一般旗標（`-n`、`-la`、`-rn`）、一般 pattern（`"careTreatment\|WebApi"`）、數值（`-m 5` 的 `5`）
+  都解析成 cwd 內的相對路徑 → in-project，照常 allow。
+- `grep /outside/secret *.md`、`grep *.md -e /outside`、`grep -e . ?? --label=/../../secret`、
+  `cat *.md --x=/../../secret` → ask。
+- 為了簡化，護欄**不看字面 `--` 的位置**：`grep /outside/secret -- *.md` 也會 ask。
+  同時帶有裸 glob 與非靜態旗標值者（例如 `grep -n x *.md --include=*.md`）也會 ask。這兩者都是安全方向的誤 ask。
 
 **刻意不變**
 - `classify.ts` 的 cwd 豁免護欄 (4) 使用 `staticValue`，glob token 不算靜態，所以不豁免。
@@ -219,9 +232,11 @@ export function mayExpandToOption(word: Word): boolean;  // value 的第一個�
     `cat ../*.md`（前綴在範圍外）、`ls .*`。
   - 清單外規則維持 ask：`tail *.md`、`diff *.md x`、`sort *.md`。
   - 注入護欄：
-    - ask：`grep /outside/secret *.md`、`grep *.md -e /outside`、`head *.md -n /outside/x`；
-    - allow：`grep "a\|b" *.md`、`grep -m 5 x *.md`、`grep /outside/secret ./*.md`（有字面前綴、不會注入）、
-      `grep /outside/secret -- *.md`（glob 在 `--` 之後、不會注入，PATTERN 只是字串）。
+    - ask：`grep /outside/secret *.md`、`grep *.md -e /outside`、`head *.md -n /outside/x`、
+      `grep -e . ?? --label=/../../secret`、`cat *.md --x=/../../secret`、`ls -la *.md --hide=/../../x`、
+      `grep /outside/secret -- *.md`（護欄不看 `--`）、`grep -n x *.md --include=*.md`；
+    - allow：`grep "a\|b" *.md`、`grep -m 5 x *.md`、`grep -rn x *.md`、`ls -la *.md`、
+      `grep /outside/secret ./*.md`（有字面前綴、不會注入，所以不套用護欄）。
 - **`src/engine/classify_test.ts`**
   - `cat < *.md` → ask。
   - `cd /outside && wc -l *.md`（chain-cd）→ ask，因為不豁免。
