@@ -2,6 +2,8 @@ import type { Command, Word } from "../deps.ts";
 import type { CwdState } from "../types.ts";
 import { staticValue } from "./word.ts";
 import { isAbsolute, normalizeAbsolute } from "./scope.ts";
+import { expandTilde, hasUnquotedLeadingTilde } from "./tilde.ts";
+import { evalSubstitutionWord } from "./subst_eval.ts";
 
 const UNKNOWN: CwdState = { kind: "unknown" };
 
@@ -23,12 +25,50 @@ function applyPath(cwd: CwdState, value: string): CwdState {
   };
 }
 
-/** `cd` 之後的新 threaded cwd。無參數（=$HOME）或動態參數 → unknown。 */
-export function applyCd(cmd: Command, cwd: CwdState): CwdState {
+/**
+ * `cd` 之後的新 threaded cwd。無參數（=$HOME）、動態參數、或不可解析的形態 → unknown。
+ *
+ * 取值順序：
+ *   1. 未加引號的 leading tilde → 僅 `~` / `~/<rest>` 且 shellHome 已知時展開；
+ *      混合引號形態（`~/"src"`）與 `~user` / `~+` / `~-` 一律 unknown。
+ *      引號包裝的 `"~"` 不命中述詞，走步驟 3 的相對語義——那對它是正確的。
+ *   2. 靜態 token → 直接使用。
+ *   3. 單一 `"$(…)"` 且內層可靜態求值 → 用求值結果。
+ * 步驟 2 與 3 取得的值都要再經 `applyTarget` 過濾 `-`。
+ *
+ * `shellHome` 選填：未提供時 tilde 形態一律 unknown（fail-safe）。
+ */
+export function applyCd(cmd: Command, cwd: CwdState, shellHome: string | null = null): CwdState {
   if (cmd.suffix.length === 0) return UNKNOWN; // cd 無參數 = $HOME
-  const val = staticValue(cmd.suffix[0]);
-  if (val === null) return UNKNOWN;
-  return applyPath(cwd, val);
+  const target = cmd.suffix[0];
+
+  if (hasUnquotedLeadingTilde(target)) {
+    const v = staticValue(target);
+    if (v === null) return UNKNOWN;
+    // parts 非空 = 混合引號形態（如 ~/"src"）：開頭 ~ 會展開、後段是引號內容，
+    // 正確模擬需逐 part 重建語義 → 保守放棄。
+    if (target.parts && target.parts.length > 0) return UNKNOWN;
+    const expanded = expandTilde(v, shellHome);
+    if (expanded === null) return UNKNOWN; // ~user / ~+ / ~- 或 home 未知
+    return applyPath(cwd, expanded);
+  }
+
+  const val = staticValue(target);
+  if (val !== null) return applyTarget(cwd, val);
+
+  const evaluated = evalSubstitutionWord(target, cwd);
+  if (evaluated === null) return UNKNOWN;
+  return applyTarget(cwd, evaluated);
+}
+
+/**
+ * 把已取得的 cd 目標字串接上 cwd。`-` 必須在這裡擋，而不是只擋原始 token——
+ * 求值結果同樣可能是 `-`（`basename ./-`、`printf '%s' -`），而 bash 對 `cd -` 的解讀
+ * 是「回上一個工作目錄」，不是相對路徑 `./-`。
+ */
+function applyTarget(cwd: CwdState, value: string): CwdState {
+  if (value === "-") return UNKNOWN;
+  return applyPath(cwd, value);
 }
 
 /** 取得緊接在 flag 之後的值：支援 `--opt=val` 與 `--opt val` / `-C val`。 */

@@ -24,7 +24,7 @@ export function evaluate(
   try {
     const { script, errors } = parseCommand(command);
     if (errors.length > 0) return { verdict: "ask", reason: "指令語法無法可靠解析" };
-    const invocations = walk(script, initialCwd, root);
+    const invocations = walk(script, initialCwd, root, shellHome);
     if (invocations.some((inv) => inv.name === "sleep")) {
       return { verdict: "deny", reason: pollingDenyReason() };
     }
