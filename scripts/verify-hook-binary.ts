@@ -54,6 +54,21 @@ const CASES: Case[] = [
     command: (proj) => `cd "$(cygpath -u '${proj}')" && cat deno.json`,
     expected: "allow",
   },
+  {
+    description: "ls -la && wc -l *.md（清單內 wc 接受裸 glob）",
+    command: () => "ls -la && wc -l *.md",
+    expected: "allow",
+  },
+  {
+    description: "grep -rn --include=*.md . | head（grep 黏寫值 glob）",
+    command: () => 'grep -rn "Nginx 5xx" --include=*.md . | head -40',
+    expected: "allow",
+  },
+  {
+    description: "grep -n 多個 glob 操作元 | head",
+    command: () => 'grep -n "careTreatment\\|WebApi\\|webapi" *.md runtime-behavior/*.md | head -40',
+    expected: "allow",
+  },
 
   // ---- 期望 ask（安全方向） ----
   {
@@ -94,6 +109,31 @@ const CASES: Case[] = [
   {
     description: "cd \"$(echo C:Windows)\" && cat win.ini（求值結果同樣可能長成磁碟相對形態）",
     command: () => `cd "$(echo C:Windows)" && cat win.ini`,
+    expected: "ask",
+  },
+  {
+    description: "cat < *.md（< 目標的 glob 不放寬）",
+    command: () => "cat < *.md",
+    expected: "ask",
+  },
+  {
+    description: "stat *.md（清單外指令含 glob）",
+    command: () => "stat *.md",
+    expected: "ask",
+  },
+  {
+    description: "grep *.md f（glob 在 PATTERN 位置）",
+    command: () => "grep *.md f",
+    expected: "ask",
+  },
+  {
+    description: "ls .*（. 開頭 glob 段在 globskipdots 關閉時會產生 ..）",
+    command: () => "ls .*",
+    expected: "ask",
+  },
+  {
+    description: "grep /outside/secret *（注入 -e 會使 PATTERN 變成檔案）",
+    command: () => "grep /outside/secret *",
     expected: "ask",
   },
 ];

@@ -5,6 +5,7 @@ import { type PathScope } from "../engine/scope.ts";
 import { staticValue } from "../engine/word.ts";
 import type { Word } from "../deps.ts";
 import { type ArgvParse, type CommandSpec, parseArgv } from "./command_spec.ts";
+import { hasGlobstarSegment, mayExpandToOption, parseGlobPath } from "../engine/glob.ts";
 
 export interface FlagGatedReaderOptions {
   names: string[];
@@ -34,6 +35,63 @@ export interface FlagGatedReaderOptions {
    * 誘使實作重掃 argv，正是單一解析契約要避免的。
    */
   cwdIndependentExtraGuard?: (parse: ArgvParse) => boolean;
+  /**
+   * legacy 路徑（未提供 spec 者）中接受合格 glob 路徑操作元的指令名。只有經旗標注入分析確認
+   * 「任何旗標被注入都無害」的固定清單（cat、ls）可列入。
+   */
+  globOperandNames?: string[];
+}
+
+/**
+ * 旗標注入護欄允許旗標 token 使用的字元。排除 `/` `\` `:` `~` 後，被注入旗標吞掉原旗標而使其
+ * 生效時，任何黏寫值（`--file=x`、`-fx`）都只能指向 cwd 內的某個檔名。
+ */
+const SAFE_OPTION_TOKEN = /^[A-Za-z0-9_=.,+-]+$/;
+
+/**
+ * glob 危險根閘門（spec 與 legacy 兩條路徑共用），必須先於任何可能回 ask 的檢查。
+ * 遞迴（明確旗標、被注入的 -r/-R、或 globstar）時，glob 可能選中磁碟根 / 家目錄根 → 硬 deny；
+ * 有注入風險時，其餘 argv 指向危險根者也 deny（注入的遞迴旗標會作用在它們身上）。
+ * 不受任何讀取範圍放寬影響，以維持「遞迴遍歷磁碟根/家目錄根 = 硬 deny」。
+ * globstar word 不論落在哪個參數角色（PATTERN、被吃掉的旗標值等）都要檢查：`shopt -s globstar`
+ * 下 bash 會在指令解讀參數之前就展開該 token，遞迴遍歷的發生與參數角色無關。
+ */
+export function globRootGate(ctx: RuleContext, globWords: Word[], isRecursive: boolean): RuleVerdict | null {
+  for (const w of ctx.argv) {
+    if (hasGlobstarSegment(w) && parseGlobPath(w) !== null && (ctx.globMaySelectDangerousRoot?.(w) ?? true)) {
+      return deny(recursiveRootDenyReason(ctx.name, w.value));
+    }
+  }
+  if (globWords.length === 0) return null;
+  const injectable = globWords.some(mayExpandToOption);
+  const globstar = globWords.some(hasGlobstarSegment);
+  if (!(isRecursive || injectable || globstar)) return null;
+  for (const w of globWords) {
+    if (ctx.globMaySelectDangerousRoot?.(w) ?? true) return deny(recursiveRootDenyReason(ctx.name, w.value));
+  }
+  if (injectable) {
+    for (const w of ctx.argv) {
+      if (!globWords.includes(w) && ctx.isDangerousRoot(w)) return deny(recursiveRootDenyReason(ctx.name, w.value));
+    }
+  }
+  return null;
+}
+
+/**
+ * 旗標注入護欄（spec 與 legacy 兩條路徑共用）。有「可能展開成旗標」的 glob 時，被注入的旗標可改變
+ * 任何其他 token 的解讀（PATTERN 變檔案、`--` 使旗標變檔案、吃值旗標吞掉下一 token），故其餘每個
+ * token 都必須能當成路徑且落在範圍內；以 `-` 開頭者另須只含安全字元。
+ */
+export function injectionGuard(ctx: RuleContext, globWords: Word[]): RuleVerdict | null {
+  if (!globWords.some(mayExpandToOption)) return null;
+  for (const w of ctx.argv) {
+    if (globWords.includes(w)) continue;
+    const reason = `${ctx.name}：glob 可能展開成旗標，${w.value} 可能被當成檔案讀取且超出範圍`;
+    if (ctx.resolvePath(w) !== "in-project") return ask(reason);
+    const t = staticValue(w);
+    if (t !== null && t.startsWith("-") && !SAFE_OPTION_TOKEN.test(t)) return ask(reason);
+  }
+  return null;
 }
 
 /** spec 驅動的判定；與 cwdIndependent 共用 parseArgv 的同一份快取結果。 */
@@ -46,6 +104,8 @@ function evaluateWithSpec(ctx: RuleContext, spec: CommandSpec): RuleVerdict {
       if (ctx.isDangerousRoot(w)) return deny(recursiveRootDenyReason(ctx.name, w.value));
     }
   }
+  const gate = globRootGate(ctx, p.globOperands, p.isRecursive);
+  if (gate) return gate;
   if (p.dynamic) return ask(`${ctx.name}：含動態 token，無法靜態判定`);
   if (p.unknownFlag !== null) {
     return ask(`${ctx.name}：未列入安全集合的旗標 ${p.unknownFlag}`);
@@ -60,7 +120,12 @@ function evaluateWithSpec(ctx: RuleContext, spec: CommandSpec): RuleVerdict {
       return ask(`${ctx.name}：路徑超出專案範圍或無法靜態解析（${arg.value}）`);
     }
   }
-  return allow();
+  for (const arg of p.globOperands) {
+    if ((ctx.resolveGlobPath?.(arg) ?? "dynamic") !== "in-project") {
+      return ask(`${ctx.name}：glob 路徑超出專案範圍或無法靜態解析（${arg.value}）`);
+    }
+  }
+  return injectionGuard(ctx, p.globOperands) ?? allow();
 }
 
 /**
@@ -120,15 +185,23 @@ export function flagGatedReader(opts: FlagGatedReaderOptions): CommandRule {
           }
         }
       }
+      const pos = positionals(ctx.argv, valueFlags);
+      const globWords = (opts.globOperandNames ?? []).includes(ctx.name)
+        ? pos.filter((w) => parseGlobPath(w) !== null)
+        : [];
+      const gate = globRootGate(ctx, globWords, isRecursive);
+      if (gate) return gate;
       const pathFlagVerdict = checkPathValueFlags(ctx, opts.pathValueFlags ?? []);
       if (pathFlagVerdict) return pathFlagVerdict;
-      for (const arg of positionals(ctx.argv, valueFlags)) {
-        const scope = ctx.resolvePath(arg);
+      for (const arg of pos) {
+        const scope = globWords.includes(arg)
+          ? (ctx.resolveGlobPath?.(arg) ?? "dynamic")
+          : ctx.resolvePath(arg);
         if (scope !== "in-project") {
           return ask(`${ctx.name}：路徑超出專案範圍或無法靜態解析（${arg.value}）`);
         }
       }
-      return allow();
+      return injectionGuard(ctx, globWords) ?? allow();
     },
     cwdIndependent: opts.cwdIndependentWhenNoPaths
       ? (ctx: RuleContext) => {
@@ -138,7 +211,7 @@ export function flagGatedReader(opts: FlagGatedReaderOptions): CommandRule {
         const p = parseArgv(ctx, spec); // 與 evaluate 同一份快取結果
         if (opts.cwdIndependentExtraGuard && !opts.cwdIndependentExtraGuard(p)) return false;
         return !p.isRecursive && !p.dynamic && p.unknownFlag === null &&
-          p.pathOperands.length === 0 && p.pathValues.length === 0;
+          p.pathOperands.length === 0 && p.pathValues.length === 0 && p.globOperands.length === 0;
       }
       : undefined,
   };

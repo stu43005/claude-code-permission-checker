@@ -1,6 +1,7 @@
 import type { Word } from "../deps.ts";
 import type { RuleContext } from "./types.ts";
 import { staticValue } from "../engine/word.ts";
+import { isGlobAttachedValue, parseGlobPath } from "../engine/glob.ts";
 
 /**
  * 旗標吃值的方式：
@@ -18,6 +19,11 @@ export interface FlagSpec {
   value: FlagValueKind;
   /** 該值是否為會被讀取的路徑（需做範圍檢查）。僅對 "required" 有意義。 */
   valueIsPath?: boolean;
+  /**
+   * 黏寫值（`--opt=<glob>`）是否容許含 glob 字元。僅適用於值**不是路徑**的 "required" 長旗標
+   * （grep 的 --include / --exclude）。形態由 glob.ts 的 isGlobAttachedValue 判定（單段、無反斜線）。
+   */
+  valueAcceptsGlob?: boolean;
 }
 
 /**
@@ -53,11 +59,18 @@ export interface CommandSpec {
    * 「靠旗標值才成立」的遞迴形式也能正確判定。
    */
   recursive?: (name: string, seenFlags: SeenFlags) => boolean;
+  /**
+   * opt-in：接受合格的 glob 路徑操作元（glob.ts 的 parseGlobPath）。只有經旗標注入分析確認
+   * 「任何旗標被注入都無害」的固定清單（grep/egrep/fgrep、head、wc）可開啟。
+   */
+  globOperands?: boolean;
 }
 
 export interface ArgvParse {
   /** 需做 resolvePath 的位置參數。 */
   pathOperands: Word[];
+  /** 合格的 glob 路徑操作元（需走 resolveGlobPath）；不含於 pathOperands。 */
+  globOperands: Word[];
   /** 非路徑的位置參數（pattern 等）。 */
   nonPathOperands: Word[];
   /** 吃路徑值的旗標所帶的值，需做 resolvePathValue。 */
@@ -105,10 +118,27 @@ function doParse(ctx: RuleContext, spec: CommandSpec): ArgvParse {
   let unknownFlag: string | null = null;
   let dynamic = false;
   let optionsDone = false;
+  const globs = new Set<Word>();
 
   for (let i = 0; i < argv.length; i++) {
     const t = staticValue(argv[i]);
-    if (t === null) { dynamic = true; continue; }
+    if (t === null) {
+      const w = argv[i];
+      // `--include=*.md`：值不是路徑、且 glob 只會展開成同一旗標的不同值 → 記為該旗標，不標 dynamic
+      if (!optionsDone) {
+        const globFlag = spec.flags.find((s) =>
+          s.value === "required" && s.valueAcceptsGlob === true && isGlobAttachedValue(w, s.name)
+        );
+        if (globFlag) { see(globFlag.name, null); continue; }
+      }
+      if (spec.globOperands && parseGlobPath(w) !== null) {
+        positional.push(w);
+        globs.add(w);
+        continue;
+      }
+      dynamic = true;
+      continue;
+    }
 
     if (optionsDone || !t.startsWith("-") || t === "-") { positional.push(argv[i]); continue; }
     if (t === "--") { optionsDone = true; continue; }
@@ -191,8 +221,14 @@ function doParse(ctx: RuleContext, spec: CommandSpec): ArgvParse {
     pathOperands = positional.slice(1);
   }
 
+  // glob 落在非路徑位置（grep 的 PATTERN）→ 展開結果會改變 PATTERN / FILE 分界，無法靜態判定
+  if (nonPathOperands.some((w) => globs.has(w))) dynamic = true;
+  const globOperands = pathOperands.filter((w) => globs.has(w));
+  pathOperands = pathOperands.filter((w) => !globs.has(w));
+
   return {
     pathOperands,
+    globOperands,
     nonPathOperands,
     pathValues,
     unknownFlag,

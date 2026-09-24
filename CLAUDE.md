@@ -8,6 +8,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 解析 Bash 指令，只在「純唯讀且全部落在當前專案內」時回 `allow`，其餘回 `ask`。**對以下四類情形回 `deny`（硬性、不可由 `permissions.allow` 解除）：① 遞迴遍歷磁碟根/家目錄根的唯讀指令；② 整鏈 print-only 偽裝（echo/printf/heredoc 靜態輸出，或跨載具純靜態輸出如 `node -e 'console.log("x")'`，未讀檔/未計算）；③ sleep 輪詢等待；④ 名稱重定義（shell 函式定義、`alias` 類）。其餘一律維持 `allow` / `ask`、不回 `deny`。**
 從 stdin 收 hook JSON、往 stdout 寫 decision JSON、**永遠 `exit 0`**。
 
+glob 支援限於**固定清單**：`grep`/`egrep`/`fgrep`、`head`、`wc`、`cat`、`ls`。合格的 glob 路徑操作元（`*.md`、`runtime-behavior/*.md`、`src/**/*.ts`）與 grep 的黏寫值 glob（`--include=*.md`）在能以純詞法確認展開結果落在讀取範圍內時 `allow`；清單外指令、`<` 重導向目標、不合格形態一律維持 `ask`。
+
 此外，會在 runtime 讀取使用者的 `permissions.allow`：對**可升級 ask**（未列入 allowlist、或指令規則自身的
 ask）——已被使用者在 settings.json 明確放行（且未被 `deny`/`ask` 命中）者，升級為 `allow`；**四條中央前置
 安全 ask**（cwd 超範圍／寫入重導向／賦值前綴／範圍外 `<`）對所有指令通用且**不可升級**（見「hook 決策 vs
@@ -110,6 +112,19 @@ parse.ts (unbash) → walk.ts → 閘① sleep → 閘② 名稱重定義 → no
   結構判斷 `~` 是否會被 bash 展開（引號會抑制展開、且要看到 tilde-prefix 結束為止，不能只看
   `parts[0]`）；`expandTilde(value, shellHome)` 只展開 `~`/`~/<rest>` 兩種形態，`~user`/`~+`/`~-`
   與 shellHome 未知一律回 `null`（fail-closed，呼叫端視為不可解析）。
+- **`glob.ts`** glob 路徑操作元的純詞法形態判定：`parseGlobPath(word)` 只接受完全未加引號、無反斜線、
+  不以 `-`/`~` 開頭、非磁碟相對的 word，且 (a) 開頭即 glob 元字元者（`mayExpandToOption`）必須是單段、
+  (b) 第一個 glob 段起不得有字面 `..`、含 glob 字元的段不得以 `.` 或 `[` 開頭；回傳字面前綴。
+  `isGlobAttachedValue(word, flag)` 判定 `--flag=<glob>`（單段、無反斜線）；`hasGlobstarSegment` 偵測 `**` 段。
+  `scope.ts` 的 `resolveGlobPath` 判定前綴目錄是否被**以目錄形式**涵蓋（專案根 / allow root / trusted root；
+  精確單檔的 allow 不算；外部前綴之下有 deny/ask 條目即否決），`globMaySelectDangerousRoot` 判定前綴是否為
+  危險根或家目錄的祖先。`resolvePath` 不處理 glob（`<` 目標等仍 ask）。
+  規則端以 `CommandSpec.globOperands` / `FlagSpec.valueAcceptsGlob`（grep/head/wc）或
+  `FlagGatedReaderOptions.globOperandNames`（cat/ls）opt-in；兩條路徑共用 `factory.ts` 的
+  `globRootGate`（遞迴、有注入風險或含 `**` 時，glob 可能選中危險根即硬 deny，先於任何 ask）與
+  `injectionGuard`（有 `mayExpandToOption` 的 glob 時，其餘每個 token 都須能當成路徑落在範圍內，
+  以 `-` 開頭者另須只含 `[A-Za-z0-9_=.,+-]`）。`RuleContext.resolveGlobPath` / `globMaySelectDangerousRoot`
+  為選填（測試字面量不必提供），缺席時分別視同 `dynamic` / `true`（fail-closed）。
 - **`subst_eval.ts`** command substitution `$(…)` 的靜態求值框架，由 `cwd.ts` 的 `applyCd`
   呼叫以推導 cwd；`resolvePath` 不使用此框架。純函式、不碰檔案系統：已知求值器涵蓋
   `dirname`/`basename`/`pwd`/`echo`/`printf`/`cygpath`，任何「結果可能取決於檔案系統狀態、
@@ -187,7 +202,7 @@ parse.ts (unbash) → walk.ts → 閘① sleep → 閘② 名稱重定義 → no
 ## 核心不變量（改動時不可違反）
 
 - **default-deny**：未明確判定為安全唯讀的一律 ask。新增指令規則時，未涵蓋的形式必須 fallback 到 ask。
-- **deny 四類**：① 遞迴遍歷磁碟根/家目錄根（find/tree/ls -R/grep -r/rg）；② 整鏈 print-only 偽裝＋跨載具（evaluate 閘③）；③ sleep 輪詢等待（evaluate 閘①）；④ 名稱重定義（shell 函式定義、alias 類，evaluate 閘②）。閘①②③ 皆在 `classify` 前短路、不過 `settingsAllows`，不可由 `permissions.allow` 解除；其中閘②③ 亦不可由 `permissions.allow` 升級。verdict 三態優先序 `deny > ask > allow`。**永遠 `exit 0`**；任何例外都 try/catch 成 ask（fail-safe）。
+- **deny 四類**：① 遞迴遍歷磁碟根/家目錄根（find/tree/ls -R（含 `-lR` 等群集）/grep -r/rg，以及清單內指令的 glob 經 `globRootGate` 判定可能遞迴選中危險根者）；② 整鏈 print-only 偽裝＋跨載具（evaluate 閘③）；③ sleep 輪詢等待（evaluate 閘①）；④ 名稱重定義（shell 函式定義、alias 類，evaluate 閘②）。閘①②③ 皆在 `classify` 前短路、不過 `settingsAllows`，不可由 `permissions.allow` 解除；其中閘②③ 亦不可由 `permissions.allow` 升級。verdict 三態優先序 `deny > ask > allow`。**永遠 `exit 0`**；任何例外都 try/catch 成 ask（fail-safe）。
 - **deny 為硬性**：`classify` 對 builtin `deny` 短路，**不經** `permissions.allow` 升級層（升級層只把 `ask`
   變 `allow`，永遠碰不到 `deny`）。`classify` 先評估指令規則：其硬 deny 優先於任何中央前置 ask。能越過
   中央前置的只有兩種情形：rule deny，以及規則宣告 `cwdIndependent` 且五道護欄全部成立時的**規則一**。
@@ -270,6 +285,18 @@ parse.ts (unbash) → walk.ts → 閘① sleep → 閘② 名稱重定義 → no
   `redirect.body` 為**結構化 Word**（其 `CommandExpansion.script` 為完整解析的內層指令），
   `walk.ts` 須遞迴列舉其內含指令。加引號分隔符（`<<'EOF'`）時展開被抑制，`redirect.body` 為 `undefined`，無需處理。
 
+### 第三方行為：bash pathname expansion（GNU bash 5.3.9 實測，禁止憑印象）
+
+- 預設 shopt：`extglob`/`globstar`/`dotglob`/`nullglob`/`failglob` 皆 off，`globskipdots` on。
+- **`shopt -u globskipdots` 時以字面 `.` 開頭的 glob 段會產生 `..`**：`.*` → `. .. .h`、`sub/.*` → `sub/..`、
+  `.[.]` → `..`。不以 `.` 開頭的段（`??`、`[.]*`、`*`）在 dotglob / globskipdots 任一組合下皆不產生 `.`/`..`。
+- **glob 段之後的字面 `..` 原樣保留**：`sub*/../x` → `subdir/../x`，逃出字面前綴。
+- `*` `?` `[...]` 皆不匹配 `/`；globstar 未開時 `**` 等同 `*`，開啟時只在字面前綴之下遞迴。
+- 無匹配：預設保留字面、`nullglob` 移除該 word、`failglob` 報錯並中止整段 script。
+- **旗標形 word 也會展開**：`--include=*.md` 會匹配 cwd 內名為 `--include=x.md` 的檔案（結果仍以 `--include=` 開頭）。
+- **檔名注入旗標**：cwd 有名為 `--x` 的檔案時 `cat *` 會把它當旗標（`cat: unknown option`）。本工具的旗標解析器
+  看不到被注入的旗標，這正是 glob 支援限於固定清單、且需要 `injectionGuard` 的原因。
+
 ### 安全誤放（auto-allow 不該 allow）——這些是 review 實際抓到的
 
 - **git / gh 全域選項是攻擊面**：別用 denylist 逐一擋。`git.ts` 已改為**安全 allowlist**——子指令前
@@ -334,6 +361,21 @@ parse.ts (unbash) → walk.ts → 閘① sleep → 閘② 名稱重定義 → no
   指令共用，否則會讓 checksum 工具的路徑操作元被當成 `-w` 的值吃掉而漏檢（`md5sum -c -w
   /outside/checksums` 這類形態）。`base64.ts` 因此刻意獨立於 `fileReaderRule`，不與 `md5sum`/
   `sha256sum` 共用同一份 `valueFlags`。
+- **glob 支援的清單是固定的，不可擴增**：被注入的旗標不在本工具的解析結果裡，逐指令擴增等同對 GNU
+  全旗標集做 denylist。清單成員的注入分析：cat/ls（coreutils 8.32 對照 `src/cat.c`、`src/ls.c` 的
+  `long_options[]`）與 head 所有旗標皆無寫檔、exec、讀取操作元以外檔案的副作用；grep 無寫檔 / exec 旗標，
+  但注入 `-e`/`-f`/`--` 會翻轉位置參數分類（由 `injectionGuard` 處理）；wc 的 `--files0-from=<cwd 內檔名>`
+  可讀出該檔所列任意路徑的**計數與檔名**。這是已接受的限制：攻擊者須先在專案內植入兩個特製檔名的檔案，
+  且只洩漏計數與檔名、不洩漏內容。
+- **注入會翻轉任何 token 的解讀**：cwd 有 `-e^` 檔時 `grep /outside/secret *` 會讀出 `/outside/secret` 內容；
+  注入 `--` 使 `--label=/../../secret` 變成檔案；注入吃值旗標吞掉原本的 `-e`，使其值 `--file=/outside/secret`
+  生效。故 `injectionGuard` 不區分 token 種類、全部當路徑檢查，並限制旗標 token 的字元集。
+- **多段 glob 的注入值會帶 `/`**：專案內有名為 `-f` 的目錄時 `*/outside/secret` 展開成 `-f/outside/secret`。
+  故開頭即 glob 元字元者必須單段；黏寫值 glob 亦必須單段（`--include=*/../../../**` 會遍歷 cwd 之外）。
+- **glob 可繞過遞迴危險根 deny**：注入的 `-r`/`-R`（`grep x ?r ~`）、glob 選中家目錄（`grep -r x /home/m?`）、
+  globstar（`cat /home/me/**/*.md`）。`globRootGate` 須先於任何 ask，且不受 `Read()` 放寬影響。
+  ls 的遞迴偵測須認得群集寫法（`-lR`），否則閘門失效——這也使明寫的 `ls -lR ~` 從 allow 收緊為 deny。
+- **精確單檔的 `Read()` allow 不可當成 glob 前綴目錄的授權**：`Read(//outside/data)` 只授權該路徑本身。
 
 ### hook 決策 vs settings.json 權限的優先序（重要）
 

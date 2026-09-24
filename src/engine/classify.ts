@@ -2,7 +2,7 @@ import type { CommandInvocation } from "../types.ts";
 import type { RuleContext, RuleVerdict } from "../rules/types.ts";
 import { allow, ask } from "../rules/types.ts";
 import { lookupRule } from "../rules/allowlist.ts";
-import { buildScopeConfig, dangerousRoot, isReadScoped, normalizeAbsolute, resolvePath, resolvePathValue, type ScopeConfig } from "./scope.ts";
+import { buildScopeConfig, dangerousRoot, globMaySelectDangerousRoot, isReadScoped, normalizeAbsolute, resolveGlobPath, resolvePath, resolvePathValue, type ScopeConfig } from "./scope.ts";
 import { hasWriteRedirect } from "./redirect.ts";
 import { settingsAllows } from "../permissions/matcher.ts";
 import { EMPTY_RULES, type PermissionRules } from "../permissions/settings.ts";
@@ -92,6 +92,8 @@ export function classify(
     resolvePathValue: (v) => resolvePathValue(v, inv.cwd, scope),
     resolveUrl: (v) => resolveUrl(v, rules.webFetch),
     isDangerousRoot: (w) => dangerousRoot(w, inv.cwd, scope.home),
+    resolveGlobPath: (w) => resolveGlobPath(w, inv.cwd, scope),
+    globMaySelectDangerousRoot: (w) => globMaySelectDangerousRoot(w, inv.cwd, scope.home),
   };
   const ruleVerdict: RuleVerdict | null = rule ? rule.evaluate(ctx) : null;
   if (ruleVerdict?.kind === "deny") return ruleVerdict;

@@ -34,7 +34,8 @@ const cases: Array<{ cmd: string; want: Verdict; cwd?: CwdState; note: string }>
   // 動態
   { cmd: "cat $FILE", want: "ask", note: "dynamic path" },
   { cmd: "cat $(ls)", want: "ask", note: "command substitution arg" },
-  { cmd: "cat *.txt", want: "ask", note: "glob" },
+  { cmd: "stat *.txt", want: "ask", note: "glob on command outside the fixed glob list" },
+  { cmd: "cat *.txt", want: "allow", note: "glob on fixed-list command, prefix in project" },
   { cmd: "cd $X && cat f", want: "ask", note: "unknown cwd then relative" },
   // 組合
   { cmd: "cat a | tee b", want: "ask", note: "pipe with non-allowed tee" },
