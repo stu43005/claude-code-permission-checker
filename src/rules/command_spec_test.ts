@@ -187,3 +187,46 @@ Deno.test("a short attached-only flag takes its =value and stops the cluster", (
   assertEquals(bare.seenFlags.get("-c"), [null]);
   assertEquals(bare.pathOperands.map((w) => w.value), ["pat", "a.txt"]);
 });
+
+const GLOB_SPEC: CommandSpec = {
+  flags: [
+    { name: "-e", value: "required" },
+    { name: "--include", value: "required", valueAcceptsGlob: true },
+    { name: "--file", value: "required", valueIsPath: true },
+  ],
+  positionals: (seen) => (seen.has("-e") ? "paths" : "pattern-then-paths"),
+  globOperands: true,
+};
+
+Deno.test("parseArgv: glob 路徑操作元收進 globOperands、不標 dynamic", () => {
+  const p = parseArgv(ctxOf("demo", "demo x *.md sub/*.md a.txt"), GLOB_SPEC);
+  assertEquals(p.dynamic, false);
+  assertEquals(p.globOperands.map((w) => w.value), ["*.md", "sub/*.md"]);
+  assertEquals(p.pathOperands.map((w) => w.value), ["a.txt"]);
+  assertEquals(p.nonPathOperands.map((w) => w.value), ["x"]);
+});
+
+Deno.test("parseArgv: glob 落在 PATTERN 位置或作為獨立 token 旗標值 → dynamic", () => {
+  assertEquals(parseArgv(ctxOf("demo", "demo *.md a.txt"), GLOB_SPEC).dynamic, true);
+  assertEquals(parseArgv(ctxOf("demo", "demo -e *.md a.txt"), GLOB_SPEC).dynamic, true);
+});
+
+Deno.test("parseArgv: 黏寫 glob 值只對 valueAcceptsGlob 旗標成立", () => {
+  const ok = parseArgv(ctxOf("demo", "demo --include=*.md x ."), GLOB_SPEC);
+  assertEquals(ok.dynamic, false);
+  assertEquals(ok.seenFlags.has("--include"), true);
+  assertEquals(ok.globOperands.length, 0);
+  assertEquals(parseArgv(ctxOf("demo", "demo --file=*.x x ."), GLOB_SPEC).dynamic, true);
+  assertEquals(parseArgv(ctxOf("demo", "demo --include=*/../x x ."), GLOB_SPEC).dynamic, true);
+});
+
+Deno.test("parseArgv: 不合格的 glob 形態仍為 dynamic", () => {
+  assertEquals(parseArgv(ctxOf("demo", "demo -e x .*"), GLOB_SPEC).dynamic, true);
+  assertEquals(parseArgv(ctxOf("demo", "demo -e x */y"), GLOB_SPEC).dynamic, true);
+});
+
+Deno.test("parseArgv: 未開 globOperands 的 spec，glob 維持 dynamic", () => {
+  const p = parseArgv(ctxOf("demo", "demo -b *.md"), DEMO);
+  assertEquals(p.dynamic, true);
+  assertEquals(p.globOperands.length, 0);
+});
