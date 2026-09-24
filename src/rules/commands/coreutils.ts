@@ -14,6 +14,7 @@ const HEAD_SPEC: CommandSpec = {
   ],
   positionals: "paths",
   numericShorthand: true, // head -100
+  globOperands: true, // 固定清單成員：旗標被 glob 注入也無害
 };
 
 const WC_SPEC: CommandSpec = {
@@ -23,6 +24,7 @@ const WC_SPEC: CommandSpec = {
     { name: "--files0-from", value: "required", valueIsPath: true },
   ],
   positionals: "paths",
+  globOperands: true, // 固定清單成員；注入 --files0-from 的殘留風險為已接受限制
 };
 
 const SPECS: Record<string, CommandSpec> = { head: HEAD_SPEC, wc: WC_SPEC };

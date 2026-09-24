@@ -40,11 +40,17 @@ const NON_PATH_VALUE = [
   "-e", "--regexp", "--include", "--exclude", "--devices",
 ];
 const PATH_VALUE = ["-f", "--file", "--exclude-from"];
+/** 值是 grep 自己的檔名 glob（不是路徑）；黏寫形態 `--include=*.md` 可容許 shell glob 字元。 */
+const GLOB_VALUE = new Set(["--include", "--exclude"]);
 
 const flags: FlagSpec[] = [
   ...NO_VALUE.map((name): FlagSpec => ({ name, value: "none" })),
   ...ATTACHED_ONLY.map((name): FlagSpec => ({ name, value: "attached-only" })),
-  ...NON_PATH_VALUE.map((name): FlagSpec => ({ name, value: "required" })),
+  ...NON_PATH_VALUE.map((name): FlagSpec => ({
+    name,
+    value: "required",
+    ...(GLOB_VALUE.has(name) ? { valueAcceptsGlob: true } : {}),
+  })),
   ...PATH_VALUE.map((name): FlagSpec => ({ name, value: "required", valueIsPath: true })),
 ];
 
@@ -87,6 +93,7 @@ function specFor(_name: string, argv: Word[]): CommandSpec {
     flags,
     positionals: positionalsFor,
     recursive: (name, seen) => recursiveFor(name, seen, argv),
+    globOperands: true,
   };
 }
 

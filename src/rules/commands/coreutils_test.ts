@@ -3,7 +3,15 @@ import { parse } from "../../deps.ts";
 import type { Command } from "../../deps.ts";
 import { cdRule, diffRule, fileReaderRule, pureUtilRule } from "./coreutils.ts";
 import type { RuleContext } from "../types.ts";
-import { dangerousRoot, resolvePath, resolvePathValue, rootScope } from "../../engine/scope.ts";
+import {
+  dangerousRoot,
+  globMaySelectDangerousRoot,
+  resolveGlobPath,
+  resolvePath,
+  resolvePathValue,
+  rootScope,
+  type ScopeConfig,
+} from "../../engine/scope.ts";
 import type { CwdState } from "../../types.ts";
 
 function ctxOf(src: string, cwd: CwdState = { kind: "known", path: "/proj" }): RuleContext {
@@ -18,6 +26,34 @@ function ctxOf(src: string, cwd: CwdState = { kind: "known", path: "/proj" }): R
     resolvePathValue: (v) => resolvePathValue(v, cwd, rootScope("/proj")),
     resolveUrl: () => "not-allowed",
     isDangerousRoot: (w) => dangerousRoot(w, cwd, null),
+  };
+}
+
+const HOME = "/home/me";
+const HOME_OPEN: ScopeConfig = { ...rootScope("/proj"), home: HOME, allow: { roots: [HOME], files: [] } };
+const ROOT_OPEN: ScopeConfig = { ...rootScope("/proj"), home: HOME, allow: { roots: ["/"], files: [] } };
+
+/** 可指定 cwd / home / scope，並綁定 glob 相關方法的 RuleContext。 */
+function envCtx(
+  src: string,
+  env: { cwd?: string; home?: string | null; scope?: ScopeConfig } = {},
+): RuleContext {
+  const cmd = parse(src).commands[0].command as Command;
+  const cwd: CwdState = { kind: "known", path: env.cwd ?? "/proj" };
+  const home = env.home === undefined ? HOME : env.home;
+  const scope = env.scope ?? { ...rootScope("/proj"), home };
+  return {
+    name: cmd.name!.value,
+    argv: cmd.suffix,
+    redirects: cmd.redirects,
+    assignments: cmd.prefix,
+    cwd,
+    resolvePath: (w) => resolvePath(w, cwd, scope),
+    resolvePathValue: (v) => resolvePathValue(v, cwd, scope),
+    resolveUrl: () => "not-allowed",
+    isDangerousRoot: (w) => dangerousRoot(w, cwd, home),
+    resolveGlobPath: (w) => resolveGlobPath(w, cwd, scope),
+    globMaySelectDangerousRoot: (w) => globMaySelectDangerousRoot(w, cwd, home),
   };
 }
 
@@ -149,4 +185,28 @@ Deno.test("head / wc declare cwd-independence only with no operands", () => {
   assertEquals(fileReaderRule.cwdIndependent!(ctxOf("cat")), false);
   assertEquals(fileReaderRule.cwdIndependent!(ctxOf("ls")), false);
   assertEquals(fileReaderRule.cwdIndependent!(ctxOf("tr a b")), false);
+});
+
+Deno.test("head / wc glob: allow", () => {
+  for (const src of ["wc -l *.md", "head *.md", "head -n 5 src/*.ts", "wc -l runtime-behavior/*.md"]) {
+    assertEquals(fileReaderRule.evaluate(envCtx(src)).kind, "allow", src);
+  }
+});
+
+Deno.test("head / wc glob: ask", () => {
+  for (
+    const src of [
+      "wc --files0-from=*.x", // 吃路徑值的旗標，黏寫 glob 不容許
+      "head *.md -n /outside/x", // 注入護欄：-n 的值可能被推成檔案
+      "head ../*.md",
+    ]
+  ) {
+    assertEquals(fileReaderRule.evaluate(envCtx(src)).kind, "ask", src);
+  }
+});
+
+Deno.test("head glob: globstar 選中危險根 → deny", () => {
+  for (const scope of [undefined, HOME_OPEN, ROOT_OPEN]) {
+    assertEquals(fileReaderRule.evaluate(envCtx("head /**/*.md", { scope })).kind, "deny");
+  }
 });

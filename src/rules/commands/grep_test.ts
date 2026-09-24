@@ -3,7 +3,16 @@ import { parse } from "../../deps.ts";
 import type { Command } from "../../deps.ts";
 import { grepRule, rgRule } from "./grep.ts";
 import type { RuleContext } from "../types.ts";
-import { dangerousRoot, resolvePath, resolvePathValue, rootScope } from "../../engine/scope.ts";
+import {
+  dangerousRoot,
+  globMaySelectDangerousRoot,
+  resolveGlobPath,
+  resolvePath,
+  resolvePathValue,
+  rootScope,
+  type ScopeConfig,
+} from "../../engine/scope.ts";
+import type { CwdState } from "../../types.ts";
 
 function ctxOf(name: string, src: string): RuleContext {
   const cmd = parse(src).commands[0].command as Command;
@@ -141,4 +150,116 @@ Deno.test("the pattern flag is detected from the same parse, not a separate scan
     grepRule.evaluate(ctxOf("grep", "grep --label -- -e pat /etc/passwd")).kind,
     "ask",
   );
+});
+
+const HOME = "/home/me";
+/** 家目錄被 Read(~/**) 放行 / 磁碟根被 Read(//**) 放行的設定：危險根 deny 不得受其影響。 */
+const HOME_OPEN: ScopeConfig = { ...rootScope("/proj"), home: HOME, allow: { roots: [HOME], files: [] } };
+const ROOT_OPEN: ScopeConfig = { ...rootScope("/proj"), home: HOME, allow: { roots: ["/"], files: [] } };
+
+/** 可指定 cwd / home / scope，並綁定 glob 相關方法的 RuleContext。 */
+function envCtx(
+  name: string,
+  src: string,
+  env: { cwd?: string; home?: string | null; scope?: ScopeConfig } = {},
+): RuleContext {
+  const cmd = parse(src).commands[0].command as Command;
+  const cwd: CwdState = { kind: "known", path: env.cwd ?? "/proj" };
+  const home = env.home === undefined ? HOME : env.home;
+  const scope = env.scope ?? { ...rootScope("/proj"), home };
+  return {
+    name,
+    argv: cmd.suffix,
+    redirects: cmd.redirects,
+    assignments: cmd.prefix,
+    cwd,
+    resolvePath: (w) => resolvePath(w, cwd, scope),
+    resolvePathValue: (v) => resolvePathValue(v, cwd, scope),
+    resolveUrl: () => "not-allowed",
+    isDangerousRoot: (w) => dangerousRoot(w, cwd, home),
+    resolveGlobPath: (w) => resolveGlobPath(w, cwd, scope),
+    globMaySelectDangerousRoot: (w) => globMaySelectDangerousRoot(w, cwd, home),
+  };
+}
+
+Deno.test("grep glob: allow", () => {
+  for (
+    const src of [
+      "grep -n x *.md sub/*.md",
+      "grep -rn x --include=*.md .",
+      'grep -rn "Nginx 5xx" --include=*.md .',
+      'grep -n "careTreatment\\|WebApi\\|webapi" *.md runtime-behavior/*.md',
+      'grep "a\\|b" *.md',
+      "grep -m 5 x *.md",
+      "grep -rn x *.md",
+      "grep /outside/secret ./*.md", // 有字面前綴、不會注入 → 不套用注入護欄
+    ]
+  ) {
+    assertEquals(grepRule.evaluate(envCtx("grep", src)).kind, "allow", src);
+  }
+});
+
+Deno.test("grep glob: ask", () => {
+  for (
+    const src of [
+      "grep *.md f", // glob 在 PATTERN 位置
+      "grep -e *.md f", // glob 作為獨立 token 旗標值
+      "grep -f *.x f",
+      "grep x ../*.md", // 前綴在範圍外
+      "grep x /home/m?/a.md", // 非遞迴、無注入 → 不觸發危險根閘門，依一般範圍判定
+      // 注入護欄
+      "grep /outside/secret *.md",
+      "grep *.md -e /outside",
+      "grep -e . ?? --label=/../../secret",
+      "grep /outside/secret -- *.md", // 護欄不看 --
+      "grep -n x *.md --include=*.md", // 裸 glob + 非靜態旗標值
+      "grep ?e -e --file=/outside/secret ./safe.txt",
+      "grep ?e -e -f/outside/secret ./safe.txt",
+      "grep ?e -e --file=C:secret ./safe.txt",
+    ]
+  ) {
+    assertEquals(grepRule.evaluate(envCtx("grep", src)).kind, "ask", src);
+  }
+});
+
+Deno.test("grep glob: 危險根 deny（不受讀取放寬影響、不被 ask 搶先）", () => {
+  for (const scope of [undefined, HOME_OPEN, ROOT_OPEN]) {
+    for (
+      const src of [
+        "grep x ?r ~", // 注入 -r
+        "grep -r x /home/m?",
+        "grep -r x /*",
+        "grep x /home/me/**/*.md", // globstar 視為遞迴
+      ]
+    ) {
+      assertEquals(grepRule.evaluate(envCtx("grep", src, { scope })).kind, "deny", src);
+    }
+    assertEquals(grepRule.evaluate(envCtx("grep", "grep -r x m?", { cwd: "/home", scope })).kind, "deny");
+  }
+});
+
+Deno.test("grep glob: 磁碟根 glob → deny（含 Read(//C:/**) 放行時）", () => {
+  const DRIVE_OPEN: ScopeConfig = { ...rootScope("D:/proj"), home: HOME, allow: { roots: ["C:/"], files: [] } };
+  for (const scope of [rootScope("D:/proj"), DRIVE_OPEN]) {
+    for (const src of ["grep -r x C:/*", "grep x C:/**/*.md"]) {
+      assertEquals(grepRule.evaluate(envCtx("grep", src, { cwd: "D:/proj", scope })).kind, "deny", src);
+    }
+  }
+});
+
+Deno.test({
+  name: "grep glob: Windows 上 /c/* → deny（含 Read(//C:/**) 放行時）",
+  ignore: Deno.build.os !== "windows",
+  fn() {
+    const DRIVE_OPEN: ScopeConfig = { ...rootScope("D:/proj"), home: HOME, allow: { roots: ["C:/"], files: [] } };
+    for (const scope of [rootScope("D:/proj"), DRIVE_OPEN]) {
+      for (const src of ["grep -r x /c/*", "grep x /c/**/*.md"]) {
+        assertEquals(grepRule.evaluate(envCtx("grep", src, { cwd: "D:/proj", scope })).kind, "deny", src);
+      }
+    }
+  },
+});
+
+Deno.test("grep glob: 未提供 glob 方法的 RuleContext → fail-closed ask", () => {
+  assertEquals(grepRule.evaluate(ctxOf("grep", "grep -n x src/*.md")).kind, "ask");
 });

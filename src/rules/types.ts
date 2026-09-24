@@ -18,6 +18,16 @@ export interface RuleContext {
   resolveUrl(value: string): UrlScope;
   /** 此參數是否指向磁碟根 / 家目錄根（用於遞迴指令的 deny 判定）。 */
   isDangerousRoot(arg: Word): boolean;
+  /**
+   * glob 路徑操作元的範圍判定（前綴目錄須以目錄形式被涵蓋）。
+   * 選填；未提供時呼叫端視同 "dynamic"（fail-closed → ask）。classify 永遠提供。
+   */
+  resolveGlobPath?(arg: Word): PathScope;
+  /**
+   * glob 操作元是否可能選中磁碟根 / 家目錄根。
+   * 選填；未提供時呼叫端視同 true（fail-closed → deny）。classify 永遠提供。
+   */
+  globMaySelectDangerousRoot?(arg: Word): boolean;
 }
 
 export type RuleVerdict =
