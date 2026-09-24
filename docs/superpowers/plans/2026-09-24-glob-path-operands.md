@@ -1087,6 +1087,7 @@ Message: `feat(rules): accept glob operands for grep/head/wc with root gate and 
 - Modify: `src/rules/factory.ts`（`FlagGatedReaderOptions.globOperandNames`、legacy 分支）
 - Modify: `src/rules/commands/coreutils.ts`（`fileReaderRule`）
 - Test: `src/rules/commands/coreutils_test.ts`（檔尾新增；沿用 Task 4 的 `envCtx`、`HOME_OPEN`、`ROOT_OPEN`）
+- Modify: `src/engine/evaluate_test.ts`（既有 `cat *.txt` 案例）
 
 - [ ] **Step 1: 寫失敗測試**
 
@@ -1247,9 +1248,18 @@ const lsShortClusterHasR: FlagMatcher = (t) =>
   globOperandNames: ["cat", "ls"],
 ```
 
+- [ ] **Step 4b: 更新既有 e2e 案例 `src/engine/evaluate_test.ts`**
+
+該檔的案例表以 `{ cmd: "cat *.txt", want: "ask", note: "glob" }` 代表「glob → ask」。cat 納入固定清單後，此案例依設計改為 allow。為保留原意（清單外指令的 glob 仍 ask），把這一行替換為兩行：
+
+```ts
+  { cmd: "stat *.txt", want: "ask", note: "glob on command outside the fixed glob list" },
+  { cmd: "cat *.txt", want: "allow", note: "glob on fixed-list command, prefix in project" },
+```
+
 - [ ] **Step 5: 執行測試確認通過**
 
-Run: `deno test --allow-env src/rules/commands/coreutils_test.ts`
+Run: `deno test --allow-env src/rules/commands/coreutils_test.ts src/engine/evaluate_test.ts`
 Expected: PASS
 
 - [ ] **Step 6: 驗證**
@@ -1259,7 +1269,7 @@ Expected: 全部通過
 
 - [ ] **Step 7: Commit（git-master）**
 
-檔案：`src/rules/factory.ts`、`src/rules/commands/coreutils.ts`、`src/rules/commands/coreutils_test.ts`
+檔案：`src/rules/factory.ts`、`src/rules/commands/coreutils.ts`、`src/rules/commands/coreutils_test.ts`、`src/engine/evaluate_test.ts`
 Message: `feat(rules): accept glob operands for cat/ls and detect clustered ls -R`
 
 ---
