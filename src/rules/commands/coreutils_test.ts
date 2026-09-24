@@ -211,6 +211,12 @@ Deno.test("head glob: globstar 選中危險根 → deny", () => {
   }
 });
 
+Deno.test("head glob: 旗標值位置的 globstar 選中危險根 → deny", () => {
+  for (const scope of [undefined, HOME_OPEN, ROOT_OPEN]) {
+    assertEquals(fileReaderRule.evaluate(envCtx("head -n /**/*.md a.txt", { scope })).kind, "deny");
+  }
+});
+
 Deno.test("cat / ls glob: allow", () => {
   for (const src of ["cat src/*.ts", "cat src/**/*.ts", "ls *.md", "ls -la *.md", "ls -lR src"]) {
     assertEquals(fileReaderRule.evaluate(envCtx(src)).kind, "allow", src);

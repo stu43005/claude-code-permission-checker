@@ -263,3 +263,11 @@ Deno.test({
 Deno.test("grep glob: 未提供 glob 方法的 RuleContext → fail-closed ask", () => {
   assertEquals(grepRule.evaluate(ctxOf("grep", "grep -n x src/*.md")).kind, "ask");
 });
+
+Deno.test("grep glob: 任何參數位置的 globstar 選中危險根 → deny", () => {
+  for (const scope of [undefined, HOME_OPEN, ROOT_OPEN]) {
+    assertEquals(grepRule.evaluate(envCtx("grep", "grep /home/me/**/*.md file", { scope })).kind, "deny");
+    assertEquals(grepRule.evaluate(envCtx("grep", "grep -e /home/me/**/*.md file", { scope })).kind, "deny");
+  }
+  assertEquals(grepRule.evaluate(envCtx("grep", "grep x src/**/*.md")).kind, "allow");
+});

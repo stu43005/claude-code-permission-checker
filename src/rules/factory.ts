@@ -53,8 +53,15 @@ const SAFE_OPTION_TOKEN = /^[A-Za-z0-9_=.,+-]+$/;
  * 遞迴（明確旗標、被注入的 -r/-R、或 globstar）時，glob 可能選中磁碟根 / 家目錄根 → 硬 deny；
  * 有注入風險時，其餘 argv 指向危險根者也 deny（注入的遞迴旗標會作用在它們身上）。
  * 不受任何讀取範圍放寬影響，以維持「遞迴遍歷磁碟根/家目錄根 = 硬 deny」。
+ * globstar word 不論落在哪個參數角色（PATTERN、被吃掉的旗標值等）都要檢查：`shopt -s globstar`
+ * 下 bash 會在指令解讀參數之前就展開該 token，遞迴遍歷的發生與參數角色無關。
  */
 export function globRootGate(ctx: RuleContext, globWords: Word[], isRecursive: boolean): RuleVerdict | null {
+  for (const w of ctx.argv) {
+    if (hasGlobstarSegment(w) && parseGlobPath(w) !== null && (ctx.globMaySelectDangerousRoot?.(w) ?? true)) {
+      return deny(recursiveRootDenyReason(ctx.name, w.value));
+    }
+  }
   if (globWords.length === 0) return null;
   const injectable = globWords.some(mayExpandToOption);
   const globstar = globWords.some(hasGlobstarSegment);
