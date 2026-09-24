@@ -112,6 +112,7 @@ export function mayExpandToOption(word: Word): boolean;  // value 的第一個�
 **切段**：以 `/` 切段。第一個含 glob 字元的段稱為 *G*。*G* 之前的所有段依原樣以 `/` 連接，就是 `prefix`：
 
 - value 以 `/` 開頭時，`prefix` 保留開頭的 `/`，例如 `/*.md` → `prefix = "/"`；
+- 前綴只剩磁碟機代號時補回分隔符，例如 `C:/*.md` → `prefix = "C:/"`（否則會被當成相對路徑解析到 cwd 內）；
 - 沒有任何前段時，`prefix` 為 `""`。
 
 **尾段限制**：*G* 以及其後的所有段，
@@ -155,9 +156,10 @@ export function mayExpandToOption(word: Word): boolean;  // value 的第一個�
   - `home !== null && isWithin(P, normalizeAbsolute(home))`：*P* 是家目錄的祖先，glob 可能選中家目錄本身，
     例如 `/home/m?`。
 
-`RuleContext` 新增：
-- `resolveGlobPath(arg: Word): PathScope`；
-- `globMaySelectDangerousRoot(arg: Word): boolean`，由 `classify.ts` 綁定 cwd 與 `scope.home`，與 `isDangerousRoot` 同源。
+`RuleContext` 新增兩個**選填**方法（repo 內 18 個測試檔各自手寫 `RuleContext` 字面量，必填會強迫全部修改）：
+- `resolveGlobPath?(arg: Word): PathScope`；缺席時呼叫端視同 `"dynamic"`（fail-closed → ask）；
+- `globMaySelectDangerousRoot?(arg: Word): boolean`；缺席時呼叫端視同 `true`（fail-closed → deny）。
+`classify.ts` 永遠提供兩者，綁定 cwd 與 `scope.home`，與 `isDangerousRoot` 同源。
 
 **`resolvePath`、`resolvePathValue` 不變。**
 

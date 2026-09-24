@@ -78,6 +78,10 @@ Deno.test("parseGlobPath: 接受的形態與其 prefix", () => {
     ["/d/proj/*.md", "/d/proj"],
     ["../x/*.md", "../x"],
     ["/*.md", "/"],
+    ["C:/*.md", "C:/"], // 磁碟根前綴必須保留分隔符，否則會被當成相對路徑
+    ["C:/proj/*.md", "C:/proj"],
+    ["src//*.md", "src/"], // 空段可接受（原樣連接）
+    ["src/*/", "src"], // 結尾 / 可接受
   ];
   for (const [src, prefix] of cases) {
     assertEquals(parseGlobPath(w(src)), { prefix }, src);
@@ -125,6 +129,7 @@ Deno.test("isGlobAttachedValue: 只接受單段、無反斜線的黏寫 glob 值
   assertEquals(isGlobAttachedValue(w("--include=*/../../../**"), "--include"), false);
   assertEquals(isGlobAttachedValue(w("--include=src/*.md"), "--include"), false);
   assertEquals(isGlobAttachedValue(w('--include="*.md"'), "--include"), false);
+  assertEquals(isGlobAttachedValue(w("--include=\\*.md"), "--include"), false); // 含反斜線
 });
 ```
 
@@ -216,7 +221,12 @@ export function parseGlobPath(word: Word): GlobPath | null {
     if (GLOB_CHAR.test(s) && (s.startsWith(".") || s.startsWith("["))) return null;
   }
   const head = segs.slice(0, g);
-  return { prefix: head.length === 0 ? "" : head.join("/") || "/" };
+  if (head.length === 0) return { prefix: "" };
+  const joined = head.join("/");
+  if (joined === "") return { prefix: "/" }; // `/*.md`
+  // `C:/*.md` 切段後前綴只剩 `C:`；補回分隔符，否則會被當成相對路徑而解析到 cwd 之內
+  if (/^[A-Za-z]:$/.test(joined)) return { prefix: joined + "/" };
+  return { prefix: joined };
 }
 
 /**
@@ -315,6 +325,45 @@ Deno.test("resolveGlobPath: 外部 allow root 涵蓋、巢狀 deny/ask 否決", 
 Deno.test("resolveGlobPath: 精確單檔 allow 不擴大成其子路徑", () => {
   assertEquals(resolveGlobPath(wordOf("cat /ext/data/*"), GLOB_CWD, extScope([], ["/ext/data"])), "out-of-project");
   assertEquals(resolveGlobPath(wordOf("cat /ext/data/*"), GLOB_CWD, extScope(["/ext/data"])), "in-project");
+});
+
+Deno.test("resolveGlobPath: 巢狀 deny/ask 的 file 條目同樣否決", () => {
+  const s: ScopeConfig = {
+    ...rootScope("/proj"),
+    allow: { roots: ["/ext"], files: [] },
+    deny: { roots: [], files: ["/ext/private.key"] },
+  };
+  assertEquals(resolveGlobPath(wordOf("cat /ext/*"), GLOB_CWD, s), "out-of-project");
+  const a: ScopeConfig = {
+    ...rootScope("/proj"),
+    allow: { roots: ["/ext"], files: [] },
+    ask: { roots: [], files: ["/ext/private.key"] },
+  };
+  assertEquals(resolveGlobPath(wordOf("cat /ext/*"), GLOB_CWD, a), "out-of-project");
+});
+
+Deno.test("resolveGlobPath / globMaySelectDangerousRoot: 絕對前綴不受 cwd unknown 影響", () => {
+  assertEquals(resolveGlobPath(wordOf("cat /proj/src/*.ts"), { kind: "unknown" }, rootScope("/proj")), "in-project");
+  assertEquals(globMaySelectDangerousRoot(wordOf("ls /proj/src/*"), { kind: "unknown" }, "/home/me"), false);
+});
+
+Deno.test("resolveGlobPath / globMaySelectDangerousRoot: 磁碟根前綴（C:/*）", () => {
+  const cwd: CwdState = { kind: "known", path: "D:/proj" };
+  assertEquals(resolveGlobPath(wordOf("cat C:/*.md"), cwd, rootScope("D:/proj")), "out-of-project");
+  assertEquals(resolveGlobPath(wordOf("cat C:/**/*.md"), cwd, rootScope("D:/proj")), "out-of-project");
+  assertEquals(globMaySelectDangerousRoot(wordOf("ls C:/*"), cwd, null), true);
+  assertEquals(globMaySelectDangerousRoot(wordOf("ls C:/**/*.md"), cwd, null), true);
+  assertEquals(globMaySelectDangerousRoot(wordOf("ls C:/proj/*"), cwd, null), false);
+});
+
+Deno.test({
+  name: "globMaySelectDangerousRoot: Windows 上 /c/* 前綴等同磁碟根",
+  ignore: Deno.build.os !== "windows",
+  fn() {
+    const cwd: CwdState = { kind: "known", path: "D:/proj" };
+    assertEquals(globMaySelectDangerousRoot(wordOf("ls /c/*"), cwd, null), true);
+    assertEquals(resolveGlobPath(wordOf("cat /c/*.md"), cwd, rootScope("D:/proj")), "out-of-project");
+  },
 });
 
 Deno.test("resolveGlobPath: trusted root 涵蓋", () => {
@@ -707,6 +756,28 @@ Deno.test("grep glob: 危險根 deny（不受讀取放寬影響、不被 ask 搶
   }
 });
 
+Deno.test("grep glob: 磁碟根 glob → deny（含 Read(//C:/**) 放行時）", () => {
+  const DRIVE_OPEN: ScopeConfig = { ...rootScope("D:/proj"), home: HOME, allow: { roots: ["C:/"], files: [] } };
+  for (const scope of [rootScope("D:/proj"), DRIVE_OPEN]) {
+    for (const src of ["grep -r x C:/*", "grep x C:/**/*.md"]) {
+      assertEquals(grepRule.evaluate(envCtx("grep", src, { cwd: "D:/proj", scope })).kind, "deny", src);
+    }
+  }
+});
+
+Deno.test({
+  name: "grep glob: Windows 上 /c/* → deny（含 Read(//C:/**) 放行時）",
+  ignore: Deno.build.os !== "windows",
+  fn() {
+    const DRIVE_OPEN: ScopeConfig = { ...rootScope("D:/proj"), home: HOME, allow: { roots: ["C:/"], files: [] } };
+    for (const scope of [rootScope("D:/proj"), DRIVE_OPEN]) {
+      for (const src of ["grep -r x /c/*", "grep x /c/**/*.md"]) {
+        assertEquals(grepRule.evaluate(envCtx("grep", src, { cwd: "D:/proj", scope })).kind, "deny", src);
+      }
+    }
+  },
+});
+
 Deno.test("grep glob: 未提供 glob 方法的 RuleContext → fail-closed ask", () => {
   assertEquals(grepRule.evaluate(ctxOf("grep", "grep -n x src/*.md")).kind, "ask");
 });
@@ -946,7 +1017,31 @@ function specFor(_name: string, argv: Word[]): CommandSpec {
 }
 ```
 
-`src/rules/commands/coreutils.ts`：`HEAD_SPEC` 在 `numericShorthand: true, // head -100` 之後新增 `globOperands: true,`；`WC_SPEC` 在 `positionals: "paths",` 之後新增 `globOperands: true,`。
+`src/rules/commands/coreutils.ts`：`HEAD_SPEC` 與 `WC_SPEC` 各新增 `globOperands: true`，改完後兩者為：
+
+```ts
+const HEAD_SPEC: CommandSpec = {
+  flags: [
+    ...["-q", "--quiet", "--silent", "-v", "--verbose", "-z", "--zero-terminated"]
+      .map((name): FlagSpec => ({ name, value: "none" })),
+    ...["-c", "--bytes", "-n", "--lines"]
+      .map((name): FlagSpec => ({ name, value: "required" })),
+  ],
+  positionals: "paths",
+  numericShorthand: true, // head -100
+  globOperands: true, // 固定清單成員：旗標被 glob 注入也無害
+};
+
+const WC_SPEC: CommandSpec = {
+  flags: [
+    ...["-c", "--bytes", "-m", "--chars", "-l", "--lines", "-L", "--max-line-length", "-w", "--words"]
+      .map((name): FlagSpec => ({ name, value: "none" })),
+    { name: "--files0-from", value: "required", valueIsPath: true },
+  ],
+  positionals: "paths",
+  globOperands: true, // 固定清單成員；注入 --files0-from 的殘留風險為已接受限制
+};
+```
 
 - [ ] **Step 7: 執行測試確認通過**
 
@@ -1015,12 +1110,34 @@ Deno.test("cat / ls glob: 危險根 deny（不受讀取放寬影響、不被 ask
     }
   }
 });
+
+Deno.test("cat / ls glob: 磁碟根 glob → deny（含 Read(//C:/**) 放行時）", () => {
+  const DRIVE_OPEN: ScopeConfig = { ...rootScope("D:/proj"), home: HOME, allow: { roots: ["C:/"], files: [] } };
+  for (const scope of [rootScope("D:/proj"), DRIVE_OPEN]) {
+    for (const src of ["ls -R C:/*", "ls -lR C:/*", "cat C:/**/*.md"]) {
+      assertEquals(fileReaderRule.evaluate(envCtx(src, { cwd: "D:/proj", scope })).kind, "deny", src);
+    }
+  }
+});
+
+Deno.test({
+  name: "cat / ls glob: Windows 上 /c/* → deny（含 Read(//C:/**) 放行時）",
+  ignore: Deno.build.os !== "windows",
+  fn() {
+    const DRIVE_OPEN: ScopeConfig = { ...rootScope("D:/proj"), home: HOME, allow: { roots: ["C:/"], files: [] } };
+    for (const scope of [rootScope("D:/proj"), DRIVE_OPEN]) {
+      for (const src of ["ls -lR /c/*", "cat /c/**/*.md"]) {
+        assertEquals(fileReaderRule.evaluate(envCtx(src, { cwd: "D:/proj", scope })).kind, "deny", src);
+      }
+    }
+  },
+});
 ```
 
 - [ ] **Step 2: 執行測試確認失敗**
 
 Run: `deno test --allow-env src/rules/commands/coreutils_test.ts`
-Expected: FAIL（`cat src/*.ts` 等回 ask；`ls -lR ~` 回 allow 而非 deny）
+Expected: FAIL。`cat src/*.ts` 等 allow 案例回 ask；`ls -lR ~` 在此測試設定（未提供 shellHome）下回 ask 而非 deny，因為 `-lR` 尚未被認成遞迴；`ls -lR /home/me/*` 等回 ask 而非 deny。
 
 - [ ] **Step 3: `factory.ts` legacy 分支接線**
 
@@ -1178,7 +1295,11 @@ Deno.test("glob: 使用者範例三條指令 allow", () => {
 - [ ] **Step 2: 執行測試確認失敗**
 
 Run: `deno test --allow-env src/engine/classify_test.ts`
-Expected: FAIL（「清單內指令經 classify 綁定後 allow」與「使用者範例三條指令 allow」回 ask：classify 尚未提供 `resolveGlobPath`）
+Expected: FAIL。classify 尚未提供兩個 glob 方法，因此走 Task 4 的 fail-closed fallback：
+- 含開頭即 glob 元字元者（`wc -l *.md`、`head *.md`、`ls *.md`、`grep -n x *.md sub/*.md`、範例 1 與 3）→ `globMaySelectDangerousRoot` 缺席視同 true → **deny**；
+- 有字面前綴、非遞迴者（`cat src/*.ts`）→ `resolveGlobPath` 缺席視同 dynamic → **ask**；
+- 範例 2（只有黏寫值 glob、無 glob 操作元）此時已是 allow，該斷言通過。
+其餘 ask 類斷言此時已通過。只要失敗的斷言恰為上述 allow 類，即為預期狀態。
 
 - [ ] **Step 3: 實作 classify 綁定**
 
@@ -1333,7 +1454,8 @@ glob 支援限於**固定清單**：`grep`/`egrep`/`fgrep`、`head`、`wc`、`ca
   全旗標集做 denylist。清單成員的注入分析：cat/ls（coreutils 8.32 對照 `src/cat.c`、`src/ls.c` 的
   `long_options[]`）與 head 所有旗標皆無寫檔、exec、讀取操作元以外檔案的副作用；grep 無寫檔 / exec 旗標，
   但注入 `-e`/`-f`/`--` 會翻轉位置參數分類（由 `injectionGuard` 處理）；wc 的 `--files0-from=<cwd 內檔名>`
-  可讀出該檔所列任意路徑的**計數與檔名**（已接受的限制，見 spec）。
+  可讀出該檔所列任意路徑的**計數與檔名**。這是已接受的限制：攻擊者須先在專案內植入兩個特製檔名的檔案，
+  且只洩漏計數與檔名、不洩漏內容。
 - **注入會翻轉任何 token 的解讀**：cwd 有 `-e^` 檔時 `grep /outside/secret *` 會讀出 `/outside/secret` 內容；
   注入 `--` 使 `--label=/../../secret` 變成檔案；注入吃值旗標吞掉原本的 `-e`，使其值 `--file=/outside/secret`
   生效。故 `injectionGuard` 不區分 token 種類、全部當路徑檢查，並限制旗標 token 的字元集。
