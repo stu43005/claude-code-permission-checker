@@ -4,6 +4,7 @@ import type { CwdState } from "../types.ts";
 import type { ReadScope } from "../permissions/path_scope.ts";
 import type { PermissionRules } from "../permissions/settings.ts";
 import { expandTilde, hasUnquotedLeadingTilde } from "./tilde.ts";
+import { parseGlobPath } from "./glob.ts";
 
 // 維持既有匯入點（cwd.ts 等從 scope.ts 匯入）；定義已搬到 word.ts。
 export { isDriveRelative };
@@ -335,4 +336,52 @@ export function dangerousRoot(arg: Word, cwd: CwdState, home: string | null): bo
     abs = resolveAgainst(cwd.path, v);
   }
   return isDangerousRootAbs(abs, home);
+}
+
+/** glob 前綴解析成已正規化絕對路徑；cwd unknown 且前綴為相對路徑時回 null。 */
+function globPrefixAbs(prefix: string, cwd: CwdState): string | null {
+  if (isAbsolute(prefix)) return normalizeAbsolute(prefix);
+  if (cwd.kind === "unknown") return null;
+  return prefix === "" ? normalizeAbsolute(cwd.path) : resolveAgainst(cwd.path, prefix);
+}
+
+/** ReadScope 是否有任何 root / file 嚴格位於 dir 之下。 */
+function hasStrictDescendant(s: ReadScope, dir: string): boolean {
+  return [...s.roots, ...s.files].some((x) => {
+    const n = normalizeAbsolute(x);
+    return n !== dir && isWithin(dir, n);
+  });
+}
+
+/**
+ * glob 路徑操作元的範圍判定（三態）。glob 展開結果必落在字面前綴目錄 P 之下，故判定 P 是否被
+ * 「以目錄形式」涵蓋：專案根 → 涵蓋；外部則需 allow root / trusted root 涵蓋（**精確單檔 allow
+ * 不算**），且 P 之下不得有任何 deny/ask 條目（glob 可能展開進被否決的子樹）。
+ */
+export function resolveGlobPath(arg: Word, cwd: CwdState, scope: ScopeConfig): PathScope {
+  const g = parseGlobPath(arg);
+  if (g === null) return "dynamic";
+  const p = globPrefixAbs(g.prefix, cwd);
+  if (p === null) return "dynamic";
+  if (isWithin(scope.root, p)) return "in-project"; // root-first
+  if (hits(scope.deny, p) || hits(scope.ask, p)) return "out-of-project";
+  const covered = scope.allow.roots.some((r) => isWithin(r, p)) ||
+    scope.trusted.some((r) => isWithin(r, p));
+  if (!covered) return "out-of-project";
+  if (hasStrictDescendant(scope.deny, p) || hasStrictDescendant(scope.ask, p)) return "out-of-project";
+  return "in-project";
+}
+
+/**
+ * glob 操作元是否可能選中磁碟根 / 家目錄根：前綴 P 本身是危險根（展開為其子項，效果等同遍歷整個根；
+ * Windows 上 `/` 的子項 `/c` 即磁碟根），或 P 是家目錄的祖先（可能選中家目錄本身，如 `/home/m?`）。
+ * cwd unknown 且前綴相對 → true（fail-closed）。非合格 glob 形態 → false（它不會被當成 glob 操作元接受）。
+ */
+export function globMaySelectDangerousRoot(arg: Word, cwd: CwdState, home: string | null): boolean {
+  const g = parseGlobPath(arg);
+  if (g === null) return false;
+  const p = globPrefixAbs(g.prefix, cwd);
+  if (p === null) return true;
+  if (isDangerousRootAbs(p, home)) return true;
+  return home !== null && isWithin(p, normalizeAbsolute(home));
 }

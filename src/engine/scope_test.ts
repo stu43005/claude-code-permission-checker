@@ -1,7 +1,7 @@
 import { assertEquals } from "@std/assert";
 import { parse } from "../deps.ts";
 import type { Command, Word } from "../deps.ts";
-import { buildScopeConfig, canonicalizeExecPath, dangerousRoot, isDangerousRootAbs, isReadScoped, isWithin, normalizeAbsolute, resolvePath, resolvePathValue, rootScope, type PathScope, type ScopeConfig } from "./scope.ts";
+import { buildScopeConfig, canonicalizeExecPath, dangerousRoot, globMaySelectDangerousRoot, isDangerousRootAbs, isReadScoped, isWithin, normalizeAbsolute, resolveGlobPath, resolvePath, resolvePathValue, rootScope, type PathScope, type ScopeConfig } from "./scope.ts";
 import type { CwdState } from "../types.ts";
 import type { PermissionRules } from "../permissions/settings.ts";
 import { EMPTY_DOMAIN_SCOPE } from "../permissions/domain_scope.ts";
@@ -423,4 +423,120 @@ Deno.test("resolvePath: 磁碟相對形態（C:Windows）不得視為專案內�
   assertEquals(resolvePath(wordOf("cat C:/Windows/win.ini"), cwd, scope), "out-of-project");
   // 一般相對路徑不受影響
   assertEquals(resolvePath(wordOf("cat src/a.ts"), cwd, scope), "in-project");
+});
+
+const GLOB_CWD: CwdState = { kind: "known", path: "/proj" };
+
+/** 專案 /proj + 外部 allow/deny/ask（皆為目錄 root，另可給 allow 精確單檔）。 */
+function extScope(
+  allowRoots: string[],
+  allowFiles: string[] = [],
+  denyRoots: string[] = [],
+  askRoots: string[] = [],
+): ScopeConfig {
+  return {
+    ...rootScope("/proj"),
+    allow: { roots: allowRoots, files: allowFiles },
+    deny: { roots: denyRoots, files: [] },
+    ask: { roots: askRoots, files: [] },
+  };
+}
+
+Deno.test("resolveGlobPath: 三態", () => {
+  const s = rootScope("/proj");
+  assertEquals(resolveGlobPath(wordOf("cat *.md"), GLOB_CWD, s), "in-project");
+  assertEquals(resolveGlobPath(wordOf("cat src/**/*.ts"), GLOB_CWD, s), "in-project");
+  assertEquals(resolveGlobPath(wordOf("cat ../*.md"), GLOB_CWD, s), "out-of-project");
+  assertEquals(resolveGlobPath(wordOf("cat /etc/*.conf"), GLOB_CWD, s), "out-of-project");
+  assertEquals(resolveGlobPath(wordOf("cat src/*.ts"), { kind: "unknown" }, s), "dynamic");
+  assertEquals(resolveGlobPath(wordOf("cat *.md"), { kind: "unknown" }, s), "dynamic");
+  assertEquals(resolveGlobPath(wordOf("cat .*"), GLOB_CWD, s), "dynamic"); // 非合格 glob 形態
+});
+
+Deno.test("resolveGlobPath: 外部 allow root 涵蓋、巢狀 deny/ask 否決", () => {
+  assertEquals(resolveGlobPath(wordOf("cat /ext/*"), GLOB_CWD, extScope(["/ext"])), "in-project");
+  assertEquals(
+    resolveGlobPath(wordOf("cat /ext/*"), GLOB_CWD, extScope(["/ext"], [], ["/ext/private"])),
+    "out-of-project",
+  );
+  assertEquals(
+    resolveGlobPath(wordOf("cat /ext/*"), GLOB_CWD, extScope(["/ext"], [], [], ["/ext/private"])),
+    "out-of-project",
+  );
+  // 前綴本身被 deny 覆蓋
+  assertEquals(resolveGlobPath(wordOf("cat /ext/a/*"), GLOB_CWD, extScope(["/ext"], [], ["/ext"])), "out-of-project");
+  // 專案內 root-first：專案內的 deny 條目不影響
+  assertEquals(resolveGlobPath(wordOf("cat src/*"), GLOB_CWD, extScope([], [], ["/proj/src/secret"])), "in-project");
+});
+
+Deno.test("resolveGlobPath: 精確單檔 allow 不擴大成其子路徑", () => {
+  assertEquals(resolveGlobPath(wordOf("cat /ext/data/*"), GLOB_CWD, extScope([], ["/ext/data"])), "out-of-project");
+  assertEquals(resolveGlobPath(wordOf("cat /ext/data/*"), GLOB_CWD, extScope(["/ext/data"])), "in-project");
+});
+
+Deno.test("resolveGlobPath: 巢狀 deny/ask 的 file 條目同樣否決", () => {
+  const s: ScopeConfig = {
+    ...rootScope("/proj"),
+    allow: { roots: ["/ext"], files: [] },
+    deny: { roots: [], files: ["/ext/private.key"] },
+  };
+  assertEquals(resolveGlobPath(wordOf("cat /ext/*"), GLOB_CWD, s), "out-of-project");
+  const a: ScopeConfig = {
+    ...rootScope("/proj"),
+    allow: { roots: ["/ext"], files: [] },
+    ask: { roots: [], files: ["/ext/private.key"] },
+  };
+  assertEquals(resolveGlobPath(wordOf("cat /ext/*"), GLOB_CWD, a), "out-of-project");
+});
+
+Deno.test("resolveGlobPath / globMaySelectDangerousRoot: 絕對前綴不受 cwd unknown 影響", () => {
+  assertEquals(resolveGlobPath(wordOf("cat /proj/src/*.ts"), { kind: "unknown" }, rootScope("/proj")), "in-project");
+  assertEquals(globMaySelectDangerousRoot(wordOf("ls /proj/src/*"), { kind: "unknown" }, "/home/me"), false);
+});
+
+Deno.test("resolveGlobPath / globMaySelectDangerousRoot: 磁碟根前綴（C:/*）", () => {
+  const cwd: CwdState = { kind: "known", path: "D:/proj" };
+  assertEquals(resolveGlobPath(wordOf("cat C:/*.md"), cwd, rootScope("D:/proj")), "out-of-project");
+  assertEquals(resolveGlobPath(wordOf("cat C:/**/*.md"), cwd, rootScope("D:/proj")), "out-of-project");
+  assertEquals(globMaySelectDangerousRoot(wordOf("ls C:/*"), cwd, null), true);
+  assertEquals(globMaySelectDangerousRoot(wordOf("ls C:/**/*.md"), cwd, null), true);
+  assertEquals(globMaySelectDangerousRoot(wordOf("ls C:/proj/*"), cwd, null), false);
+});
+
+Deno.test({
+  name: "globMaySelectDangerousRoot: Windows 上 /c/* 前綴等同磁碟根",
+  ignore: Deno.build.os !== "windows",
+  fn() {
+    const cwd: CwdState = { kind: "known", path: "D:/proj" };
+    assertEquals(globMaySelectDangerousRoot(wordOf("ls /c/*"), cwd, null), true);
+    assertEquals(resolveGlobPath(wordOf("cat /c/*.md"), cwd, rootScope("D:/proj")), "out-of-project");
+  },
+});
+
+Deno.test("resolveGlobPath: trusted root 涵蓋", () => {
+  const s: ScopeConfig = { ...rootScope("/proj"), trusted: ["/trusted"] };
+  assertEquals(resolveGlobPath(wordOf("cat /trusted/*.txt"), GLOB_CWD, s), "in-project");
+});
+
+Deno.test({
+  name: "resolveGlobPath: Windows 上 /d/ 前綴等同 D:/",
+  ignore: Deno.build.os !== "windows",
+  fn() {
+    const cwd: CwdState = { kind: "known", path: "D:/proj" };
+    assertEquals(resolveGlobPath(wordOf("cat /d/proj/src/*.ts"), cwd, rootScope("D:/proj")), "in-project");
+  },
+});
+
+Deno.test("globMaySelectDangerousRoot", () => {
+  const H = "/home/me";
+  assertEquals(globMaySelectDangerousRoot(wordOf("ls /*"), GLOB_CWD, H), true);
+  assertEquals(globMaySelectDangerousRoot(wordOf("ls /home/me/*"), GLOB_CWD, H), true);
+  assertEquals(globMaySelectDangerousRoot(wordOf("ls /home/m?"), GLOB_CWD, H), true);
+  assertEquals(globMaySelectDangerousRoot(wordOf("ls /h*/me"), GLOB_CWD, H), true); // 前綴 /
+  assertEquals(globMaySelectDangerousRoot(wordOf("ls /home/me/src/*"), GLOB_CWD, H), false);
+  assertEquals(globMaySelectDangerousRoot(wordOf("ls src/*"), GLOB_CWD, H), false);
+  assertEquals(globMaySelectDangerousRoot(wordOf("ls m?"), { kind: "known", path: "/home" }, H), true);
+  assertEquals(globMaySelectDangerousRoot(wordOf("ls src/*"), { kind: "unknown" }, H), true); // fail-closed
+  assertEquals(globMaySelectDangerousRoot(wordOf("ls .*"), GLOB_CWD, H), false); // 非合格 glob 形態
+  assertEquals(globMaySelectDangerousRoot(wordOf("ls /home/*"), GLOB_CWD, null), false); // home 未知
 });
