@@ -1298,8 +1298,11 @@ Run: `deno test --allow-env src/engine/classify_test.ts`
 Expected: FAIL。classify 尚未提供兩個 glob 方法，因此走 Task 4 的 fail-closed fallback：
 - 含開頭即 glob 元字元者（`wc -l *.md`、`head *.md`、`ls *.md`、`grep -n x *.md sub/*.md`、範例 1 與 3）→ `globMaySelectDangerousRoot` 缺席視同 true → **deny**；
 - 有字面前綴、非遞迴者（`cat src/*.ts`）→ `resolveGlobPath` 缺席視同 dynamic → **ask**；
-- 範例 2（只有黏寫值 glob、無 glob 操作元）此時已是 allow，該斷言通過。
-其餘 ask 類斷言此時已通過。只要失敗的斷言恰為上述 allow 類，即為預期狀態。
+- 範例 2（只有黏寫值 glob、無 glob 操作元）此時已是 allow，該斷言通過；
+- 「chain-cd 到專案外不因 cwd 豁免放行」（`cd /outside && wc -l *.md`）此時回 **deny** 而非 ask：
+  `globRootGate` 在 classify 的中央前置之前就以 fail-closed 回 deny，`combine` 保留 deny。
+其餘 ask 類斷言（`cat < *.md`、清單外指令、`Bash(stat *)`）此時已通過。
+只要失敗的斷言恰為上述幾類，即為預期狀態；**不要**為了讓 chain-cd 斷言在此步驟通過而修改 `globRootGate`。
 
 - [ ] **Step 3: 實作 classify 綁定**
 
