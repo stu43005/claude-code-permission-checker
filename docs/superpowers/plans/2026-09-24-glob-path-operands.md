@@ -1043,6 +1043,27 @@ const WC_SPEC: CommandSpec = {
 };
 ```
 
+- [ ] **Step 6b: 在 `classify.ts` 綁定兩個 glob 方法**
+
+開啟 head 的 glob 之後，若 `classify.ts` 尚未提供這兩個方法，既有測試 `cd /tmp && head -100 *.log`（`classify_test.ts` 的 guardrail 4）會因 fail-closed 變成 deny，全套測試無法保持綠燈。因此綁定在此 Task 完成（原列於 Task 6 Step 3）。
+
+`src/engine/classify.ts`：
+
+1. 第 5 行 import 改為：
+
+```ts
+import { buildScopeConfig, dangerousRoot, globMaySelectDangerousRoot, isReadScoped, normalizeAbsolute, resolveGlobPath, resolvePath, resolvePathValue, type ScopeConfig } from "./scope.ts";
+```
+
+2. `const ctx: RuleContext = { ... }` 物件在 `isDangerousRoot: (w) => dangerousRoot(w, inv.cwd, scope.home),` 之後新增：
+
+```ts
+    resolveGlobPath: (w) => resolveGlobPath(w, inv.cwd, scope),
+    globMaySelectDangerousRoot: (w) => globMaySelectDangerousRoot(w, inv.cwd, scope.home),
+```
+
+綁定後 `cd /tmp && head -100 *.log` 的 `*.log` 前綴解析為 `/tmp`：不是危險根 → 不 deny；不在範圍內 → ask，與既有預期一致。
+
 - [ ] **Step 7: 執行測試確認通過**
 
 Run: `deno test --allow-env src/rules/commands/grep_test.ts src/rules/commands/coreutils_test.ts src/rules/command_spec_test.ts`
@@ -1055,7 +1076,7 @@ Expected: 全部通過
 
 - [ ] **Step 9: Commit（git-master）**
 
-檔案：`src/rules/types.ts`、`src/rules/factory.ts`、`src/rules/commands/grep.ts`、`src/rules/commands/coreutils.ts`、`src/rules/commands/grep_test.ts`、`src/rules/commands/coreutils_test.ts`
+檔案：`src/rules/types.ts`、`src/rules/factory.ts`、`src/rules/commands/grep.ts`、`src/rules/commands/coreutils.ts`、`src/rules/commands/grep_test.ts`、`src/rules/commands/coreutils_test.ts`、`src/engine/classify.ts`
 Message: `feat(rules): accept glob operands for grep/head/wc with root gate and injection guard`
 
 ---
@@ -1246,7 +1267,7 @@ Message: `feat(rules): accept glob operands for cat/ls and detect clustered ls -
 ### Task 6: `classify.ts` 綁定、端到端測試與 operational verification
 
 **Files:**
-- Modify: `src/engine/classify.ts`
+- （`src/engine/classify.ts` 的綁定已移至 Task 4 Step 6b）
 - Test: `src/engine/classify_test.ts`（檔尾新增）
 - Modify: `scripts/verify-hook-binary.ts`（`CASES` 陣列）
 
@@ -1292,41 +1313,24 @@ Deno.test("glob: 使用者範例三條指令 allow", () => {
 });
 ```
 
-- [ ] **Step 2: 執行測試確認失敗**
-
-Run: `deno test --allow-env src/engine/classify_test.ts`
-Expected: FAIL。classify 尚未提供兩個 glob 方法，因此走 Task 4 的 fail-closed fallback：
-- 含開頭即 glob 元字元者（`wc -l *.md`、`head *.md`、`ls *.md`、`grep -n x *.md sub/*.md`、範例 1 與 3）→ `globMaySelectDangerousRoot` 缺席視同 true → **deny**；
-- 有字面前綴、非遞迴者（`cat src/*.ts`）→ `resolveGlobPath` 缺席視同 dynamic → **ask**；
-- 範例 2（只有黏寫值 glob、無 glob 操作元）此時已是 allow，該斷言通過；
-- 「chain-cd 到專案外不因 cwd 豁免放行」（`cd /outside && wc -l *.md`）此時回 **deny** 而非 ask：
-  `globRootGate` 在 classify 的中央前置之前就以 fail-closed 回 deny，`combine` 保留 deny。
-其餘 ask 類斷言（`cat < *.md`、清單外指令、`Bash(stat *)`）此時已通過。
-只要失敗的斷言恰為上述幾類，即為預期狀態；**不要**為了讓 chain-cd 斷言在此步驟通過而修改 `globRootGate`。
-
-- [ ] **Step 3: 實作 classify 綁定**
-
-`src/engine/classify.ts`：
-
-1. 第 5 行 import 改為：
+再新增一個驗證 `scope.home` 綁定的測試（classify 的第 4 個參數是 home）：
 
 ```ts
-import { buildScopeConfig, dangerousRoot, globMaySelectDangerousRoot, isReadScoped, normalizeAbsolute, resolveGlobPath, resolvePath, resolvePathValue, type ScopeConfig } from "./scope.ts";
+Deno.test("glob: classify 以 scope.home 綁定危險根判定", () => {
+  const invs = walk(parseCommand("grep -r x /home/m?").script, START, ROOT);
+  assertEquals(classify(invs[0], ROOT, rulesOf({}), "/home/me").kind, "deny");
+  assertEquals(classify(invs[0], ROOT, rulesOf({}), null).kind, "ask"); // home 未知 → 非危險根，前綴在範圍外
+});
 ```
 
-2. `const ctx: RuleContext = { ... }` 物件在 `isDangerousRoot: (w) => dangerousRoot(w, inv.cwd, scope.home),` 之後新增：
+`classify.ts` 的綁定已在 Task 4 Step 6b 完成，cat/ls 已在 Task 5 啟用，因此本 Task 的 classify 測試屬於**端到端回歸測試**，不會有先失敗的階段。
 
-```ts
-    resolveGlobPath: (w) => resolveGlobPath(w, inv.cwd, scope),
-    globMaySelectDangerousRoot: (w) => globMaySelectDangerousRoot(w, inv.cwd, scope.home),
-```
-
-- [ ] **Step 4: 執行測試確認通過**
+- [ ] **Step 2: 執行測試確認通過**
 
 Run: `deno test --allow-env src/engine/classify_test.ts`
 Expected: PASS
 
-- [ ] **Step 5: 新增 operational verification 案例**
+- [ ] **Step 3: 新增 operational verification 案例**
 
 `scripts/verify-hook-binary.ts` 的 `CASES` 陣列：
 
@@ -1380,7 +1384,7 @@ Expected: PASS
   },
 ```
 
-- [ ] **Step 6: 驗證（含 build 與 operational verification）**
+- [ ] **Step 4: 驗證（含 build 與 operational verification）**
 
 Run: `deno task check && deno task lint && deno task test`
 Expected: 全部通過
@@ -1388,10 +1392,10 @@ Expected: 全部通過
 Run: `deno run --allow-run --allow-read --allow-write --allow-env scripts/verify-hook-binary.ts`
 Expected: 腳本自行 `deno task build`，所有案例（含新增 8 筆）PASS，結束碼 0。
 
-- [ ] **Step 7: Commit（git-master）**
+- [ ] **Step 5: Commit（git-master）**
 
-檔案：`src/engine/classify.ts`、`src/engine/classify_test.ts`、`scripts/verify-hook-binary.ts`
-Message: `feat(engine): bind glob resolution into rule context and add verification cases`
+檔案：`src/engine/classify_test.ts`、`scripts/verify-hook-binary.ts`
+Message: `test: add end-to-end glob classification and binary verification cases`
 
 ---
 
