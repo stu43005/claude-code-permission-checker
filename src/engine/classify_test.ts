@@ -579,3 +579,45 @@ Deno.test("central rule 1: cwdIndependent 的指令在 unknown cwd 下也不得�
   };
   assertEquals(classify(inv, "/proj", undefined, null, [], true).kind, "ask");
 });
+
+Deno.test("glob: 清單內指令經 classify 綁定後 allow", () => {
+  for (const src of ["wc -l *.md", "head *.md", "cat src/*.ts", "ls *.md", "grep -n x *.md sub/*.md"]) {
+    assertEquals(only(src).kind, "allow", src);
+  }
+});
+
+Deno.test("glob: 輸入重導向 < 的 glob 目標仍 ask（resolvePath 未放寬）", () => {
+  assertEquals(only("cat < *.md").kind, "ask");
+});
+
+Deno.test("glob: 清單外指令含 glob 維持 ask", () => {
+  for (const src of ["stat *.md", "tail *.md", "diff *.md x", "sort *.md"]) {
+    assertEquals(only(src).kind, "ask", src);
+  }
+});
+
+Deno.test("glob: Bash(stat *) 不會升級含 glob 的 stat", () => {
+  assertEquals(onlyWith("stat *.md", rulesOf({ allow: ["Bash(stat *)"] })).kind, "ask");
+});
+
+Deno.test("glob: chain-cd 到專案外不因 cwd 豁免放行", () => {
+  assertEquals(evaluate("cd /outside && wc -l *.md", ROOT, START).verdict, "ask");
+});
+
+Deno.test("glob: 使用者範例三條指令 allow", () => {
+  for (
+    const src of [
+      "ls -la && wc -l *.md",
+      'grep -rn "Nginx 5xx" --include=*.md . | head -40',
+      'grep -n "careTreatment\\|WebApi\\|webapi" *.md runtime-behavior/*.md | head -40',
+    ]
+  ) {
+    assertEquals(evaluate(src, ROOT, START).verdict, "allow", src);
+  }
+});
+
+Deno.test("glob: classify 以 scope.home 綁定危險根判定", () => {
+  const invs = walk(parseCommand("grep -r x /home/m?").script, START, ROOT);
+  assertEquals(classify(invs[0], ROOT, rulesOf({}), "/home/me").kind, "deny");
+  assertEquals(classify(invs[0], ROOT, rulesOf({}), null).kind, "ask"); // home 未知 → 非危險根，前綴在範圍外
+});
