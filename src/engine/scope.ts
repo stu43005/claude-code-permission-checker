@@ -1,9 +1,12 @@
 import type { Word, WordPart } from "../deps.ts";
-import { staticValue } from "./word.ts";
+import { isDriveRelative, staticValue } from "./word.ts";
 import type { CwdState } from "../types.ts";
 import type { ReadScope } from "../permissions/path_scope.ts";
 import type { PermissionRules } from "../permissions/settings.ts";
 import { expandTilde, hasUnquotedLeadingTilde } from "./tilde.ts";
+
+// 維持既有匯入點（cwd.ts 等從 scope.ts 匯入）；定義已搬到 word.ts。
+export { isDriveRelative };
 
 export type PathScope = "in-project" | "out-of-project" | "dynamic";
 
@@ -23,16 +26,6 @@ export function toPosix(p: string): string {
 export function isAbsolute(p: string): boolean {
   const s = toPosix(p);
   return s.startsWith("/") || /^[A-Za-z]:\//.test(s);
-}
-
-/**
- * Windows 磁碟前綴但缺分隔符（`C:Windows`）。這個形態的語義有歧義——不同程式解析結果不同
- * （實測 `cd`/`realpath` 解析到 C 磁碟，`cat`/`ls` 當成含冒號的相對檔名）——且沒有任何正當
- * 寫法會用它：要指 C 磁碟就寫 `/c/Windows` 或 `C:/Windows`。歧義且無正當用途，依 default-deny
- * 一律拒絕，不去臆測它會落在哪裡。
- */
-export function isDriveRelative(p: string): boolean {
-  return /^[A-Za-z]:(?![/\\])/.test(p);
 }
 
 /**
