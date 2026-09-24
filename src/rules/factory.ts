@@ -5,7 +5,7 @@ import { type PathScope } from "../engine/scope.ts";
 import { staticValue } from "../engine/word.ts";
 import type { Word } from "../deps.ts";
 import { type ArgvParse, type CommandSpec, parseArgv } from "./command_spec.ts";
-import { hasGlobstarSegment, mayExpandToOption } from "../engine/glob.ts";
+import { hasGlobstarSegment, mayExpandToOption, parseGlobPath } from "../engine/glob.ts";
 
 export interface FlagGatedReaderOptions {
   names: string[];
@@ -35,6 +35,11 @@ export interface FlagGatedReaderOptions {
    * 誘使實作重掃 argv，正是單一解析契約要避免的。
    */
   cwdIndependentExtraGuard?: (parse: ArgvParse) => boolean;
+  /**
+   * legacy 路徑（未提供 spec 者）中接受合格 glob 路徑操作元的指令名。只有經旗標注入分析確認
+   * 「任何旗標被注入都無害」的固定清單（cat、ls）可列入。
+   */
+  globOperandNames?: string[];
 }
 
 /**
@@ -173,15 +178,23 @@ export function flagGatedReader(opts: FlagGatedReaderOptions): CommandRule {
           }
         }
       }
+      const pos = positionals(ctx.argv, valueFlags);
+      const globWords = (opts.globOperandNames ?? []).includes(ctx.name)
+        ? pos.filter((w) => parseGlobPath(w) !== null)
+        : [];
+      const gate = globRootGate(ctx, globWords, isRecursive);
+      if (gate) return gate;
       const pathFlagVerdict = checkPathValueFlags(ctx, opts.pathValueFlags ?? []);
       if (pathFlagVerdict) return pathFlagVerdict;
-      for (const arg of positionals(ctx.argv, valueFlags)) {
-        const scope = ctx.resolvePath(arg);
+      for (const arg of pos) {
+        const scope = globWords.includes(arg)
+          ? (ctx.resolveGlobPath?.(arg) ?? "dynamic")
+          : ctx.resolvePath(arg);
         if (scope !== "in-project") {
           return ask(`${ctx.name}：路徑超出專案範圍或無法靜態解析（${arg.value}）`);
         }
       }
-      return allow();
+      return injectionGuard(ctx, globWords) ?? allow();
     },
     cwdIndependent: opts.cwdIndependentWhenNoPaths
       ? (ctx: RuleContext) => {

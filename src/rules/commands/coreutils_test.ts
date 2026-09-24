@@ -210,3 +210,64 @@ Deno.test("head glob: globstar 選中危險根 → deny", () => {
     assertEquals(fileReaderRule.evaluate(envCtx("head /**/*.md", { scope })).kind, "deny");
   }
 });
+
+Deno.test("cat / ls glob: allow", () => {
+  for (const src of ["cat src/*.ts", "cat src/**/*.ts", "ls *.md", "ls -la *.md", "ls -lR src"]) {
+    assertEquals(fileReaderRule.evaluate(envCtx(src)).kind, "allow", src);
+  }
+});
+
+Deno.test("cat / ls glob: ask", () => {
+  for (
+    const src of [
+      "cat ../*.md", // 前綴在範圍外
+      "ls .*", // . 開頭 glob 段不合格
+      "stat *.md", // 清單外成員
+      "cat *.md --x=/../../secret", // 注入護欄：注入 -- 使旗標變檔案
+      "ls -la *.md --hide=/../../x",
+      "cat /home/me/*.md", // 非遞迴、無注入 → 不觸發閘門，依一般範圍判定
+    ]
+  ) {
+    assertEquals(fileReaderRule.evaluate(envCtx(src)).kind, "ask", src);
+  }
+});
+
+Deno.test("cat / ls glob: 危險根 deny（不受讀取放寬影響、不被 ask 搶先）", () => {
+  for (const scope of [undefined, HOME_OPEN, ROOT_OPEN]) {
+    for (
+      const src of [
+        "ls ?R /", // 注入 -R
+        "ls -R /home/me/*",
+        "ls -lR /home/me/*",
+        "ls -lR /*",
+        "cat /home/me/**/*.md", // globstar 視為遞迴
+        "ls -lR ~", // 群集遞迴偵測（既有行為收緊）
+        "ls -lR /",
+      ]
+    ) {
+      assertEquals(fileReaderRule.evaluate(envCtx(src, { scope })).kind, "deny", src);
+    }
+  }
+});
+
+Deno.test("cat / ls glob: 磁碟根 glob → deny（含 Read(//C:/**) 放行時）", () => {
+  const DRIVE_OPEN: ScopeConfig = { ...rootScope("D:/proj"), home: HOME, allow: { roots: ["C:/"], files: [] } };
+  for (const scope of [rootScope("D:/proj"), DRIVE_OPEN]) {
+    for (const src of ["ls -R C:/*", "ls -lR C:/*", "cat C:/**/*.md"]) {
+      assertEquals(fileReaderRule.evaluate(envCtx(src, { cwd: "D:/proj", scope })).kind, "deny", src);
+    }
+  }
+});
+
+Deno.test({
+  name: "cat / ls glob: Windows 上 /c/* → deny（含 Read(//C:/**) 放行時）",
+  ignore: Deno.build.os !== "windows",
+  fn() {
+    const DRIVE_OPEN: ScopeConfig = { ...rootScope("D:/proj"), home: HOME, allow: { roots: ["C:/"], files: [] } };
+    for (const scope of [rootScope("D:/proj"), DRIVE_OPEN]) {
+      for (const src of ["ls -lR /c/*", "cat /c/**/*.md"]) {
+        assertEquals(fileReaderRule.evaluate(envCtx(src, { cwd: "D:/proj", scope })).kind, "deny", src);
+      }
+    }
+  },
+});

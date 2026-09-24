@@ -30,6 +30,13 @@ const WC_SPEC: CommandSpec = {
 const SPECS: Record<string, CommandSpec> = { head: HEAD_SPEC, wc: WC_SPEC };
 
 /**
+ * ls 短旗標群集含 R（`-lR`、`-Rla`）代表遞迴。與 grep.ts 的 shortClusterHasR 同形式；
+ * 可能多判（`-wR` 的 R 其實是 -w 的值），方向安全。
+ */
+const lsShortClusterHasR: FlagMatcher = (t) =>
+  /^-[^-]/.test(t) && !t.includes("=") && t.slice(1).includes("R");
+
+/**
  * 會把非 flag 參數當作要讀取 / 解析的路徑，需做範圍檢查（spec line 218 要求整份
  * 清單皆「路徑做範圍檢查」）。basename/dirname/realpath/readlink 接受路徑操作元，
  * 故一併納入受範圍檢查的群組。
@@ -48,10 +55,13 @@ export const fileReaderRule: CommandRule = flagGatedReader({
   valueFlags: [exact("--files0-from", "--relative-to", "--relative-base")],
   pathValueFlags: ["--files0-from", "--relative-to", "--relative-base"],
   // 這些指令無「會寫檔」的 flag；故 askFlags 留空。
-  recursive: (n, a) => n === "ls" && hasAnyFlag(a, [exact("-R", "--recursive")]),
+  recursive: (n, a) => n === "ls" && hasAnyFlag(a, [exact("-R", "--recursive"), lsShortClusterHasR]),
   cwdIndependentWhenNoPaths: true,
   // ls 無操作元時列出 cwd。其餘未提供 spec 的成員由「無 spec → 不豁免」自動排除。
   cwdDependentNames: ["ls"],
+  // 固定清單：cat / ls 的所有旗標（coreutils 8.32）皆無寫檔、執行程式、讀取操作元以外檔案的副作用，
+  // 被 glob 注入也無害。清單不擴增；其餘成員含 glob 維持 ask。
+  globOperandNames: ["cat", "ls"],
 });
 
 /**
